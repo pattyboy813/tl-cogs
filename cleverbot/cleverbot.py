@@ -234,7 +234,7 @@ class Cleverbotcog(commands.Cog):
         embed.title = "Options for cleverbot:"
         embed.colour = discord.Colour.dark_red()
         nevus = self.bot.get_user(473446760233041929)
-        embed.set_footer(text="Bot by " + nevus.name, icon_url=nevus.avatar_url)
+        embed.set_footer(text="Bot by " + nevus.name, icon_url=nevus.display_avatar.url)
         # Put in code block to preserve spaces
         embed.description = "```{}```".format(options_str)
         await ctx.send(embed=embed)

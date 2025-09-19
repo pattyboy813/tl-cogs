@@ -304,10 +304,15 @@ class ClashRoyaleCog(commands.Cog):
                     embedFields.append([e_name, e_value])
             
             colour = choice([discord.Colour.green(), discord.Colour.blue(), discord.Colour.purple(), discord.Colour.orange(), discord.Colour.red(), discord.Colour.teal()])
-            embedsToSend = []                
+            guild_icon = ctx.guild.icon
+            guild_icon_url = guild_icon.url if guild_icon else None
+            embedsToSend = []
             for i in range(0, len(embedFields), 8):
                 embed = discord.Embed(colour=colour)
-                embed.set_author(name=f"{ctx.guild.name} clans", icon_url=ctx.guild.icon_url)
+                embed.set_author(
+                    name=f"{ctx.guild.name} clans",
+                    icon_url=guild_icon_url or discord.Embed.Empty,
+                )
                 footer = "API is offline, showing last saved data." if offline else f"Do you need more info about a clan? Use {ctx.prefix}clan [key]"
                 embed.set_footer(text = footer)
                 for e in embedFields[i:i+8]:
