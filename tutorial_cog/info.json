@@ -1,4 +1,4 @@
-{ 
+{
   "author": [
     "vanhorn",
     "Legend Development Team"
@@ -12,5 +12,6 @@
   "requirements": [
     "pytz"
   ],
-  "type": "COG"
+  "type": "COG",
+  "min_bot_version": "3.5.0"
 }
