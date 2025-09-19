@@ -339,7 +339,7 @@ class Welcomer(commands.Cog):
         channel = self.bot.get_channel(await self.config.log_channel_id())
 
         embed = discord.Embed(color=discord.Color.green(), description="User Joined")
-        avatar = user.avatar_url if user.avatar else user.default_avatar_url
+        avatar = user.display_avatar.url
         embed.set_author(name=user.name, icon_url=avatar)
 
         try:
@@ -420,7 +420,7 @@ class Welcomer(commands.Cog):
             return
 
         embed = discord.Embed(color=discord.Color.red(), description="User Left")
-        avatar = member.avatar_url if member.avatar else member.default_avatar_url
+        avatar = member.display_avatar.url
         embed.set_author(name=member.display_name, icon_url=avatar)
         channel = self.bot.get_channel(await self.config.log_channel_id())
         await channel.send(embed=embed)

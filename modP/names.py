@@ -285,7 +285,7 @@ class ModInfo(MixinMeta):
         name = " ~ ".join((name, user.nick)) if user.nick else name
         name = filter_invites(name)
 
-        avatar = user.avatar_url_as(static_format="png")
+        avatar = user.display_avatar.url
         data.set_author(name=f"{statusemoji} {name}", url=avatar)
         data.set_thumbnail(url=avatar)
 

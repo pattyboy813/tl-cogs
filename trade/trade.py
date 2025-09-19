@@ -207,7 +207,8 @@ class Trade(commands.Cog):
         return { **token_trades, **sorted2}
         
 
-    @commands.group(pass_context = True, no_pm=True)
+    @commands.group()
+    @commands.guild_only()
     async def trade(self, ctx):
         """ Clash Royale trade commands"""
         pass
@@ -221,7 +222,7 @@ class Trade(commands.Cog):
     async def want_add(self, ctx, *, card):
         """Add card that you are looking for"""
         
-        author = ctx.message.author
+        author = ctx.author
         
         try:
             card = self.cards_abbrev[card]
@@ -238,7 +239,7 @@ class Trade(commands.Cog):
     async def want_remove(self, ctx, *, card):
         """Remove card that you are no longer looking for"""
         
-        author = ctx.message.author
+        author = ctx.author
         try:
             card = self.cards_abbrev[card]
         except KeyError:
@@ -256,7 +257,7 @@ class Trade(commands.Cog):
     async def give_add(self, ctx, *, card):    
         """Add card that you want to give away"""        
         
-        author = ctx.message.author
+        author = ctx.author
         
         try:
             card = self.cards_abbrev[card]
@@ -273,7 +274,7 @@ class Trade(commands.Cog):
     async def give_remove(self, ctx, *, card):
         """Remove card that you no longer want to give away"""
         
-        author = ctx.message.author
+        author = ctx.author
         try:
             card = self.cards_abbrev[card]
         except KeyError:
@@ -283,11 +284,12 @@ class Trade(commands.Cog):
         await ctx.send("You are no longer looking to give away {}".format(card))
 
         
-    @trade.command(pass_context=True, no_pm=True)
+    @trade.command()
+    @commands.guild_only()
     async def search(self, ctx, *, card):
         """Search for trades"""
-        
-        author = ctx.message.author
+
+        author = ctx.author
         server = ctx.guild
         
         try:
@@ -354,7 +356,7 @@ class Trade(commands.Cog):
         
         if token in token_type:
             
-            author = ctx.message.author
+            author = ctx.author
             token = token.lower()
         
             try:
@@ -371,7 +373,7 @@ class Trade(commands.Cog):
         """Remove trade token"""
         
         if token in token_type:
-            author = ctx.message.author
+            author = ctx.author
             token = token.lower()
         
             try:
@@ -388,7 +390,7 @@ class Trade(commands.Cog):
         """Display trade data of user"""
         
         member_data = await self.database.member(ctx.author).all()
-        pfp = ctx.author.avatar_url
+        pfp = ctx.author.display_avatar.url
         
         embed = discord.Embed(color=0xFAA61A, description="Trade user info.")
         embed.set_author(name="{} ".format(ctx.author.display_name),
