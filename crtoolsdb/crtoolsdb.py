@@ -421,7 +421,7 @@ class ClashRoyaleTools(commands.Cog):
             self.tags.saveTag(userID=user.id, tag=tag)
             embed = discord.Embed(color=discord.Color.green(),
                                   description="Use !accounts to see all accounts")
-            avatar = user.avatar_url if user.avatar else user.default_avatar_url
+            avatar = user.display_avatar.url
             embed.set_author(name='{} (#{}) has been successfully saved.'.format(name, tag),
                              icon_url=avatar)
             embed.set_footer(text="Bot by: Generaleoley | Legend Gaming")
