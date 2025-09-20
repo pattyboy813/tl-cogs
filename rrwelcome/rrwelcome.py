@@ -19,16 +19,20 @@ class ReactRoleWelcome(commands.Cog):
             "If you experience any issues with this, feel free to ping an online staff member to get you into our server.\n\n"
             "Note: Clicking the first 3 options will also open up the server. So you won't need to click 'Join a club' and 'Join the Community' at the same time!"
         )
-        e.add_field(name = "Want to join a Clash Royale clan?", value = "Click 'Join a Clan!' below to be taken to our recruitment channel.", inline = False)
-        e.add_field(name = "Want to join a Brawl Stars club?", value = "Click 'Join a Club!' below to be taken our recruitment channel.", inline = False)
-        e.add_field(name = "Looking for a Minecraft Server to join?", value = "Click 'Join the Craft!' below to be taken to the UTS Minecraft Server information channel.", inline = False)
-        e.add_field(name = "Just looking to be apart of our community?", value = "Click 'Join the community!' below to open up our server!", inline = False)
+        a = discord.Embed(
+            title = "Please enjoy each button press equally!"
+        )
+        a.add_field(name = "Want to join a Clash Royale clan?", value = "Click 'Join a Clan!' below to be taken to our recruitment channel.", inline = False)
+        a.add_field(name = "Want to join a Brawl Stars club?", value = "Click 'Join a Club!' below to be taken our recruitment channel.", inline = False)
+        a.add_field(name = "Looking for a Minecraft Server to join?", value = "Click 'Join the Craft!' below to be taken to the UTS Minecraft Server information channel.", inline = False)
+        a.add_field(name = "Just looking to be apart of our community?", value = "Click 'Join the community!' below to open up our server!", inline = False)
 
         e.set_footer(text = "Threat Level - 2025")
+        a.set_footer(text = "Threat Level - 2025")
 
         view = ReactRoleView()
-
-        await ctx.send(embed = e, view = view)
+        await ctx.send(embed = e)
+        await ctx.send(embed = a, view = view)
 
 class ReactRoleView(discord.ui.View):
     def __init__(self):
