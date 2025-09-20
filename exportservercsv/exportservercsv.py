@@ -26,10 +26,10 @@ class ExportServerCSV(commands.Cog):
         
         channels_buffer = io.StringIO()
         writer = csv.writer(channels_buffer)
-        writer.writerow(["Catergory Name", "Channel ID", "Channel Name", "Channel Type"])
+        writer.writerow(["Category Name", "Channel ID", "Channel Name", "Channel Type"])
         for channel in guild.channels:
             writer.writerow([
-                channel.catergory.name if channel.catergory else "N/A",
+                channel.category.name if channel.category else "N/A",
                 channel.id,
                 channel.name,
                 str(channel.type)
