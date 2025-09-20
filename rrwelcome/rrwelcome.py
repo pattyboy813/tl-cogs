@@ -34,10 +34,10 @@ class ReactRoleView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-        self.add_item(ReactRoleButton("Join a Clan!", [place1, place2]))
-        self.add_item(ReactRoleButton("Join a Club!", [place1, place2]))
-        self.add_item(ReactRoleButton("Join the Craft!", [place1, place2]))
-        self.add_item(ReactRoleButton("Join the Community!", [place1]))
+        self.add_item(ReactRoleButton("Join a Clan!", [1405139477705261056, 1418925222345707644]))
+        self.add_item(ReactRoleButton("Join a Club!", [1405139477705261056, 1418925387018141706]))
+        self.add_item(ReactRoleButton("Join the Craft!", [1405139477705261056, 1418925441279983677]))
+        self.add_item(ReactRoleButton("Join the Community!", [1405139477705261056]))
 
 class ReactRoleButton(discord.ui.Button):
     def __init__(self, label: str, role_ids: list[int]):
