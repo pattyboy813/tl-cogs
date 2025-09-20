@@ -67,9 +67,9 @@ class ReactRoleButton(discord.ui.Button):
             
         msg = []
         if added:
-            msg.append(f"Added {'and '.join(added)}")
+            msg.append(f"Added {' and '.join(added)}! Welcome to Threat Level!")
         if removed:
-            msg.append(f"Removed {'and '.join(removed)}")
+            msg.append(f"Removed {' and '.join(removed)}")
         
         if not msg:
             msg = ["Sorry, I can't add role that don't exist. Ping a staff member to get this sorted for you."]
