@@ -80,7 +80,7 @@ class Mod(
         self.config.register_member(**self.default_member_settings)
         self.config.register_user(**self.default_user_settings)
         self.cache: dict = {}
-        self.tban_expiry_task = self.bot.loop.create_task(self.check_tempban_expirations())
+        self.tban_expiry_task = asyncio.create_task(self.check_tempban_expirations())
         self.last_case: dict = defaultdict(dict)
 
         self._ready = asyncio.Event()
@@ -143,7 +143,7 @@ class Mod(
                         "Ignored guilds and channels have been moved. "
                         "Please use `[p]moveignoredchannels` to migrate the old settings."
                     )
-                    self.bot.loop.create_task(send_to_owners_with_prefix_replaced(self.bot, msg))
+                    asyncio.create_task(send_to_owners_with_prefix_replaced(self.bot, msg))
                     message_sent = True
                     break
             if message_sent is False:
@@ -153,9 +153,7 @@ class Mod(
                             "Ignored guilds and channels have been moved. "
                             "Please use `[p]moveignoredchannels` to migrate the old settings."
                         )
-                        self.bot.loop.create_task(
-                            send_to_owners_with_prefix_replaced(self.bot, msg)
-                        )
+                        asyncio.create_task(send_to_owners_with_prefix_replaced(self.bot, msg))
                         break
             await self.config.version.set("1.1.0")
         if await self.config.version() < "1.2.0":
@@ -165,7 +163,7 @@ class Mod(
                         "Delete delay settings have been moved. "
                         "Please use `[p]movedeletedelay` to migrate the old settings."
                     )
-                    self.bot.loop.create_task(send_to_owners_with_prefix_replaced(self.bot, msg))
+                    asyncio.create_task(send_to_owners_with_prefix_replaced(self.bot, msg))
                     break
             await self.config.version.set("1.2.0")
         if await self.config.version() < "1.3.0":
