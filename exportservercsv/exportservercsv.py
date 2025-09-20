@@ -27,7 +27,7 @@ class ExportServerCSV(commands.Cog):
         channels_buffer = io.StringIO()
         writer = csv.writer(channels_buffer, delimiter = ",") # make the columns easy to read
         writer.writerow(["Category Name", "Channel ID", "Channel Name", "Channel Type"])
-        for channel in reversed(guild.channels):
+        for channel in sorted(guild.channels, key=lambda c: (c.category.position if c.category else -1, c.position)):
             writer.writerow([
                 channel.category.name if channel.category else "N/A",
                 str(channel.id),
