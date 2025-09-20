@@ -14,9 +14,9 @@ class ReactRoleWelcome(commands.Cog):
     async def welcome(self, ctx):
         e = discord.Embed(
             title = "Welcome to Threat Level!",
-            description = "Please read the following carefully to avoid your removal from the server!\n"
-            "To help us keep the inactive members out of your server, you'll need to select a role(s) from the ones available to avoid being kicked. If you don't select anything, you'll be kicked (not banned) after one week.\n"
-            "If you experience any issues with this, feel free to ping an online staff member to get you into our server.\n"
+            description = "Please read the following carefully to avoid your removal from the server!\n\n"
+            "To help us keep the inactive members out of your server, you'll need to select a role(s) from the ones available to avoid being kicked. If you don't select anything, you'll be kicked (not banned) after one week.\n\n"
+            "If you experience any issues with this, feel free to ping an online staff member to get you into our server.\n\n"
             "Note: Clicking the first 3 options will also open up the server. So you won't need to click 'Join a club' and 'Join the Community' at the same time!"
         )
         e.add_field(name = "Want to join a Clash Royale clan?", value = "Click 'Join a Clan!' below to be taken to our recruitment channel.", inline = False)
