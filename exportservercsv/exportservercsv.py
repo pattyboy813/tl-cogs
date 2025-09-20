@@ -14,23 +14,23 @@ class ExportServerCSV(commands.Cog):
         guild = ctx.guild
 
         roles_buffer = io.StringIO()
-        writer = csv.writer(roles_buffer)
+        writer = csv.writer(roles_buffer, delimiter = ",")
         writer.writerow(["Role ID", "Role Name", "Position"])
-        for role in guild.roles:
+        for role in reversed(guild.roles): # make it print top to bottom not bottom to top
             writer.writerow([
-                role.id,
+                str(role.id),
                 role.name,
                 role.position
             ])
         roles_buffer.seek(0)
         
         channels_buffer = io.StringIO()
-        writer = csv.writer(channels_buffer)
+        writer = csv.writer(channels_buffer, delimiter = ",") # make the columns easy to read
         writer.writerow(["Category Name", "Channel ID", "Channel Name", "Channel Type"])
-        for channel in guild.channels:
+        for channel in reversed(guild.channels):
             writer.writerow([
                 channel.category.name if channel.category else "N/A",
-                channel.id,
+                str(channel.id),
                 channel.name,
                 str(channel.type)
             ])
@@ -39,7 +39,7 @@ class ExportServerCSV(commands.Cog):
         await ctx.send(
             "Export Complete! Please enjoy these files equally!",
             files = [
-                discord.File(io.BytesIO(roles_buffer.getvalue().encode()), filename = "tlgroles.csv"),
-                discord.File(io.BytesIO(channels_buffer.getvalue().encode()), filename = "tlgchannels.csv")
+                discord.File(io.BytesIO(roles_buffer.getvalue().encode("utf-8-sig")), filename = "tlgroles.csv"),
+                discord.File(io.BytesIO(channels_buffer.getvalue().encode("utf-8-sig")), filename = "tlgchannels.csv")
             ]
         )
