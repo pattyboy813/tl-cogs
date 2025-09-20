@@ -7,7 +7,7 @@ import time
 from pyrate_limiter import (
     BucketFullException,
     Duration,
-    RequestRate,
+    Rate,
     Limiter,
     MemoryListBucket,
     MemoryQueueBucket,
@@ -53,8 +53,8 @@ class ModPlus(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, 8818154, force_registration=True)
         # PyRateLimit.init(redis_host="localhost", redis_port=6379)
-        hourly_rate5 = RequestRate(5, Duration.HOUR)
-        hourly_rate3 = RequestRate(3, Duration.HOUR)
+        hourly_rate5 = Rate(5, Duration.HOUR)
+        hourly_rate3 = Rate(3, Duration.HOUR)
         self.kicklimiter = Limiter(hourly_rate5)
         self.banlimiter = Limiter(hourly_rate3)
         # self.kicklimit = PyRateLimit()
