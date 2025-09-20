@@ -171,38 +171,7 @@ class Mod(
         if await self.config.version() < "1.3.0":
             guild_dict = await self.config.all_guilds()
             async for guild_id in AsyncIter(guild_dict.keys(), steps=25):
-                async with self.config.guild_from_id(guild_id).all() as guild_data:
-                    current_state = guild_data.pop("ban_mention_spam", False)
-                    if current_state is not False:
-                        if "mention_spam" not in guild_data:
-                            guild_data["mention_spam"] = {}
-                        guild_data["mention_spam"]["ban"] = current_state
+                async with self.config.guild_from_id(guild_id).mention_spam() as ms:
+                    if "strict" not in ms:
+                        ms["strict"] = False
             await self.config.version.set("1.3.0")
-
-    @commands.command()
-    @commands.is_owner()
-    async def moveignoredchannels(self, ctx: commands.Context) -> None:
-        """Move ignored channels and servers to core"""
-        all_guilds = await self.config.all_guilds()
-        all_channels = await self.config.all_channels()
-        for guild_id, settings in all_guilds.items():
-            await self.bot._config.guild_from_id(guild_id).ignored.set(settings["ignored"])
-            await self.config.guild_from_id(guild_id).ignored.clear()
-        for channel_id, settings in all_channels.items():
-            await self.bot._config.channel_from_id(channel_id).ignored.set(settings["ignored"])
-            await self.config.channel_from_id(channel_id).clear()
-        await ctx.send(_("Ignored channels and guilds restored."))
-
-    @commands.command()
-    @commands.is_owner()
-    async def movedeletedelay(self, ctx: commands.Context) -> None:
-        """
-        Move deletedelay settings to core
-        """
-        all_guilds = await self.config.all_guilds()
-        for guild_id, settings in all_guilds.items():
-            await self.bot._config.guild_from_id(guild_id).delete_delay.set(
-                settings["delete_delay"]
-            )
-            await self.config.guild_from_id(guild_id).delete_delay.clear()
-        await ctx.send(_("Delete delay settings restored."))

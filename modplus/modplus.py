@@ -5,12 +5,12 @@ import asyncio
 import datetime
 import time
 from pyrate_limiter import (
-	BucketFullException,
-	Duration,
-	RequestRate,
-	Limiter,
-	MemoryListBucket,
-	MemoryQueueBucket,
+    BucketFullException,
+    Duration,
+    RequestRate,
+    Limiter,
+    MemoryListBucket,
+    MemoryQueueBucket,
 )
 
 ERROR_MESSAGES = {
@@ -334,139 +334,3 @@ class ModPlus(commands.Cog):
                 break
         if not canrun:
             return False
-        if permkey == 'kick':
-            try:
-                self.kicklimiter.try_acquire(str(ctx.author.id))
-            except BucketFullException:
-                await self.rate_limit_exceeded(ctx.author, 'kick')
-                return False
-        elif permkey == 'ban':
-            try:
-                self.banlimiter.try_acquire(str(ctx.author.id))
-            except BucketFullException:
-                await self.rate_limit_exceeded(ctx.author, 'kick')
-                return False
-        return True
-
-
-    @commands.group()
-    @checks.admin()
-    async def modpset(self, ctx):
-        """Configure Mod Plus"""
-        pass
-
-    @modpset.group(aliases=['perms', 'perm'])
-    async def permissions(self, ctx):
-        """Configure Role Permissions"""
-        pass
-
-    @permissions.command(name='info')
-    async def permsinfo(self, ctx):
-        """Get info about perms system"""
-        await ctx.send(PERM_SYS_INFO)
-
-    @permissions.command(name='add')
-    async def permsadd(self, ctx, role: discord.Role, *, permkey: str):
-        """Add Perms to a Role"""
-        permkey = permkey.strip().lower()
-        if permkey not in self.permkeys:
-            return await ctx.send(ERROR_MESSAGES['PERM_UNRECOGNIZED'])
-
-        data = await self.config.guild(ctx.guild).get_raw("perms", permkey)
-
-        if role.id in data:
-            return await ctx.send(f"{role.name} already has the {permkey} permission")
-
-        data.append(role.id)
-        await self.config.guild(ctx.guild).set_raw("perms", permkey, value=data)
-        return await ctx.send(f"{role.name} was sucessfully given the {permkey} permission")
-
-    @permissions.command(name='remove')
-    async def permsremove(self, ctx, role: discord.Role, *, permkey: str):
-        """Revoke Perms from a Role"""
-        permkey = permkey.strip().lower()
-        if permkey not in self.permkeys:
-            return await ctx.send(ERROR_MESSAGES['PERM_UNRECOGNIZED'])
-
-        data = await self.config.guild(ctx.guild).get_raw("perms", permkey)
-        if role.id not in data:
-            return await ctx.send(f"{role.name} doesn't have the {permkey} permission")
-        data.remove(role.id)
-        await self.config.guild(ctx.guild).set_raw("perms", permkey, value=data)
-        return await ctx.send(f"{role.name} has sucessfully been revoked the {permkey} permission")
-    
-    @permissions.group(name='list')
-    async def permslist(self, ctx):
-        """List Permissions"""
-        pass
-
-    @permslist.command(name='perm', aliases=['perms', 'permission'])
-    async def list_perm_by_perm(self, ctx, *, permkey):
-        """List Roles which have the given perm"""
-        permkey = permkey.strip().lower()
-        if permkey not in self.permkeys:
-            return await ctx.send(ERROR_MESSAGES['PERM_UNRECOGNIZED'])
-
-        data = await self.config.guild(ctx.guild).get_raw("perms", permkey)
-        rolenames = []
-        for roleid in data:
-            role = ctx.guild.get_role(roleid)
-            if role is None:
-                continue
-            rolenames.append(role.mention)
-        output = f"Roles that have {permkey} permission: " + ', '.join(rolenames)
-        if len(rolenames) == 0:
-            output = f"No Roles have the {permkey} permission."
-        await ctx.send(output)
-    
-    @permslist.command(name='role')
-    async def list_perms_by_role(self, ctx, role: discord.Role):
-        """List which permissions a role has"""
-        data = await self.config.guild(ctx.guild).perms()
-        perms = []
-        for permkey in data:
-            if role.id in data[permkey]:
-                perms.append(permkey)
-        if len(perms) == 0:
-            await ctx.send(f"{role.name} has no permissions.")
-        else:
-            output = f"{role.name} has the following for permisssions: " + ', '.join(perms)
-            await ctx.send(output)
-
-
-    # Role Config Probably Delte
-
-    # @modpset.command(name='role')
-    # async def setrole(self, ctx, role: discord.Role, *, rolekey):
-    #     """Set the coresponding role"""
-    #     rolekey = rolekey.strip().lower()
-    #     if rolekey not in self.rolekeys:
-    #         return await ctx.send("Role Key was not recognized. List of valid keys: warning1, warning2, warning3+, jailed, muted")
-    #     data = await self.config.guild(ctx.guild).roles()
-    #     data[rolekey] = role.id
-    #     await self.config.guild(ctx.guild).roles.set(data)
-    #     await ctx.send(f'{rolekey} was set to {role.mention}.')
-
-    # @modpset.command(name='showroles')
-    # async def set_showroles(self, ctx):
-    #     """Show which role is attributed to which key"""
-    #     output = "__**Role Configuration:**__"
-    #     data = await self.config.guild(ctx.guild).roles()
-    #     for rolekey in data:
-    #         if data[rolekey] is None:
-    #             output += f"\n**{rolekey}**: Not Set"
-    #         else:
-    #             role = ctx.guild.get_role(data[rolekey])
-    #             output += f"\n**{rolekey}**: {role.mention}"
-    #     await ctx.send(output)
-
-    # @modpset.command()
-    # async def createmutedrole(self, ctx):
-    #     """Create a muted role with all channel overrides. This will override an already set muted role"""
-    #     async with ctx.typing():
-    #         guild: discord.Guild = ctx.guild
-    #         mutedrole : discord.Role = guild.create_role(name="Muted", reason="Muted Role Creation")
-    #         for channel in guild.text_channels:
-    #             channel.set_permissions(mutedrole, send_messages=False)
-
-        

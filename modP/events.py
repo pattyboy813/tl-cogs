@@ -67,7 +67,7 @@ class Events(MixinMeta):
                         message.created_at.replace(tzinfo=timezone.utc),
                         "ban",
                         author,
-                        guild.me,
+                        (guild.me or guild.get_member(self.bot.user.id)),
                         _("Mention spam (Autoban)"),
                         until=None,
                         channel=None,
@@ -91,7 +91,7 @@ class Events(MixinMeta):
                         message.created_at.replace(tzinfo=timezone.utc),
                         "kick",
                         author,
-                        guild.me,
+                        (guild.me or guild.get_member(self.bot.user.id)),
                         _("Mention spam (Autokick)"),
                         until=None,
                         channel=None,
@@ -123,7 +123,7 @@ class Events(MixinMeta):
                     message.created_at.replace(tzinfo=timezone.utc),
                     "warning",
                     author,
-                    guild.me,
+                    (guild.me or guild.get_member(self.bot.user.id)),
                     _("Mention spam (Autowarn)"),
                     until=None,
                     channel=None,
@@ -171,8 +171,6 @@ class Events(MixinMeta):
                     # Ensure order is maintained without duplicates occurring
                     name_list.remove(before.name)
                 name_list.append(before.name)
-                while len(name_list) > 20:
-                    name_list.pop(0)
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):

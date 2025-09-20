@@ -220,94 +220,45 @@ class ModInfo(MixinMeta):
             # In embed.fields.2.value: Must be 1024 or fewer in length.
             if len(role_str) > 1024:
                 # Alternative string building time.
-                # This is not the most optimal, but if you're hitting this, you are losing more time
-                # to every single check running on users than the occasional user info invoke
-                # We don't start by building this way, since the number of times we hit this should be
-                # infinitesimally small compared to when we don't across all uses of Red.
-                continuation_string = _(
-                    "and {numeric_number} more roles not displayed due to embed limits."
+                # This is not the most optimal, but
+                # it works fine.
+                most_important = [x.mention for x in roles if not x.is_default()]
+                role_str = _("{num} roles").format(num=len(roles))
+                if len(most_important) < 16:
+                    role_str += ": " + ", ".join(most_important)
+            else:
+                role_str = role_str
+
+            data = [
+                (_("User ID"), user.id),
+                (_("Status"), f"{statusemoji} {activity}"),
+                (_("Joined Server"), joined_on),
+                (_("Joined Discord"), created_on),
+            ]
+
+            if voice_state and voice_state.channel:
+                data.append(
+                    (_("Current voice channel"), f"{voice_state.channel.name} (ID: {voice_state.channel.id})")
                 )
-                available_length = 1024 - len(continuation_string)  # do not attempt to tweak, i18n
 
-                role_chunks = []
-                remaining_roles = 0
+            e = discord.Embed(colour=user.colour, timestamp=ctx.message.created_at)
+            e.add_field(name=_("Roles"), value=role_str, inline=False)
 
-                for r in roles:
-                    chunk = f"{r.mention}, "
-                    chunk_size = len(chunk)
+            if names:
+                e.add_field(name=_("Previous Names"), value=", ".join(names), inline=False)
+            if nicks:
+                e.add_field(name=_("Previous Nicknames"), value=", ".join(nicks), inline=False)
 
-                    if chunk_size < available_length:
-                        available_length -= chunk_size
-                        role_chunks.append(chunk)
-                    else:
-                        remaining_roles += 1
+            for name, value in data:
+                e.add_field(name=name, value=value, inline=True)
 
-                role_chunks.append(continuation_string.format(numeric_number=remaining_roles))
-
-                role_str = "".join(role_chunks)
-
+            e.set_footer(text=_("Member #{} | User ID: {}").format(member_number, user.id))
+            e.set_author(name=str(user), icon_url=user.display_avatar.url)
+            e.set_thumbnail(url=user.display_avatar.url)
+            await ctx.send(embed=e)
         else:
-            role_str = None
-
-        data = discord.Embed(description=status_string or activity, colour=user.colour)
-
-        data.add_field(name=_("Joined Discord on"), value=created_on)
-        data.add_field(name=_("Joined this server on"), value=joined_on)
-        if role_str is not None:
-            data.add_field(
-                name=_("Roles") if len(roles) > 1 else _("Role"), value=role_str, inline=False
-            )
-        if names:
-            # May need sanitizing later, but mentions do not ping in embeds currently
-            val = filter_invites(", ".join(names))
-            data.add_field(
-                name=_("Previous Names") if len(names) > 1 else _("Previous Name"),
-                value=val,
-                inline=False,
-            )
-        if nicks:
-            # May need sanitizing later, but mentions do not ping in embeds currently
-            val = filter_invites(", ".join(nicks))
-            data.add_field(
-                name=_("Previous Nicknames") if len(nicks) > 1 else _("Previous Nickname"),
-                value=val,
-                inline=False,
-            )
-        if voice_state and voice_state.channel:
-            data.add_field(
-                name=_("Current voice channel"),
-                value="{0.mention} ID: {0.id}".format(voice_state.channel),
-                inline=False,
-            )
-        data.set_footer(text=_("Member #{} | User ID: {}").format(member_number, user.id))
-
-        name = str(user)
-        name = " ~ ".join((name, user.nick)) if user.nick else name
-        name = filter_invites(name)
-
-        avatar = user.display_avatar.url
-        data.set_author(name=f"{statusemoji} {name}", url=avatar)
-        data.set_thumbnail(url=avatar)
-
-        await ctx.send(embed=data)
-
-    @commands.command()
-    async def names(self, ctx: commands.Context, *, user: discord.Member):
-        """Show previous names and nicknames of a user."""
-        names, nicks = await self.get_names_and_nicks(user)
-        msg = ""
-        if names:
-            msg += _("**Past 20 names**:")
-            msg += "\n"
-            msg += ", ".join(names)
-        if nicks:
-            if msg:
-                msg += "\n\n"
-            msg += _("**Past 20 nicknames**:")
-            msg += "\n"
-            msg += ", ".join(nicks)
-        if msg:
-            msg = filter_various_mentions(msg)
-            await ctx.send(msg)
-        else:
-            await ctx.send(_("That user doesn't have any recorded name or nickname change."))
+            e = discord.Embed(colour=user.colour, timestamp=ctx.message.created_at)
+            e.set_footer(text=_("Member #{} | User ID: {}").format(member_number, user.id))
+            e.set_author(name=str(user), icon_url=user.display_avatar.url)
+            e.set_thumbnail(url=user.display_avatar.url)
+            await ctx.send(embed=e)

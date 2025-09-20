@@ -351,177 +351,51 @@ class ModSettings(MixinMeta):
     @modset.command()
     @commands.guild_only()
     async def dm(self, ctx: commands.Context, enabled: bool = None):
-        """Toggle whether a message should be sent to a user when they are kicked/banned.
-
-        If this option is enabled, the bot will attempt to DM the user with the guild name
-        and reason as to why they were kicked/banned.
-        """
+        """Toggle whether a message should be sent to
+        users when they are kicked/banned."""
         guild = ctx.guild
         if enabled is None:
-            setting = await self.config.guild(guild).dm_on_kickban()
-            await ctx.send(
-                _("DM when kicked/banned is currently set to: {setting}").format(setting=setting)
-            )
+            state = await self.config.guild(guild).dm_on_kickban()
+            if state:
+                msg = _("Users will be messaged when they are kicked/banned.")
+            else:
+                msg = _("Users will not be messaged when they are kicked/banned.")
+            await ctx.send(msg)
             return
-        await self.config.guild(guild).dm_on_kickban.set(enabled)
+
         if enabled:
-            await ctx.send(_("Bot will now attempt to send a DM to user before kick and ban."))
+            msg = _("Users will be messaged when they are kicked/banned.")
         else:
-            await ctx.send(
-                _("Bot will no longer attempt to send a DM to user before kick and ban.")
-            )
+            msg = _("Users will not be messaged when they are kicked/banned.")
+        await self.config.guild(guild).dm_on_kickban.set(enabled)
+        await ctx.send(msg)
 
     @modset.command()
     @commands.guild_only()
-    async def defaultdays(self, ctx: commands.Context, days: int = 0):
-        """Set the default number of days worth of messages to be deleted when a user is banned.
+    async def defaultdays(self, ctx: commands.Context, days: int):
+        """Set the default number of days of messages to delete on banning.
 
-        The number of days must be between 0 and 7.
+        Minimum 0 days, maximum 7. 0 means "do not delete any messages".
         """
-        guild = ctx.guild
         if not (0 <= days <= 7):
-            return await ctx.send(_("Invalid number of days. Must be between 0 and 7."))
-        await self.config.guild(guild).default_days.set(days)
-        await ctx.send(
-            _("{days} days worth of messages will be deleted when a user is banned.").format(
-                days=days
-            )
-        )
+            await ctx.send(_("Invalid days. Must be between 0 and 7."))
+            return
+        await self.config.guild(ctx.guild).default_days.set(days)
+        await ctx.send(_("Done."))
 
     @modset.command()
     @commands.guild_only()
-    async def defaultduration(
+    async def defaulttempbanduration(
         self,
         ctx: commands.Context,
-        *,
         duration: commands.TimedeltaConverter(
-            minimum=timedelta(seconds=1), default_unit="seconds"
+            minimum=timedelta(seconds=1), maximum=timedelta(days=365), default_unit="seconds"
         ),
     ):
-        """Set the default time to be used when a user is tempbanned.
-
-        Accepts: seconds, minutes, hours, days, weeks
-        `duration` must be greater than zero.
-
-        Examples:
-            `[p]modset defaultduration 7d12h10m`
-            `[p]modset defaultduration 7 days 12 hours 10 minutes`
-        """
-        guild = ctx.guild
-        await self.config.guild(guild).default_tempban_duration.set(duration.total_seconds())
+        """Set the default temporary ban duration."""
+        await self.config.guild(ctx.guild).default_tempban_duration.set(int(duration.total_seconds()))
         await ctx.send(
-            _("The default duration for tempbanning a user is now {duration}.").format(
+            _("Default tempban duration set to {duration}.").format(
                 duration=humanize_timedelta(timedelta=duration)
             )
         )
-
-    @modset.command()
-    @commands.guild_only()
-    async def tracknicknames(self, ctx: commands.Context, enabled: bool = None):
-        """
-        Toggle whether nickname changes should be tracked.
-
-        This setting will be overridden if trackallnames is disabled.
-        """
-        guild = ctx.guild
-        if enabled is None:
-            state = await self.config.guild(guild).track_nicknames()
-            if state:
-                msg = _("Nickname changes are currently being tracked.")
-            else:
-                msg = _("Nickname changes are not currently being tracked.")
-            await ctx.send(msg)
-            return
-
-        if enabled:
-            msg = _("Nickname changes will now be tracked.")
-        else:
-            msg = _("Nickname changes will no longer be tracked.")
-        await self.config.guild(guild).track_nicknames.set(enabled)
-        await ctx.send(msg)
-
-    @modset.command()
-    @commands.is_owner()
-    async def trackallnames(self, ctx: commands.Context, enabled: bool = None):
-        """
-        Toggle whether all name changes should be tracked.
-
-        Toggling this off also overrides the tracknicknames setting.
-        """
-        if enabled is None:
-            state = await self.config.track_all_names()
-            if state:
-                msg = _("Name changes are currently being tracked.")
-            else:
-                msg = _("All name changes are currently not being tracked.")
-            await ctx.send(msg)
-            return
-
-        if enabled:
-            msg = _("Name changes will now be tracked.")
-        else:
-            msg = _(
-                "All name changes will no longer be tracked.\n"
-                "To delete existing name data, use {command}."
-            ).format(command=f"`{ctx.clean_prefix}modset deletenames`")
-        await self.config.track_all_names.set(enabled)
-        await ctx.send(msg)
-
-    @modset.command()
-    @commands.max_concurrency(1, commands.BucketType.default)
-    @commands.is_owner()
-    async def deletenames(self, ctx: commands.Context, confirmation: bool = False) -> None:
-        """Delete all stored usernames and nicknames.
-
-        Examples:
-            - `[p]modset deletenames` - Did not confirm. Shows the help message.
-            - `[p]modset deletenames yes` - Deletes all stored usernames and nicknames.
-
-        **Arguments**
-
-        - `<confirmation>` This will default to false unless specified.
-        """
-        if not confirmation:
-            await ctx.send(
-                _(
-                    "This will delete all stored usernames and nicknames the bot has stored."
-                    "\nIf you're sure, type {command}"
-                ).format(command=inline(f"{ctx.clean_prefix}modset deletenames yes"))
-            )
-            return
-
-        async with ctx.typing():
-            # Nickname data
-            async with self.config._get_base_group(self.config.MEMBER).all() as mod_member_data:
-                guilds_to_remove = []
-                for guild_id, guild_data in mod_member_data.items():
-                    await asyncio.sleep(0)
-                    members_to_remove = []
-
-                    async for member_id, member_data in AsyncIter(guild_data.items(), steps=100):
-                        if "past_nicks" in member_data:
-                            del member_data["past_nicks"]
-                        if not member_data:
-                            members_to_remove.append(member_id)
-
-                    async for member_id in AsyncIter(members_to_remove, steps=100):
-                        del guild_data[member_id]
-                    if not guild_data:
-                        guilds_to_remove.append(guild_id)
-
-                async for guild_id in AsyncIter(guilds_to_remove, steps=100):
-                    del mod_member_data[guild_id]
-
-            # Username data
-            async with self.config._get_base_group(self.config.USER).all() as mod_user_data:
-                users_to_remove = []
-                async for user_id, user_data in AsyncIter(mod_user_data.items(), steps=100):
-                    if "past_names" in user_data:
-                        del user_data["past_names"]
-                    if not user_data:
-                        users_to_remove.append(user_id)
-
-                async for user_id in AsyncIter(users_to_remove, steps=100):
-                    del mod_user_data[user_id]
-
-        await ctx.send(_("Usernames and nicknames have been deleted from Mod config."))

@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import discord
 from redbot.core import commands, i18n, checks, modlog
-from redbot.core.commands import UserInputOptional
 from redbot.core.utils import AsyncIter
 from redbot.core.utils.chat_formatting import (
     pagify,
@@ -35,7 +34,7 @@ class KickBanMixin(MixinMeta):
         to send the newly unbanned user
         :returns: :class:`Invite`"""
         guild = ctx.guild
-        my_perms: discord.Permissions = guild.me.guild_permissions
+        my_perms: discord.Permissions = (guild.get_member(ctx.bot.user.id) or ctx.me).guild_permissions
         if my_perms.manage_guild or my_perms.administrator:
             if "VANITY_URL" in guild.features:
                 # guild has a vanity url so use it as the one to send
@@ -59,7 +58,7 @@ class KickBanMixin(MixinMeta):
                 return inv
         else:  # No existing invite found that is valid
             channels_and_perms = zip(
-                guild.text_channels, map(guild.me.permissions_in, guild.text_channels)
+                guild.text_channels, map((guild.get_member(ctx.bot.user.id) or ctx.me).permissions_in, guild.text_channels)
             )
             channel = next(
                 (channel for channel, perms in channels_and_perms if perms.create_instant_invite),
@@ -95,17 +94,14 @@ class KickBanMixin(MixinMeta):
         voice_channel: discord.VoiceChannel = user_voice_state.channel
         required_perms = discord.Permissions()
         required_perms.update(**perms)
-        if not voice_channel.permissions_for(ctx.me) >= required_perms:
+        if not voice_channel.permissions_for(ctx.me).is_superset(required_perms):
             await ctx.send(
                 _("I require the {perms} permission(s) in that user's channel to do that.").format(
                     perms=format_perms_list(required_perms)
                 )
             )
             return False
-        if (
-            ctx.permission_state is commands.PermState.NORMAL
-            and not voice_channel.permissions_for(ctx.author) >= required_perms
-        ):
+        if not voice_channel.permissions_for(ctx.author).is_superset(required_perms):
             await ctx.send(
                 _(
                     "You must have the {perms} permission(s) in that user's channel to use this "
@@ -146,7 +142,7 @@ class KickBanMixin(MixinMeta):
                         "hierarchy."
                     ),
                 )
-            elif guild.me.top_role <= user.top_role or user == guild.owner:
+            elif (guild.get_member(self.bot.user.id) or ctx.me).top_role <= user.top_role or user == guild.owner:
                 return False, _("I cannot do that due to Discord hierarchy rules.")
 
             toggle = await self.config.guild(guild).dm_on_kickban()
@@ -167,7 +163,7 @@ class KickBanMixin(MixinMeta):
         else:
             tempbans = await self.config.guild(guild).current_tempbans()
 
-            ban_list = [ban.user.id for ban in await guild.bans()]
+            ban_list = [ban_entry.user.id async for ban_entry in guild.bans(limit=None)]
             if user.id in ban_list:
                 if user.id in tempbans:
                     async with self.config.guild(guild).current_tempbans() as tempbans:
@@ -232,7 +228,8 @@ class KickBanMixin(MixinMeta):
     async def check_tempban_expirations(self):
         while self == self.bot.get_cog("Mod"):
             async for guild in AsyncIter(self.bot.guilds, steps=100):
-                if not guild.me.guild_permissions.ban_members:
+                me = guild.get_member(self.bot.user.id)
+                if not me.guild_permissions.ban_members:
                     continue
 
                 if await self.bot.cog_disabled_in_guild(self, guild):
@@ -305,7 +302,7 @@ class KickBanMixin(MixinMeta):
                 )
             )
             return
-        elif ctx.guild.me.top_role <= user.top_role or user == ctx.guild.owner:
+        elif ctx.me.top_role <= user.top_role or user == ctx.guild.owner:
             await ctx.send(_("I cannot do that due to Discord hierarchy rules."))
             return
         audit_reason = get_audit_reason(author, reason, shorten=True)
@@ -453,12 +450,12 @@ class KickBanMixin(MixinMeta):
             await ctx.send(_("Invalid days. Must be between 0 and 7."))
             return
 
-        if not guild.me.guild_permissions.ban_members:
+        if not (guild.get_member(self.bot.user.id) or ctx.me).guild_permissions.ban_members:
             return await ctx.send(_("I lack the permissions to do this."))
 
         tempbans = await self.config.guild(guild).current_tempbans()
 
-        ban_list = await guild.bans()
+        ban_list = [entry async for entry in guild.bans(limit=None)]
         for entry in ban_list:
             for user_id in user_ids:
                 if entry.user.id == user_id:
@@ -608,7 +605,7 @@ class KickBanMixin(MixinMeta):
                 )
             )
             return
-        elif guild.me.top_role <= user.top_role or user == guild.owner:
+        elif (guild.get_member(self.bot.user.id) or ctx.me).top_role <= user.top_role or user == guild.owner:
             await ctx.send(_("I cannot do that due to Discord hierarchy rules."))
             return
 
@@ -752,7 +749,7 @@ class KickBanMixin(MixinMeta):
 
     @commands.command()
     @commands.guild_only()
-    @commands.mod_or_permissions(move_members=True)
+    @checks.mod_or_permissions(move_members=True)
     async def voicekick(
         self, ctx: commands.Context, member: discord.Member, *, reason: str = None
     ):
@@ -895,7 +892,7 @@ class KickBanMixin(MixinMeta):
         guild = ctx.guild
         author = ctx.author
         audit_reason = get_audit_reason(ctx.author, reason, shorten=True)
-        bans = await guild.bans()
+        bans = [be async for be in guild.bans(limit=None)]
         bans = [be.user for be in bans]
         user = discord.utils.get(bans, id=user_id)
         if not user:
