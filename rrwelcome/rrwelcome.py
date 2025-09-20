@@ -41,7 +41,7 @@ class ReactRoleView(discord.ui.View):
 
 class ReactRoleButton(discord.ui.Button):
     def __init__(self, label: str, role_ids: list[int]):
-        super().__init__(label = label, style = discord.ButtonStyle.success, custom_ids = f"multi_{'_'.join(str(r) for r in role_ids)}",)
+        super().__init__(label = label, style = discord.ButtonStyle.success, custom_id = f"multi_{'_'.join(str(r) for r in role_ids)}",)
         self.role_ids = role_ids
 
     async def callback(self, interaction: discord.Interaction):
@@ -52,7 +52,7 @@ class ReactRoleButton(discord.ui.Button):
 
         for r in self.role_ids:
             role = guild.get_role(r)
-            if role in None:
+            if role is None:
                 continue
             if role in member.roles:
                 await member.remove_roles(role, reason = "User requested action via Welcome Reaction Role")
@@ -65,7 +65,7 @@ class ReactRoleButton(discord.ui.Button):
         if added:
             msg.append(f"Added {'and '.join(added)}")
         if removed:
-            msg.append(f"Remove {'and '.join(removed)}")
+            msg.append(f"Removed {'and '.join(removed)}")
         
         if not msg:
             msg = ["Sorry, I can't add role that don't exist. Ping a staff member to get this sorted for you."]
