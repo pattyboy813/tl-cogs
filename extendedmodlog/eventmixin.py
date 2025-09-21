@@ -1,7 +1,8 @@
-import datetime
-import discord
 import asyncio
+import datetime
 import logging
+
+import discord
 
 from discord.ext.commands.converter import Converter
 from discord.ext.commands.errors import BadArgument
@@ -12,6 +13,8 @@ from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.chat_formatting import humanize_list, inline, escape
 
 from typing import Optional, Sequence, Union, cast
+
+GuildChannel = Union[discord.abc.GuildChannel, discord.Thread]
 
 _ = Translator("ExtendedModLog", __file__)
 logger = logging.getLogger("red.trusty-cogs.ExtendedModLog")
@@ -120,12 +123,25 @@ class EventMixin:
             colour = discord.Colour(self.settings[guild.id][event_type]["colour"])
         return colour
 
-    async def is_ignored_channel(self, guild: discord.Guild, channel: discord.abc.GuildChannel):
+    async def is_ignored_channel(
+        self, guild: discord.Guild, channel: Optional[GuildChannel]
+    ) -> bool:
+        if channel is None:
+            return False
         ignored_channels = self.settings[guild.id]["ignored_channels"]
-        if channel.id in ignored_channels:
+        channel_id = getattr(channel, "id", None)
+        if channel_id in ignored_channels:
             return True
-        if channel.category and channel.category.id in ignored_channels:
+        category = getattr(channel, "category", None)
+        if category and getattr(category, "id", None) in ignored_channels:
             return True
+        parent = getattr(channel, "parent", None)
+        if parent and getattr(parent, "id", None) in ignored_channels:
+            return True
+        if parent:
+            parent_category = getattr(parent, "category", None)
+            if parent_category and getattr(parent_category, "id", None) in ignored_channels:
+                return True
         return False
 
     async def member_can_run(self, ctx: commands.Context) -> bool:
@@ -151,11 +167,12 @@ class EventMixin:
                 can = False
         return can
 
-    async def modlog_channel(self, guild: discord.Guild, event: str) -> discord.TextChannel:
-        channel = None
+    async def modlog_channel(self, guild: discord.Guild, event: str) -> GuildChannel:
+        channel: Optional[GuildChannel] = None
         settings = self.settings[guild.id].get(event)
         if "channel" in settings and settings["channel"]:
-            channel = guild.get_channel(settings["channel"])
+            get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
+            channel = get_channel(settings["channel"])
         if channel is None:
             try:
                 channel = await modlog.get_modlog_channel(guild)
@@ -279,7 +296,9 @@ class EventMixin:
             channel = await self.modlog_channel(guild, "message_delete")
         except RuntimeError:
             return
-        if await self.is_ignored_channel(guild, guild.get_channel(channel_id)):
+        get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
+        source_channel = get_channel(channel_id)
+        if await self.is_ignored_channel(guild, source_channel):
             return
         embed_links = (
             channel.permissions_for(guild.me).embed_links
@@ -289,20 +308,21 @@ class EventMixin:
         if message is None:
             if settings["cached_only"]:
                 return
-            message_channel = guild.get_channel(channel_id)
+            message_channel = source_channel
+            channel_mention = self._channel_mention(channel_id, message_channel)
             if embed_links:
                 embed = discord.Embed(
                     description=_("*Message's content unknown.*"),
                     colour=await self.get_event_colour(guild, "message_delete"),
                 )
-                embed.add_field(name=_("Channel"), value=message_channel.mention)
+                embed.add_field(name=_("Channel"), value=channel_mention)
                 embed.set_author(name=_("Deleted Message"))
                 await channel.send(embed=embed)
             else:
                 infomessage = _("{emoji} `{time}` A message was deleted in {channel}").format(
                     emoji=settings["emoji"],
                     time=datetime.datetime.utcnow().strftime("%H:%M:%S"),
-                    channel=message_channel.mention,
+                    channel=channel_mention,
                 )
                 await channel.send(f"{infomessage}\n> *Message's content unknown.*")
             return
@@ -337,7 +357,8 @@ class EventMixin:
                 if log.target.id == message.author.id and same_chan:
                     perp = f"{log.user}({log.user.id})"
                     break
-        message_channel = cast(discord.TextChannel, message.channel)
+        message_channel = cast(GuildChannel, message.channel)
+        channel_mention = self._channel_mention(message_channel.id, message_channel)
         author = message.author
         if perp is None:
             infomessage = _(
@@ -346,7 +367,7 @@ class EventMixin:
                 emoji=settings["emoji"],
                 time=time.strftime("%H:%M:%S"),
                 author=author,
-                channel=message_channel.mention,
+                channel=channel_mention,
                 a_id=author.id,
             )
         else:
@@ -359,7 +380,7 @@ class EventMixin:
                 perp=perp,
                 author=author,
                 a_id=author.id,
-                channel=message_channel.mention,
+                channel=channel_mention,
             )
         if embed_links:
             embed = discord.Embed(
@@ -368,7 +389,7 @@ class EventMixin:
                 timestamp=time,
             )
 
-            embed.add_field(name=_("Channel"), value=message_channel.mention)
+            embed.add_field(name=_("Channel"), value=channel_mention)
             if perp:
                 embed.add_field(name=_("Deleted by"), value=perp)
             if message.attachments:
@@ -403,7 +424,9 @@ class EventMixin:
         if not settings["enabled"] or not settings["bulk_enabled"]:
             return
         channel_id = payload.channel_id
-        message_channel = guild.get_channel(channel_id)
+        get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
+        message_channel = get_channel(channel_id)
+        channel_mention = self._channel_mention(channel_id, message_channel)
         try:
             channel = await self.modlog_channel(guild, "message_delete")
         except RuntimeError:
@@ -417,7 +440,7 @@ class EventMixin:
         message_amount = len(payload.message_ids)
         if embed_links:
             embed = discord.Embed(
-                description=message_channel.mention,
+                description=channel_mention,
                 colour=await self.get_event_colour(guild, "message_delete"),
             )
             guild_icon_url = self._guild_icon_url(guild)
@@ -425,7 +448,7 @@ class EventMixin:
                 name=_("Bulk message delete"),
                 icon_url=guild_icon_url or discord.Embed.Empty,
             )
-            embed.add_field(name=_("Channel"), value=message_channel.mention)
+            embed.add_field(name=_("Channel"), value=channel_mention)
             embed.add_field(name=_("Messages deleted"), value=str(message_amount))
             await channel.send(embed=embed)
         else:
@@ -435,7 +458,7 @@ class EventMixin:
                 emoji=settings["emoji"],
                 time=datetime.datetime.utcnow().strftime("%H:%M:%S"),
                 amount=message_amount,
-                channel=message_channel.mention,
+                channel=channel_mention,
             )
             await channel.send(infomessage)
         if settings["bulk_individual"]:
@@ -1674,7 +1697,7 @@ class EventMixin:
     @commands.Cog.listener()
     async def on_invite_create(self, invite: discord.Invite) -> None:
         """
-            New in discord.py 1.3
+            Requires discord.py 2.6.2 or higher.
         """
         guild = invite.guild
         if guild.id not in self.settings:
@@ -1741,7 +1764,7 @@ class EventMixin:
     @commands.Cog.listener()
     async def on_invite_delete(self, invite: discord.Invite) -> None:
         """
-            New in discord.py 1.3
+            Requires discord.py 2.6.2 or higher.
         """
         guild = invite.guild
         if guild.id not in self.settings:
@@ -1789,6 +1812,13 @@ class EventMixin:
             await channel.send(embed=embed)
         else:
             await channel.send(escape(msg, mass_mentions=True))
+
+    @staticmethod
+    def _channel_mention(channel_id: int, channel: Optional[GuildChannel]) -> str:
+        if channel is None:
+            return f"<#{channel_id}>"
+        return channel.mention
+
     @staticmethod
     def _guild_icon_url(guild: discord.Guild) -> Optional[str]:
         icon = guild.icon
