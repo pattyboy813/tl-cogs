@@ -1,66 +1,163 @@
-from __future__ import annotations
 import asyncio
-from datetime import datetime, timedelta
-from typing import Optional, Union, Iterable
+import datetime
+import logging
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, Optional, Union, List, Sequence, Callable
 
 import discord
-from discord.ext import tasks
+from discord.ext import commands
 
-from redbot.core import commands, checks, Config, modlog
+from redbot.core import checks, commands as redcommands, Config, modlog, VersionInfo, version_info
 from redbot.core.bot import Red
 from redbot.core.i18n import Translator, cog_i18n
-from redbot.core.utils.chat_formatting import humanize_list, escape, inline
-
-from .models import Event, EventSettings, GuildSettings
-from .defaults import initial_guild_settings, DEFAULTS
-from .theme import EmbedFactory, Theme
+from redbot.core.utils.chat_formatting import humanize_list, inline, escape
 
 _ = Translator("ModLogV2", __file__)
+logger = logging.getLogger("red.modlogv2")
+
 GuildChannel = Union[discord.abc.GuildChannel, discord.Thread]
 
+# -------------------------
+# Event declarations
+# -------------------------
 
-# ---- interactive setup UI (uses Select for channels for broad compat) -------
+class Event(Enum):
+    MESSAGE_EDIT = "message_edit"
+    MESSAGE_DELETE = "message_delete"
+    USER_CHANGE = "user_change"
+    ROLE_CHANGE = "role_change"
+    ROLE_CREATE = "role_create"
+    ROLE_DELETE = "role_delete"
+    VOICE_CHANGE = "voice_change"
+    USER_JOIN = "user_join"
+    USER_LEFT = "user_left"
+    CHANNEL_CHANGE = "channel_change"
+    CHANNEL_CREATE = "channel_create"
+    CHANNEL_DELETE = "channel_delete"
+    GUILD_CHANGE = "guild_change"
+    EMOJI_CHANGE = "emoji_change"
+    COMMANDS_USED = "commands_used"
+    INVITE_CREATED = "invite_created"
+    INVITE_DELETED = "invite_deleted"
+
+    @classmethod
+    def from_str(cls, s: str) -> "Event":
+        s = s.lower()
+        for e in cls:
+            if e.value == s:
+                return e
+        raise ValueError(f"Unknown event: {s}")
+
+
+@dataclass
+class EventSettings:
+    enabled: bool = False
+    channel: Optional[int] = None
+    colour: Optional[int] = None
+    embed: bool = True
+    emoji: str = ""
+    # extras per-event
+    # message_edit
+    bots: Optional[bool] = None  # for edit/delete and user_change
+    # message_delete
+    bulk_enabled: Optional[bool] = None
+    bulk_individual: Optional[bool] = None
+    cached_only: Optional[bool] = None
+    # user_change
+    nicknames: Optional[bool] = None
+    # commands_used
+    privs: Optional[List[str]] = None
+
+
+def _defaults() -> Dict[Event, EventSettings]:
+    # mirror original defaults from settings.py
+    d: Dict[Event, EventSettings] = {
+        Event.MESSAGE_EDIT: EventSettings(enabled=False, emoji="\N{MEMO}", bots=False),
+        Event.MESSAGE_DELETE: EventSettings(
+            enabled=False,
+            emoji="\N{WASTEBASKET}\N{VARIATION SELECTOR-16}",
+            bots=False,
+            bulk_enabled=False,
+            bulk_individual=False,
+            cached_only=True,
+        ),
+        Event.USER_CHANGE: EventSettings(
+            enabled=False,
+            emoji="\N{MAN}\N{ZERO WIDTH JOINER}\N{WRENCH}",
+            bots=True,
+            nicknames=True,
+        ),
+        Event.ROLE_CHANGE: EventSettings(enabled=False, emoji="\N{WAVING WHITE FLAG}\N{VARIATION SELECTOR-16}"),
+        Event.ROLE_CREATE: EventSettings(enabled=False, emoji="\N{WAVING WHITE FLAG}\N{VARIATION SELECTOR-16}"),
+        Event.ROLE_DELETE: EventSettings(enabled=False, emoji="\N{WAVING WHITE FLAG}\N{VARIATION SELECTOR-16}"),
+        Event.VOICE_CHANGE: EventSettings(enabled=False, emoji="\N{MICROPHONE}"),
+        Event.USER_JOIN: EventSettings(enabled=False, emoji="\N{INBOX TRAY}\N{VARIATION SELECTOR-16}"),
+        Event.USER_LEFT: EventSettings(enabled=False, emoji="\N{OUTBOX TRAY}\N{VARIATION SELECTOR-16}"),
+        Event.CHANNEL_CHANGE: EventSettings(enabled=False, emoji=""),
+        Event.CHANNEL_CREATE: EventSettings(enabled=False, emoji=""),
+        Event.CHANNEL_DELETE: EventSettings(enabled=False, emoji=""),
+        Event.GUILD_CHANGE: EventSettings(enabled=False, emoji="\N{HAMMER AND WRENCH}\N{VARIATION SELECTOR-16}"),
+        Event.EMOJI_CHANGE: EventSettings(enabled=False, emoji=""),
+        Event.COMMANDS_USED: EventSettings(enabled=False, emoji="\N{ROBOT FACE}", privs=["MOD","ADMIN","BOT_OWNER","GUILD_OWNER"]),
+        Event.INVITE_CREATED: EventSettings(enabled=False, emoji=""),
+        Event.INVITE_DELETED: EventSettings(enabled=False, emoji=""),
+    }
+    return d
+
+# -------------------------
+# Guild state
+# -------------------------
+
+@dataclass
+class GuildState:
+    events: Dict[Event, EventSettings] = field(default_factory=_defaults)
+    ignored_channels: List[int] = field(default_factory=list)
+    invite_links: Dict[str, dict] = field(default_factory=dict)
+
+# -------------------------
+# UI View
+# -------------------------
+
 class SetupView(discord.ui.View):
     def __init__(self, cog: "ModLogV2", guild: discord.Guild, author_id: int):
         super().__init__(timeout=600)
         self.cog = cog
         self.guild = guild
         self.author_id = author_id
-        self.selected_events: list[str] = []
+        self.selected_events: List[str] = []
         self._last_channel_id: Optional[int] = None
 
-        # event selector (max 25 options allowed by Discord)
-        self.event_select.options = [
-            discord.SelectOption(label=e.value, value=e.value) for e in Event
-        ]
+        # Events (1..25)
+        ev_opts = [discord.SelectOption(label=e.value, value=e.value) for e in Event]
+        self.event_select.options = ev_opts[:25]
+        self.event_select.min_values = 1
+        self.event_select.max_values = min(len(self.event_select.options), 25)
 
-        # channel picker — build options; if none visible, add a safe fallback
-        chs = [
+        # Channels (0..1), never empty
+        text_like = [
             c for c in guild.channels
             if isinstance(c, discord.TextChannel) or getattr(c, "type", None) == discord.ChannelType.news
         ]
-        if chs:
-            self.channel_picker.options = [
-                discord.SelectOption(label=f"#{c.name}", value=str(c.id)) for c in chs[:25]
-            ]
+        if text_like:
+            opts = [discord.SelectOption(label=f"#{c.name}", value=str(c.id)) for c in text_like[:25]]
+            self.channel_picker.options = opts
             self.channel_picker.placeholder = "Pick a modlog channel (optional)"
         else:
-            # fallback so the select is valid (non-empty) even if bot can't see channels
             self.channel_picker.options = [
                 discord.SelectOption(label="Use core modlog channel (default)", value="__core__")
             ]
             self.channel_picker.placeholder = "No channels visible — will use core modlog"
+        self.channel_picker.min_values = 0
+        self.channel_picker.max_values = 1
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                _("Only the person who opened this can use it."),
-                ephemeral=True,
-            )
+            await interaction.response.send_message(_("Only the person who opened this can use it."), ephemeral=True)
             return False
         return True
 
-    def _mutate_selected(self, mutator):
+    def _mutate_selected(self, mutator: Callable[[EventSettings], None]) -> int:
         gs = self.cog._gs(self.guild)
         changed = 0
         for raw in self.selected_events:
@@ -76,24 +173,13 @@ class SetupView(discord.ui.View):
         await self.cog._save(self.guild)
         await interaction.response.edit_message(content=msg, view=self)
 
-    @discord.ui.select(
-        placeholder="Pick one or more events…",
-        min_values=1,
-        max_values=25,
-        row=0
-    )
+    @discord.ui.select(placeholder="Pick one or more events…", min_values=1, max_values=25, row=0)
     async def event_select(self, interaction: discord.Interaction, select: discord.ui.Select):
-        self.selected_events = select.values
+        self.selected_events = list(select.values)
         await interaction.response.defer()
 
-    @discord.ui.select(
-        placeholder="Pick a modlog channel (optional)",
-        min_values=0,
-        max_values=1,
-        row=1
-    )
+    @discord.ui.select(placeholder="Pick a modlog channel (optional)", min_values=0, max_values=1, row=1)
     async def channel_picker(self, interaction: discord.Interaction, select: discord.ui.Select):
-        # "__core__" means "use the core modlog channel"
         if select.values and select.values[0] != "__core__":
             self._last_channel_id = int(select.values[0])
         else:
@@ -118,8 +204,7 @@ class SetupView(discord.ui.View):
     async def btn_embeds(self, interaction: discord.Interaction, _button: discord.ui.Button):
         if not self.selected_events:
             return await interaction.response.send_message(_("Select events first."), ephemeral=True)
-        def flip(es: EventSettings):
-            es.embed = not bool(es.embed)
+        def flip(es: EventSettings): es.embed = not bool(es.embed)
         n = self._mutate_selected(flip)
         await self._save_and_ack(interaction, _("Toggled embeds for {n} event(s).").format(n=n))
 
@@ -127,7 +212,6 @@ class SetupView(discord.ui.View):
     async def btn_set_channel(self, interaction: discord.Interaction, _button: discord.ui.Button):
         if not self.selected_events:
             return await interaction.response.send_message(_("Select events first."), ephemeral=True)
-        # _last_channel_id == None → use core modlog channel
         n = self._mutate_selected(lambda es: setattr(es, "channel", self._last_channel_id))
         await self._save_and_ack(interaction, _("Set channel for {n} event(s).").format(n=n))
 
@@ -150,108 +234,107 @@ class SetupView(discord.ui.View):
         await interaction.response.edit_message(content=_("Setup closed."), view=self)
         self.stop()
 
+# -------------------------
+# Cog
+# -------------------------
 
-
-# ---- main cog ---------------------------------------------------------------
 @cog_i18n(_)
 class ModLogV2(commands.Cog):
-    """Extended moderation logs — modern embeds + interactive setup."""
+    """Modern, nicer modlogs with a setup UI and quickstart."""
 
-    __author__ = ["RePulsar", "TrustyJAID", "you"]
-    __version__ = "5.0.1"
+    __author__ = ["Pat+ChatGPT"]
+    __version__ = "2.0.0"
 
     def __init__(self, bot: Red):
-        self.bot = bot
-        self.config = Config.get_conf(self, identifier=154457677895, force_registration=True)
-        self.config.register_guild(**initial_guild_settings().to_dict())
-        self.config.register_global(version="0.0.0")
-        self._cache: dict[int, GuildSettings] = {}
-        self.theme = Theme()
-        self.emb = EmbedFactory(self.theme)
+        self.bot: Red = bot
+        self.config: Config = Config.get_conf(self, 0xA11CE55, force_registration=True)
+        self.config.register_global(version=self.__version__)
+        # per-guild blob
+        self.config.register_guild(
+            events={}, ignored_channels=[], invite_links={}
+        )
+        self._cache: Dict[int, GuildState] = {}
+        self._invite_task: Optional[asyncio.Task] = None
 
-        self.invite_refresh.start()
+    # -------- lifecycle --------
 
-    # ---------- lifecycle ----------
     async def cog_load(self) -> None:
         await self._load_all()
+        if self._invite_task is None or self._invite_task.done():
+            try:
+                self._invite_task = asyncio.create_task(self._invite_loop())
+            except RuntimeError:
+                logger.exception("Failed to start invite loop")
+                self._invite_task = None
 
     def cog_unload(self) -> None:
-        self.invite_refresh.cancel()
+        if self._invite_task:
+            self._invite_task.cancel()
 
-    async def _load_all(self) -> None:
-        all_data = await self.config.all_guilds()
-        stored = await self.config.version()
-        for gid, data in all_data.items():
-            try:
-                gs = GuildSettings.from_dict(data)
-            except Exception:
-                # migrate from legacy flat config shape
-                gs = initial_guild_settings()
-                for e, defaults in DEFAULTS.items():
-                    flat = data.get(e.value) or {}
-                    merged = {**vars(defaults), **flat}
-                    gs.events[e] = EventSettings(**merged)
-                gs.ignored_channels = list(data.get("ignored_channels", []))
-                gs.invite_links = dict(data.get("invite_links", {}))
-            for e, defaults in DEFAULTS.items():
-                gs.events.setdefault(e, EventSettings(**vars(defaults)))
+    async def red_delete_data_for_user(self, **kwargs):
+        return
+
+    # -------- config helpers --------
+
+    async def _load_all(self):
+        all_guild = await self.config.all_guilds()
+        for gid, blob in all_guild.items():
+            gs = GuildState()
+            # load events dict
+            defaults = _defaults()
+            stored = blob.get("events") or {}
+            for ev in Event:
+                raw = stored.get(ev.value)
+                if raw:
+                    es = EventSettings(**{**defaults[ev].__dict__, **raw})
+                else:
+                    es = defaults[ev]
+                gs.events[ev] = es
+            gs.ignored_channels = blob.get("ignored_channels", [])
+            gs.invite_links = blob.get("invite_links", {})
             self._cache[gid] = gs
-        if stored != self.__version__:
-            for gid, gs in self._cache.items():
-                await self.config.guild_from_id(gid).set(gs.to_dict())
-            await self.config.version.set(self.__version__)
 
-    # ---------- helpers ----------
-    def _gs(self, guild: discord.Guild) -> GuildSettings:
+        # bump version if needed
+        stored_version = await self.config.version()
+        if stored_version != self.__version__:
+            await self.config.version.set(self.__version__)
+            # also rewrite guild structures to be sure
+            for gid, gs in self._cache.items():
+                await self._save(discord.Object(id=gid))  # type: ignore
+
+    async def _save(self, guild: Union[discord.Guild, discord.Object]):
+        gid = guild.id
+        gs = self._cache.get(gid) or GuildState()
+        payload = {
+            "events": {e.value: gs.events[e].__dict__ for e in Event},
+            "ignored_channels": gs.ignored_channels,
+            "invite_links": gs.invite_links,
+        }
+        await self.config.guild_from_id(gid).set(payload)
+
+    def _gs(self, guild: discord.Guild) -> GuildState:
         if guild.id not in self._cache:
-            self._cache[guild.id] = initial_guild_settings()
-        for e, defaults in DEFAULTS.items():
-            self._cache[guild.id].events.setdefault(e, EventSettings(**vars(defaults)))
+            self._cache[guild.id] = GuildState()
         return self._cache[guild.id]
 
-    def _es(self, guild: discord.Guild, event: Event) -> EventSettings:
-        return self._gs(guild).events[event]
+    # -------- utility --------
 
-    async def _save(self, guild: discord.Guild) -> None:
-        await self.config.guild(guild).set(self._gs(guild).to_dict())
+    async def _get_embed_colour(self, channel: discord.abc.Messageable, guild: discord.Guild) -> discord.Colour:
+        try:
+            if await self.bot.db.guild(guild).use_bot_color():
+                return guild.me.colour
+            else:
+                return await self.bot.db.color()
+        except AttributeError:
+            # Red fallback
+            return await self.bot.get_embed_colour(channel)
 
-    async def _modlog_channel(self, guild: discord.Guild, event: Event) -> Optional[GuildChannel]:
-        es = self._es(guild, event)
-        get_ch = getattr(guild, "get_channel_or_thread", guild.get_channel)
-        ch: Optional[GuildChannel] = get_ch(es.channel) if es.channel else None
-        if ch is None:
-            try:
-                ch = await modlog.get_modlog_channel(guild)
-            except RuntimeError:
-                return None
-        if not ch or not ch.permissions_for(guild.me).send_messages:
-            return None
-        return ch
-
-    def _ignored(self, guild: discord.Guild, channel: Optional[GuildChannel]) -> bool:
-        if channel is None:
-            return False
-        ignored = set(self._gs(guild).ignored_channels)
-        cid = getattr(channel, "id", None)
-        if cid in ignored:
-            return True
-        parent = getattr(channel, "parent", None)
-        if parent and getattr(parent, "id", None) in ignored:
-            return True
-        category = getattr(channel, "category", None)
-        if category and getattr(category, "id", None) in ignored:
-            return True
-        return False
-
-    async def _event_colour(self, guild: discord.Guild, event: Event, role: Optional[discord.Role] = None) -> discord.Colour:
-        es = self._es(guild, event)
-        if es.colour is not None:
-            return discord.Colour(es.colour)
+    async def _event_colour(self, guild: discord.Guild, ev: Event, changed_role: Optional[discord.Role] = None) -> discord.Colour:
         defaults = {
             Event.MESSAGE_EDIT: discord.Colour.orange(),
             Event.MESSAGE_DELETE: discord.Colour.dark_red(),
             Event.USER_CHANGE: discord.Colour.greyple(),
-            Event.ROLE_CHANGE: (role.colour if role else discord.Colour.blue()),
+            Event.ROLE_CHANGE: changed_role.colour if changed_role else discord.Colour.blue(),
             Event.ROLE_CREATE: discord.Colour.blue(),
             Event.ROLE_DELETE: discord.Colour.dark_blue(),
             Event.VOICE_CHANGE: discord.Colour.magenta(),
@@ -262,194 +345,1128 @@ class ModLogV2(commands.Cog):
             Event.CHANNEL_DELETE: discord.Colour.dark_teal(),
             Event.GUILD_CHANGE: discord.Colour.blurple(),
             Event.EMOJI_CHANGE: discord.Colour.gold(),
-            Event.COMMANDS_USED: guild.me.colour if guild.me and guild.me.colour.value else discord.Colour.blurple(),
+            Event.COMMANDS_USED: await self._get_embed_colour(guild.text_channels[0] if guild.text_channels else guild, guild),
             Event.INVITE_CREATED: discord.Colour.blurple(),
             Event.INVITE_DELETED: discord.Colour.blurple(),
-            Event.AUTOMOD_RULE_CREATE: discord.Colour.from_rgb(87,242,135),
-            Event.AUTOMOD_RULE_UPDATE: discord.Colour.gold(),
-            Event.AUTOMOD_RULE_DELETE: discord.Colour.red(),
-            Event.AUTOMOD_ACTION:      discord.Colour.from_rgb(88,101,242),
         }
-        return defaults[event]
+        es = self._gs(guild).events[ev]
+        return discord.Colour(es.colour) if es.colour else defaults[ev]
+
+    async def _modlog_channel(self, guild: discord.Guild, ev: Event) -> GuildChannel:
+        gs = self._gs(guild)
+        target: Optional[GuildChannel] = None
+        es = gs.events[ev]
+        if es.channel:
+            get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
+            target = get_channel(es.channel)  # type: ignore
+        if target is None:
+            try:
+                target = await modlog.get_modlog_channel(guild)
+            except RuntimeError:
+                raise RuntimeError("No Modlog set")
+        if not target.permissions_for(guild.me).send_messages:
+            raise RuntimeError("No permission to send messages in modlog channel")
+        return target
+
+    async def _is_ignored(self, guild: discord.Guild, channel: Optional[GuildChannel]) -> bool:
+        if channel is None:
+            return False
+        gs = self._gs(guild)
+        ignored = gs.ignored_channels
+        cid = getattr(channel, "id", None)
+        if cid in ignored:
+            return True
+        cat = getattr(channel, "category", None)
+        if cat and getattr(cat, "id", None) in ignored:
+            return True
+        parent = getattr(channel, "parent", None)
+        if parent and getattr(parent, "id", None) in ignored:
+            return True
+        if parent:
+            pcat = getattr(parent, "category", None)
+            if pcat and getattr(pcat, "id", None) in ignored:
+                return True
+        return False
+
+    @staticmethod
+    def _chan_mention(channel_id: int, channel: Optional[GuildChannel]) -> str:
+        return channel.mention if channel else f"<#{channel_id}>"
+
+    @staticmethod
+    def _guild_icon_url(guild: discord.Guild) -> Optional[str]:
+        return guild.icon.url if guild.icon else None
 
     def _settings_text(self, guild: discord.Guild) -> str:
         gs = self._gs(guild)
-        modlog_channel = _("Not Set")
         try:
-            ch = self.bot.loop.run_until_complete(modlog.get_modlog_channel(guild))  # best effort
-            if ch:
-                modlog_channel = ch.mention
+            core = self.bot.get_cog("ModLog")
+            # just check existence; channel is fetched below
         except Exception:
-            pass
-        lines = [f"**ModLogV2** v{self.__version__}", _("Modlog channel: {c}").format(c=modlog_channel), ""]
-        get_ch = getattr(guild, "get_channel_or_thread", guild.get_channel)
-        for e in Event:
-            es = gs.events[e]
-            row = f"{e.value}: **{es.enabled}**"
-            if es.channel:
-                ch = get_ch(es.channel)
-                if ch:
-                    row += f" → {ch.mention}"
-            lines.append(row)
+            core = None
+        try:
+            modch = (await modlog.get_modlog_channel(guild)).mention
+        except Exception:
+            modch = "Not Set"
+
+        lines = [f"**Settings for {guild.name}**\nCore Modlog Channel: {modch}\n"]
+        for ev in Event:
+            es = gs.events[ev]
+            ch = guild.get_channel(es.channel) if es.channel else None
+            lines.append(f"• `{ev.value}`: **{es.enabled}**"
+                         + (f" → {ch.mention}" if ch else ""))
         if gs.ignored_channels:
-            mentions = []
-            for cid in list(gs.ignored_channels):
-                ch = get_ch(cid)
-                if ch:
-                    mentions.append(ch.mention)
-            if mentions:
-                lines.append(_("\nIgnored: ") + ", ".join(mentions))
+            chs = ", ".join(self._chan_mention(cid, guild.get_channel(cid)) for cid in gs.ignored_channels)
+            lines.append(f"\nIgnored Channels: {chs}")
         return "\n".join(lines)
 
-    # ---------- commands ----------
-    @checks.admin_or_permissions(manage_channels=True)
-    @commands.group(name="modlogv2", aliases=["modlogs2"])
+    # -------------------------
+    # Commands
+    # -------------------------
+
+    @redcommands.group(name="modlogv2", invoke_without_command=True, aliases=["mlv2"])
     @commands.guild_only()
-    async def grp(self, ctx: commands.Context):
-        """Configure ModLogV2 settings."""
-        if ctx.invoked_subcommand is None:
-            await self._show_settings(ctx)
+    async def grp(self, ctx: redcommands.Context):
+        """Show ModLogV2 settings"""
+        await ctx.maybe_send_embed(self._settings_text(ctx.guild))
 
     @grp.command(name="setup")
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
-    async def setup(self, ctx: commands.Context):
-        """Interactive setup: pick events, set channels, toggle embeds."""
-        view = SetupView(self, ctx.guild, ctx.author.id)
-        msg = (
-            "**ModLogV2 Setup**\n"
-            "1) Use the dropdown to select one or more events.\n"
-            "2) (Optional) pick a channel.\n"
-            "3) Click a button (Enable/Disable/Embeds/Set/Reset).\n"
-            "Tip: Run this again anytime."
-        )
-        await ctx.send(msg, view=view)
+    async def setup(self, ctx: redcommands.Context):
+        """Interactive setup UI (with safe fallback)."""
+        try:
+            view = SetupView(self, ctx.guild, ctx.author.id)
+            msg = (
+                "**ModLogV2 Setup**\n"
+                "1) Use the dropdown to select one or more events.\n"
+                "2) (Optional) pick a channel.\n"
+                "3) Click a button (Enable/Disable/Embeds/Set/Reset).\n"
+                "Tip: Run this again anytime."
+            )
+            await ctx.send(msg, view=view)
+        except Exception as e:
+            await ctx.send(
+                "⚠️ I couldn't open the interactive setup here.\n"
+                f"```{type(e).__name__}: {e}```\n"
+                "You can still set things up quickly:\n"
+                f"• Set core modlog channel: `{ctx.clean_prefix}modlogset modlog #{ctx.channel.name}`\n"
+                f"• Enable key events: `{ctx.clean_prefix}modlogv2 toggle true message_edit message_delete user_join user_left`\n"
+                f"• (Optional) pin here: `{ctx.clean_prefix}modlogv2 channel {ctx.channel.mention} message_edit message_delete user_join user_left`\n"
+                f"• Review: `{ctx.clean_prefix}modlogv2`\n\n"
+                f"Or run `{ctx.clean_prefix}modlogv2 quickstart` for a one-command setup."
+            )
 
-    async def _bulk_update(self, ctx: commands.Context, events: Iterable[str], mutator, ok: str):
-        if not events:
-            return await ctx.send(_("You must provide at least one event name."))
-        bad = []
-        for raw in events:
-            try:
-                ev = Event.from_str(raw)
-            except Exception:
-                bad.append(raw)
-                continue
-            mutator(self._es(ctx.guild, ev))
+    @grp.command(name="quickstart")
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def quickstart(self, ctx: redcommands.Context, channel: Optional[discord.TextChannel] = None):
+        """One-shot setup enabling common events in this channel (or a specified channel)."""
+        ch = channel or ctx.channel
+        gs = self._gs(ctx.guild)
+
+        defaults = [
+            Event.MESSAGE_EDIT,
+            Event.MESSAGE_DELETE,
+            Event.USER_JOIN,
+            Event.USER_LEFT,
+            Event.COMMANDS_USED,
+        ]
+        for ev in defaults:
+            es = gs.events[ev]
+            es.enabled = True
+            es.embed = True
+            es.channel = ch.id
+
+        gs.events[Event.MESSAGE_DELETE].bulk_enabled = True
+        gs.events[Event.MESSAGE_DELETE].cached_only = False
+
         await self._save(ctx.guild)
-        good = [inline(e) for e in events if e not in bad]
-        if good:
-            await ctx.send(_("{ev} — {msg}").format(ev=humanize_list(good), msg=ok))
-        if bad:
-            await ctx.send(_("Unknown events: ") + ", ".join(inline(b) for b in bad))
+        await ctx.send(
+            "✅ Quickstart complete.\n"
+            f"Enabled: {', '.join(f'`{e.value}`' for e in defaults)} → {ch.mention}\n"
+            f"Use `{ctx.clean_prefix}modlogv2` to review, or `{ctx.clean_prefix}modlogv2 setup` to tweak."
+        )
 
-    @grp.command(name="toggle")
-    async def toggle(self, ctx: commands.Context, set_to: bool, *events: str):
-        await self._bulk_update(ctx, events, lambda es: setattr(es, "enabled", set_to), _("logs set to {s}").format(s=set_to))
+    # ---- parity commands (channel/embeds/toggle etc.) ----
 
-    @grp.command(name="embeds")
-    async def embeds(self, ctx: commands.Context, set_to: bool, *events: str):
-        await self._bulk_update(ctx, events, lambda es: setattr(es, "embed", set_to), _("embeds {s}").format(s="on" if set_to else "off"))
+    def _parse_events(self, ctx: redcommands.Context, names: List[str]) -> List[Event]:
+        evs = []
+        for n in names:
+            try:
+                evs.append(Event.from_str(n))
+            except Exception:
+                raise commands.BadArgument(f"`{n}` is not a valid event.")
+        if not evs:
+            raise commands.BadArgument(_("You must provide which events should be included."))
+        return evs
 
     @grp.command(name="colour", aliases=["color"])
-    async def colour(self, ctx: commands.Context, colour: discord.Colour, *events: str):
-        await self._bulk_update(ctx, events, lambda es: setattr(es, "colour", colour.value), _("colour set to {c}").format(c=str(colour)))
+    @checks.admin_or_permissions(manage_guild=True)
+    async def cmd_colour(self, ctx: redcommands.Context, colour: Optional[discord.Colour], *events: str):
+        """Set custom colour for events (hex or named colour)."""
+        evs = self._parse_events(ctx, list(events))
+        gs = self._gs(ctx.guild)
+        val = colour.value if colour else None
+        for ev in evs:
+            gs.events[ev].colour = val
+        await self._save(ctx.guild)
+        await ctx.send(_("Set {ev} to {c}").format(ev=humanize_list([e.value for e in evs]), c=str(colour)))
 
-    @grp.command(name="emoji")
-    @commands.bot_has_permissions(add_reactions=True)
-    async def emoji(self, ctx: commands.Context, emoji: str, *events: str):
-        try:
-            await ctx.message.add_reaction(emoji)
-        except discord.HTTPException:
-            return await ctx.send(_("That emoji can’t be used."))
-        await self._bulk_update(ctx, events, lambda es: setattr(es, "emoji", emoji), _("emoji set."))
+    @grp.command(name="embeds")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def cmd_embeds(self, ctx: redcommands.Context, set_to: bool, *events: str):
+        """Enable/disable embeds for events."""
+        evs = self._parse_events(ctx, list(events))
+        gs = self._gs(ctx.guild)
+        for ev in evs:
+            gs.events[ev].embed = set_to
+        await self._save(ctx.guild)
+        await ctx.send(_("{ev} embed logs set to {v}").format(ev=humanize_list([e.value for e in evs]), v=str(set_to)))
+
+    @grp.command(name="toggle")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def cmd_toggle(self, ctx: redcommands.Context, set_to: bool, *events: str):
+        """Turn on/off specific events."""
+        evs = self._parse_events(ctx, list(events))
+        gs = self._gs(ctx.guild)
+        for ev in evs:
+            gs.events[ev].enabled = set_to
+        await self._save(ctx.guild)
+        await ctx.send(_("{ev} logs set to {v}").format(ev=humanize_list([e.value for e in evs]), v=str(set_to)))
 
     @grp.command(name="channel")
-    async def channel(self, ctx: commands.Context, channel: discord.TextChannel, *events: str):
-        await self._bulk_update(ctx, events, lambda es: setattr(es, "channel", channel.id), _("channel set to {c}").format(c=channel.mention))
+    @checks.admin_or_permissions(manage_guild=True)
+    async def cmd_channel(self, ctx: redcommands.Context, channel: discord.TextChannel, *events: str):
+        """Set per-event channel."""
+        evs = self._parse_events(ctx, list(events))
+        gs = self._gs(ctx.guild)
+        for ev in evs:
+            gs.events[ev].channel = channel.id
+        await self._save(ctx.guild)
+        await ctx.send(_("{ev} logs will go to {ch}").format(ev=humanize_list([e.value for e in evs]), ch=channel.mention))
 
     @grp.command(name="resetchannel")
-    async def resetchannel(self, ctx: commands.Context, *events: str):
-        await self._bulk_update(ctx, events, lambda es: setattr(es, "channel", None), _("channel reset."))
+    @checks.admin_or_permissions(manage_guild=True)
+    async def cmd_resetchannel(self, ctx: redcommands.Context, *events: str):
+        """Reset events to the core modlog channel."""
+        evs = self._parse_events(ctx, list(events))
+        gs = self._gs(ctx.guild)
+        for ev in evs:
+            gs.events[ev].channel = None
+        await self._save(ctx.guild)
+        await ctx.send(_("Reset channel for {ev}.").format(ev=humanize_list([e.value for e in evs])))
 
     @grp.command(name="all")
-    async def all(self, ctx: commands.Context, set_to: bool):
+    @checks.admin_or_permissions(manage_guild=True)
+    async def cmd_all(self, ctx: redcommands.Context, set_to: bool):
+        """Turn all logging options on/off."""
         gs = self._gs(ctx.guild)
-        for es in gs.events.values():
-            es.enabled = set_to
+        for ev in Event:
+            gs.events[ev].enabled = set_to
         await self._save(ctx.guild)
-        await self._show_settings(ctx)
+        await ctx.maybe_send_embed(self._settings_text(ctx.guild))
 
-    @grp.command(name="flag")
-    async def flag(self, ctx: commands.Context, event: str, flag: str, value: bool):
-        """Flip a boolean flag on an event: bots, bulk_enabled, bulk_individual, cached_only, nicknames, embed, enabled."""
-        try:
-            ev = Event.from_str(event)
-        except Exception:
-            return await ctx.send(_("Unknown event."))
-        es = self._es(ctx.guild, ev)
-        if not hasattr(es, flag):
-            return await ctx.send(_("That flag doesn't exist for this event."))
-        setattr(es, flag, value)
+    @grp.command(name="botedits")
+    async def cmd_botedits(self, ctx: redcommands.Context):
+        """Toggle message edit notifications for bots."""
+        gs = self._gs(ctx.guild)
+        es = gs.events[Event.MESSAGE_EDIT]
+        es.bots = not bool(es.bots)
         await self._save(ctx.guild)
-        await ctx.send(_("{e}.{f} → {v}").format(e=inline(ev.value), f=inline(flag), v=value))
+        await ctx.send(_("Bots edited messages ") + ("enabled" if es.bots else "disabled"))
+
+    @grp.command(name="botdeletes")
+    async def cmd_botdeletes(self, ctx: redcommands.Context):
+        """Toggle message delete notifications for bots (cached)."""
+        gs = self._gs(ctx.guild)
+        es = gs.events[Event.MESSAGE_DELETE]
+        es.bots = not bool(es.bots)
+        await self._save(ctx.guild)
+        await ctx.send(_("Bot delete logs ") + ("enabled" if es.bots else "disabled"))
+
+    @grp.group(name="delete")
+    async def grp_delete(self, ctx: redcommands.Context):
+        """Delete logging settings."""
+        pass
+
+    @grp_delete.command(name="bulkdelete")
+    async def cmd_bulk(self, ctx: redcommands.Context):
+        gs = self._gs(ctx.guild)
+        es = gs.events[Event.MESSAGE_DELETE]
+        es.bulk_enabled = not bool(es.bulk_enabled)
+        await self._save(ctx.guild)
+        await ctx.send(_("Bulk message delete logs ") + ("enabled" if es.bulk_enabled else "disabled"))
+
+    @grp_delete.command(name="individual")
+    async def cmd_bulk_indiv(self, ctx: redcommands.Context):
+        gs = self._gs(ctx.guild)
+        es = gs.events[Event.MESSAGE_DELETE]
+        es.bulk_individual = not bool(es.bulk_individual)
+        await self._save(ctx.guild)
+        await ctx.send(_("Individual message delete logs for bulk message delete ") + ("enabled" if es.bulk_individual else "disabled"))
+
+    @grp_delete.command(name="cachedonly")
+    async def cmd_cached_only(self, ctx: redcommands.Context):
+        gs = self._gs(ctx.guild)
+        es = gs.events[Event.MESSAGE_DELETE]
+        es.cached_only = not bool(es.cached_only)
+        await self._save(ctx.guild)
+        await ctx.send(_("Delete logs for non-cached messages ") + ("disabled" if es.cached_only else "enabled"))
+
+    @grp.command(name="botchange")
+    async def cmd_user_botchange(self, ctx: redcommands.Context):
+        gs = self._gs(ctx.guild)
+        es = gs.events[Event.USER_CHANGE]
+        es.bots = not bool(es.bots)
+        await self._save(ctx.guild)
+        await ctx.send(_("Bots will be tracked in user change logs.") if es.bots else _("Bots will no longer be tracked in user change logs."))
+
+    @grp.command(name="nickname", aliases=["nicknames"])
+    async def cmd_user_nicks(self, ctx: redcommands.Context):
+        gs = self._gs(ctx.guild)
+        es = gs.events[Event.USER_CHANGE]
+        es.nicknames = not bool(es.nicknames)
+        await self._save(ctx.guild)
+        await ctx.send(_("Nicknames will be tracked in user change logs.") if es.nicknames else _("Nicknames will no longer be tracked in user change logs."))
 
     @grp.command(name="commandlevel", aliases=["commandslevel"])
-    async def commandlevel(self, ctx: commands.Context, *levels: str):
-        """Set which privilege levels to log for commands_used: MOD ADMIN BOT_OWNER GUILD_OWNER NONE"""
-        valid = {"MOD","ADMIN","BOT_OWNER","GUILD_OWNER","NONE"}
+    async def cmd_command_level(self, ctx: redcommands.Context, *levels: str):
+        """Set which privilege levels to log for commands (MOD ADMIN BOT_OWNER GUILD_OWNER NONE)."""
         if not levels:
-            return await ctx.send(_("Provide at least one level."))
-        lv = [x.upper() for x in levels]
-        bad = [x for x in lv if x not in valid]
+            return await ctx.send_help()
+        allowed = {"MOD","ADMIN","BOT_OWNER","GUILD_OWNER","NONE"}
+        bad = [l for l in levels if l.upper() not in allowed]
         if bad:
-            return await ctx.send(_("Unknown levels: ") + ", ".join(inline(b) for b in bad))
-        es = self._es(ctx.guild, Event.COMMANDS_USED)
-        es.privs = lv
+            raise commands.BadArgument(_("Invalid level(s): ") + ", ".join(bad))
+        gs = self._gs(ctx.guild)
+        gs.events[Event.COMMANDS_USED].privs = [l.upper() for l in levels]
         await self._save(ctx.guild)
-        await ctx.send(_("Command levels set to: ") + humanize_list([inline(x) for x in lv]))
+        await ctx.send(_("Command logs set to: ") + humanize_list(gs.events[Event.COMMANDS_USED].privs))
 
     @grp.command(name="ignore")
-    async def ignore(self, ctx: commands.Context, channel: Union[discord.TextChannel, discord.CategoryChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel, discord.Thread]):
+    async def cmd_ignore(self, ctx: redcommands.Context, channel: Union[
+        discord.TextChannel, discord.CategoryChannel, discord.VoiceChannel,
+        discord.StageChannel, discord.ForumChannel, discord.Thread]):
         gs = self._gs(ctx.guild)
         if channel.id not in gs.ignored_channels:
             gs.ignored_channels.append(channel.id)
             await self._save(ctx.guild)
-            return await ctx.send(_("Now ignoring ") + channel.mention)
-        await ctx.send(channel.mention + _(" is already ignored."))
+            await ctx.send(_(" Now ignoring events in ") + channel.mention)
+        else:
+            await ctx.send(channel.mention + _(" is already being ignored."))
 
     @grp.command(name="unignore")
-    async def unignore(self, ctx: commands.Context, channel: Union[discord.TextChannel, discord.CategoryChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel, discord.Thread]):
+    async def cmd_unignore(self, ctx: redcommands.Context, channel: Union[
+        discord.TextChannel, discord.CategoryChannel, discord.VoiceChannel,
+        discord.StageChannel, discord.ForumChannel, discord.Thread]):
         gs = self._gs(ctx.guild)
         if channel.id in gs.ignored_channels:
             gs.ignored_channels.remove(channel.id)
             await self._save(ctx.guild)
-            return await ctx.send(_("Now tracking ") + channel.mention)
-        await ctx.send(channel.mention + _(" is not ignored."))
+            await ctx.send(_(" Now tracking events in ") + channel.mention)
+        else:
+            await ctx.send(channel.mention + _(" is not being ignored."))
 
-    async def _show_settings(self, ctx: commands.Context):
-        await ctx.maybe_send_embed(self._settings_text(ctx.guild))
+    # -------------------------
+    # Listeners (core parity set)
+    # -------------------------
 
-    # ---------- background: invite snapshot ----------
-    @tasks.loop(minutes=5.0, reconnect=True)
-    async def invite_refresh(self):
-        await self.bot.wait_until_ready()
-        for gid, gs in list(self._cache.items()):
-            guild = self.bot.get_guild(gid)
-            if not guild or not gs.events[Event.USER_JOIN].enabled:
+    async def _can_send_embed(self, channel: discord.TextChannel, ev: Event, guild: discord.Guild) -> bool:
+        gs = self._gs(guild)
+        return channel.permissions_for(guild.me).embed_links and gs.events[ev].embed
+
+    async def _member_can_run(self, ctx: redcommands.Context) -> bool:
+        command = ctx.message.content.replace(ctx.prefix, "")
+        com = ctx.bot.get_command(command)
+        if com is None:
+            return False
+        try:
+            testcontext = await ctx.bot.get_context(ctx.message, cls=redcommands.Context)
+            to_check = [*reversed(com.parents)] + [com]
+            can = False
+            for cmd in to_check:
+                can = await cmd.can_run(testcontext)
+                if can is False:
+                    break
+        except commands.CheckFailure:
+            can = False
+        return can
+
+    @commands.Cog.listener()
+    async def on_command(self, ctx: redcommands.Context):
+        guild = ctx.guild
+        if guild is None:
+            return
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        es = gs.events[Event.COMMANDS_USED]
+        if not es.enabled:
+            return
+        if await self._is_ignored(guild, ctx.channel):
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.COMMANDS_USED)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.COMMANDS_USED, guild)
+
+        command = ctx.message.content.replace(ctx.prefix, "")
+        try:
+            privs = self.bot.get_command(command).requires.privilege_level.name
+        except Exception:
+            return
+        wanted = set(es.privs or [])
+        if privs not in wanted:
+            return
+
+        time = ctx.message.created_at
+        if embed_ok:
+            colour = await self._event_colour(guild, Event.COMMANDS_USED)
+            e = discord.Embed(description=ctx.message.content, colour=colour, timestamp=time)
+            e.add_field(name=_("Channel"), value=ctx.channel.mention)
+            e.add_field(name=_("Can Run"), value=str(await self._member_can_run(ctx)))
+            e.add_field(name=_("Privilege"), value=privs)
+            e.set_footer(text=_("User ID: ") + str(ctx.author.id))
+            e.set_author(name=f"{ctx.author} ({ctx.author.id}) - Used a Command", icon_url=ctx.author.display_avatar.url)
+            await ch.send(embed=e)
+        else:
+            inf = (f"{es.emoji} `{time.strftime('%H:%M:%S')}` "
+                   f"{ctx.author}(`{ctx.author.id}`) used `{ctx.message.content}` in {ctx.channel.mention}")
+            await ch.send(inf[:2000])
+
+    @commands.Cog.listener(name="on_raw_message_delete")
+    async def on_raw_message_delete_listener(self, payload: discord.RawMessageDeleteEvent, *, check_audit_log: bool = True):
+        gid = payload.guild_id
+        if gid is None:
+            return
+        guild = self.bot.get_guild(gid)
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        es = gs.events[Event.MESSAGE_DELETE]
+        if not es.enabled:
+            return
+        get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
+        source_channel = get_channel(payload.channel_id)
+        if await self._is_ignored(guild, source_channel):
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.MESSAGE_DELETE)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.MESSAGE_DELETE, guild)
+        message = payload.cached_message
+        if message is None:
+            if es.cached_only:
+                return
+            mention = self._chan_mention(payload.channel_id, source_channel)
+            if embed_ok:
+                e = discord.Embed(description=_("*Message's content unknown.*"),
+                                  colour=await self._event_colour(guild, Event.MESSAGE_DELETE))
+                e.add_field(name=_("Channel"), value=mention)
+                e.set_author(name=_("Deleted Message"))
+                await ch.send(embed=e)
+            else:
+                msg = _("{emoji} `{time}` A message was deleted in {channel}").format(
+                    emoji=es.emoji, time=datetime.datetime.utcnow().strftime("%H:%M:%S"), channel=mention
+                )
+                await ch.send(f"{msg}\n> *Message's content unknown.*")
+            return
+
+        # cached
+        if message.author.bot and not es.bots:
+            return
+        if message.content == "" and message.attachments == []:
+            return
+
+        perp = None
+        if ch.permissions_for(guild.me).view_audit_log and check_audit_log:
+            async for log in guild.audit_logs(limit=2, action=discord.AuditLogAction.message_delete):
+                if getattr(log.extra, "channel", None) and log.extra.channel.id == message.channel.id and log.target.id == message.author.id:
+                    perp = f"{log.user}({log.user.id})"
+                    break
+
+        mention = self._chan_mention(message.channel.id, message.channel)
+        time = message.created_at
+        if embed_ok:
+            e = discord.Embed(description=message.content, colour=await self._event_colour(guild, Event.MESSAGE_DELETE), timestamp=time)
+            e.add_field(name=_("Channel"), value=mention)
+            if perp:
+                e.add_field(name=_("Deleted by"), value=perp)
+            if message.attachments:
+                files = ", ".join(a.filename for a in message.attachments)
+                e.add_field(name=_("Attachments"), value=files[:1024])
+            e.set_footer(text=_("User ID: ") + str(message.author.id))
+            e.set_author(name=f"{message.author} ({message.author.id}) - Deleted Message", icon_url=message.author.display_avatar.url)
+            await ch.send(embed=e)
+        else:
+            head = (_("{emoji} `{time}` A message from **{author}** (`{a_id}`) was deleted in {channel}")
+                    .format(emoji=es.emoji, time=time.strftime("%H:%M:%S"), author=message.author, a_id=message.author.id, channel=mention))
+            clean = escape(message.clean_content, mass_mentions=True)[: (1990 - len(head))]
+            await ch.send(f"{head}\n>>> {clean}")
+
+    @commands.Cog.listener()
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent):
+        gid = payload.guild_id
+        if gid is None:
+            return
+        guild = self.bot.get_guild(gid)
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        es = gs.events[Event.MESSAGE_DELETE]
+        if not es.enabled or not es.bulk_enabled:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.MESSAGE_DELETE)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.MESSAGE_DELETE, guild)
+        get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
+        message_channel = get_channel(payload.channel_id)
+        if await self._is_ignored(guild, message_channel):
+            return
+        amount = len(payload.message_ids)
+        mention = self._chan_mention(payload.channel_id, message_channel)
+        if embed_ok:
+            e = discord.Embed(description=mention, colour=await self._event_colour(guild, Event.MESSAGE_DELETE))
+            e.set_author(name=_("Bulk message delete"), icon_url=self._guild_icon_url(guild) or discord.Embed.Empty)
+            e.add_field(name=_("Channel"), value=mention)
+            e.add_field(name=_("Messages deleted"), value=str(amount))
+            await ch.send(embed=e)
+        else:
+            msg = _("{emoji} `{time}` Bulk message delete in {channel}, {amount} messages deleted.").format(
+                emoji=es.emoji, time=datetime.datetime.utcnow().strftime("%H:%M:%S"), channel=mention, amount=amount
+            )
+            await ch.send(msg)
+        if es.bulk_individual:
+            for m in payload.cached_messages:
+                fake = discord.RawMessageDeleteEvent({"id": m.id, "channel_id": payload.channel_id, "guild_id": gid})
+                fake.cached_message = m
+                try:
+                    await self.on_raw_message_delete_listener(fake, check_audit_log=False)
+                except Exception:
+                    pass
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        guild = before.guild
+        if guild is None:
+            return
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        es = gs.events[Event.MESSAGE_EDIT]
+        if not es.enabled:
+            return
+        if before.author.bot and not es.bots:
+            return
+        if before.content == after.content:
+            return
+        if await self._is_ignored(guild, after.channel):
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.MESSAGE_EDIT)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.MESSAGE_EDIT, guild)
+        if embed_ok:
+            e = discord.Embed(description=before.content, colour=await self._event_colour(guild, Event.MESSAGE_EDIT), timestamp=before.created_at)
+            e.add_field(name=_("After Message:"), value=f"[Click to see new message]({after.jump_url})")
+            e.add_field(name=_("Channel:"), value=before.channel.mention)
+            e.set_footer(text=_("User ID: ") + str(before.author.id))
+            e.set_author(name=f"{before.author} ({before.author.id}) - Edited Message", icon_url=before.author.display_avatar.url)
+            await ch.send(embed=e)
+        else:
+            msg = (_("{emoji} `{time}` **{author}** (`{a_id}`) edited a message in {channel}.\n"
+                     "Before:\n> {before}\nAfter:\n> {after}")
+                   .format(emoji=es.emoji, time=datetime.datetime.utcnow().strftime("%H:%M:%S"),
+                           author=before.author, a_id=before.author.id, channel=before.channel.mention,
+                           before=escape(before.content, mass_mentions=True),
+                           after=escape(after.content, mass_mentions=True)))
+            await ch.send(msg[:2000])
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        guild = member.guild
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        es = gs.events[Event.USER_JOIN]
+        if not es.enabled:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.USER_JOIN)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.USER_JOIN, guild)
+        users = len(guild.members)
+        since_created = (datetime.datetime.utcnow() - member.created_at).days
+        user_created = member.created_at.strftime("%d %b %Y %H:%M")
+        created_on = f"{user_created}\n({since_created} days ago)"
+        if embed_ok:
+            e = discord.Embed(description=member.mention, colour=await self._event_colour(guild, Event.USER_JOIN),
+                              timestamp=member.joined_at or datetime.datetime.utcnow())
+            e.add_field(name=_("Total Users:"), value=str(users))
+            e.add_field(name=_("Account created on:"), value=created_on)
+            e.set_footer(text=_("User ID: ") + str(member.id))
+            e.set_author(name=f"{member} ({member.id}) has joined the server", icon_url=member.display_avatar.url)
+            e.set_thumbnail(url=member.display_avatar.url)
+            await ch.send(embed=e)
+        else:
+            await ch.send(_("{emoji} `{time}` **{m}**(`{mid}`) joined. Total members: {u}")
+                          .format(emoji=es.emoji, time=datetime.datetime.utcnow().strftime("%H:%M:%S"),
+                                  m=member, mid=member.id, u=users))
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        guild = member.guild
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        es = gs.events[Event.USER_LEFT]
+        if not es.enabled:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.USER_LEFT)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.USER_LEFT, guild)
+        perp = None
+        reason = None
+        if ch.permissions_for(guild.me).view_audit_log:
+            async for log in guild.audit_logs(limit=5, after=datetime.datetime.utcnow() + datetime.timedelta(minutes=-30), action=discord.AuditLogAction.kick):
+                if log.target.id == member.id:
+                    perp = log.user
+                    reason = log.reason
+                    break
+        if embed_ok:
+            e = discord.Embed(description=member.mention, colour=await self._event_colour(guild, Event.USER_LEFT), timestamp=datetime.datetime.utcnow())
+            e.add_field(name=_("Total Users:"), value=str(len(guild.members)))
+            if perp: e.add_field(name=_("Kicked"), value=perp.mention)
+            if reason: e.add_field(name=_("Reason"), value=str(reason))
+            e.set_footer(text=_("User ID: ") + str(member.id))
+            e.set_author(name=f"{member} ({member.id}) has left the server", icon_url=member.display_avatar.url)
+            e.set_thumbnail(url=member.display_avatar.url)
+            await ch.send(embed=e)
+        else:
+            if perp:
+                await ch.send(_("{emoji} `{time}` **{m}**(`{mid}`) was kicked by {p}. Total members: {u}")
+                              .format(emoji=es.emoji, time=datetime.datetime.utcnow().strftime("%H:%M:%S"),
+                                      m=member, mid=member.id, p=perp, u=len(guild.members)))
+            else:
+                await ch.send(_("{emoji} `{time}` **{m}**(`{mid}`) left. Total members: {u}")
+                              .format(emoji=es.emoji, time=datetime.datetime.utcnow().strftime("%H:%M:%S"),
+                                      m=member, mid=member.id, u=len(guild.members)))
+
+    # (Channel/Role/Guild/Emoji/Voice/Member update listeners implemented in a compact but parity way)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_create(self, new_channel: discord.abc.GuildChannel):
+        guild = new_channel.guild
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        if not gs.events[Event.CHANNEL_CREATE].enabled:
+            return
+        if await self._is_ignored(guild, new_channel):
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.CHANNEL_CREATE)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.CHANNEL_CREATE, guild)
+        t = str(new_channel.type).title()
+        time = datetime.datetime.utcnow()
+        perp, reason = None, None
+        if ch.permissions_for(guild.me).view_audit_log:
+            async for log in guild.audit_logs(limit=2, action=discord.AuditLogAction.channel_create):
+                if log.target.id == new_channel.id:
+                    perp = log.user
+                    reason = log.reason
+                    break
+        if embed_ok:
+            e = discord.Embed(description=f"{new_channel.mention} {new_channel.name}", timestamp=time,
+                              colour=await self._event_colour(guild, Event.CHANNEL_CREATE))
+            e.set_author(name=_("{t} Channel Created {n} ({i})").format(t=t, n=new_channel.name, i=new_channel.id))
+            e.add_field(name=_("Type"), value=t)
+            if perp: e.add_field(name=_("Created by"), value=perp.mention)
+            if reason: e.add_field(name=_("Reason"), value=reason)
+            await ch.send(embed=e)
+        else:
+            await ch.send(_("{emoji} `{time}` {t} channel created {c}")
+                          .format(emoji=gs.events[Event.CHANNEL_CREATE].emoji, time=time.strftime("%H:%M:%S"),
+                                  t=t, c=new_channel.mention))
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, old_channel: discord.abc.GuildChannel):
+        guild = old_channel.guild
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        if not gs.events[Event.CHANNEL_DELETE].enabled:
+            return
+        if await self._is_ignored(guild, old_channel):
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.CHANNEL_DELETE)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.CHANNEL_DELETE, guild)
+        t = str(old_channel.type).title()
+        time = datetime.datetime.utcnow()
+        perp, reason = None, None
+        if ch.permissions_for(guild.me).view_audit_log:
+            async for log in guild.audit_logs(limit=2, action=discord.AuditLogAction.channel_delete):
+                if log.target.id == old_channel.id:
+                    perp = log.user
+                    reason = log.reason
+                    break
+        if embed_ok:
+            e = discord.Embed(description=old_channel.name, timestamp=time, colour=await self._event_colour(guild, Event.CHANNEL_DELETE))
+            e.set_author(name=_("{t} Channel Deleted {n} ({i})").format(t=t, n=old_channel.name, i=old_channel.id))
+            e.add_field(name=_("Type"), value=t)
+            if perp: e.add_field(name=_("Deleted by"), value=perp.mention)
+            if reason: e.add_field(name=_("Reason"), value=reason)
+            await ch.send(embed=e)
+        else:
+            await ch.send(_("{emoji} `{time}` {t} channel deleted #{n} ({i})")
+                          .format(emoji=gs.events[Event.CHANNEL_DELETE].emoji, time=time.strftime("%H:%M:%S"),
+                                  t=t, n=old_channel.name, i=old_channel.id))
+
+    async def _perm_changes_text(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel, embed_links: bool) -> str:
+        p_msg = ""
+        bp, ap = {}, {}
+        for o, p in before.overwrites.items():
+            bp[str(o.id)] = [i for i in p]
+        for o, p in after.overwrites.items():
+            ap[str(o.id)] = [i for i in p]
+        for ent in bp:
+            ent_obj = before.guild.get_role(int(ent)) or before.guild.get_member(int(ent))
+            if ent not in ap:
+                p_msg += (f"{ent_obj.mention if embed_links else ent_obj.name} Overwrites removed.\n")
                 continue
-            if not guild.me.guild_permissions.manage_guild:
-                continue
+            if ap[ent] != bp[ent]:
+                a = set(ap[ent]); b = set(bp[ent])
+                for diff in list(a - b):
+                    p_msg += (f"{ent_obj.mention if embed_links else ent_obj.name} {diff[0]} Set to {diff[1]}\n")
+        for ent in ap:
+            ent_obj = after.guild.get_role(int(ent)) or after.guild.get_member(int(ent))
+            if ent not in bp:
+                p_msg += (f"{ent_obj.mention if embed_links else ent_obj.name} Overwrites added.\n")
+        return p_msg
+
+    @commands.Cog.listener()
+    async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
+        guild = before.guild
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        if not gs.events[Event.CHANNEL_CHANGE].enabled:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.CHANNEL_CHANGE)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.CHANNEL_CHANGE, guild)
+        t = str(after.type).title()
+        time = datetime.datetime.utcnow()
+        perp, reason = None, None
+        if ch.permissions_for(guild.me).view_audit_log:
+            async for log in guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_update):
+                if log.target.id == before.id:
+                    perp, reason = log.user, log.reason
+                    break
+        e = discord.Embed(description=after.mention, timestamp=time, colour=await self._event_colour(guild, Event.CHANNEL_CREATE))
+        e.set_author(name=_("{t} Channel Updated {n} ({i})").format(t=t, n=before.name, i=before.id))
+
+        changed = False
+        if isinstance(before, discord.TextChannel) and isinstance(after, discord.TextChannel):
+            for attr, name in {"name":_("Name:"), "topic":_("Topic:"), "category":_("Category:"), "slowmode_delay":_("Slowmode delay:")}.items():
+                b = getattr(before, attr); a = getattr(after, attr)
+                if b != a:
+                    changed = True
+                    e.add_field(name=_("Before ") + name, value=str(b)[:1024] or "None")
+                    e.add_field(name=_("After ") + name, value=str(a)[:1024] or "None")
+            if before.is_nsfw() != after.is_nsfw():
+                changed = True
+                e.add_field(name=_("Before NSFW"), value=str(before.is_nsfw()))
+                e.add_field(name=_("After NSFW"), value=str(after.is_nsfw()))
+            pmsg = await self._perm_changes_text(before, after, embed_ok)
+            if pmsg:
+                changed = True
+                e.add_field(name=_("Permissions"), value=pmsg[:1024])
+        elif isinstance(before, discord.VoiceChannel) and isinstance(after, discord.VoiceChannel):
+            for attr, name in {"name":_("Name:"), "position":_("Position:"), "category":_("Category:"), "bitrate":_("Bitrate:"), "user_limit":_("User limit:")}.items():
+                b = getattr(before, attr); a = getattr(after, attr)
+                if b != a:
+                    changed = True
+                    e.add_field(name=_("Before ") + name, value=str(b))
+                    e.add_field(name=_("After ") + name, value=str(a))
+            pmsg = await self._perm_changes_text(before, after, embed_ok)
+            if pmsg:
+                changed = True
+                e.add_field(name=_("Permissions"), value=pmsg[:1024])
+        if perp: e.add_field(name=_("Updated by"), value=perp.mention)
+        if reason: e.add_field(name=_("Reason"), value=reason)
+        if changed:
+            if embed_ok:
+                await ch.send(embed=e)
+            else:
+                await ch.send(escape(_("Updated channel ") + before.name, mass_mentions=True))
+
+    async def _role_perm_changes(self, before: discord.Role, after: discord.Role) -> str:
+        perms = [
+            "create_instant_invite","kick_members","ban_members","administrator","manage_channels","manage_guild",
+            "add_reactions","view_audit_log","priority_speaker","read_messages","send_messages","send_tts_messages",
+            "manage_messages","embed_links","attach_files","read_message_history","mention_everyone","external_emojis",
+            "connect","speak","mute_members","deafen_members","move_members","use_voice_activation","change_nickname",
+            "manage_nicknames","manage_roles","manage_webhooks","manage_emojis"
+        ]
+        pmsg = ""
+        for p in perms:
+            if getattr(before.permissions, p) != getattr(after.permissions, p):
+                pmsg += f"{p} Set to {getattr(after.permissions, p)}\n"
+        return pmsg
+
+    @commands.Cog.listener()
+    async def on_guild_role_update(self, before: discord.Role, after: discord.Role):
+        guild = before.guild
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        if not gs.events[Event.ROLE_CHANGE].enabled:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.ROLE_CHANGE)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.ROLE_CHANGE, guild)
+        perp, reason = None, None
+        if ch.permissions_for(guild.me).view_audit_log:
+            async for log in guild.audit_logs(limit=5, action=discord.AuditLogAction.role_update):
+                if log.target.id == before.id:
+                    perp, reason = log.user, log.reason
+                    break
+        e = discord.Embed(description=after.mention, colour=after.colour, timestamp=datetime.datetime.utcnow())
+        e.set_author(name=_("Updated {role} ({r_id}) role ").format(role=before.name, r_id=before.id))
+        changed = False
+        for attr, name in {"name":_("Name:"), "color":_("Colour:"), "mentionable":_("Mentionable:"), "hoist":_("Is Hoisted:")}.items():
+            b = getattr(before, attr); a = getattr(after, attr)
+            if b != a:
+                changed = True
+                e.add_field(name=_("Before ") + name, value=str(b))
+                e.add_field(name=_("After ") + name, value=str(a))
+        pmsg = await self._role_perm_changes(before, after)
+        if pmsg:
+            changed = True
+            e.add_field(name=_("Permissions"), value=pmsg[:1024])
+        if perp: e.add_field(name=_("Updated by"), value=perp.mention)
+        if reason: e.add_field(name=_("Reason"), value=reason)
+        if changed:
+            if embed_ok:
+                await ch.send(embed=e)
+            else:
+                await ch.send(_("{emoji} Updated role **{role}**").format(emoji=gs.events[Event.ROLE_CHANGE].emoji, role=before.name))
+
+    @commands.Cog.listener()
+    async def on_guild_role_create(self, role: discord.Role):
+        guild = role.guild
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        if not gs.events[Event.ROLE_CREATE].enabled:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.ROLE_CREATE)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.ROLE_CREATE, guild)
+        perp, reason = None, None
+        if ch.permissions_for(guild.me).view_audit_log:
+            async for log in guild.audit_logs(limit=5, action=discord.AuditLogAction.role_create):
+                if log.target.id == role.id:
+                    perp, reason = log.user, log.reason
+                    break
+        if embed_ok:
+            e = discord.Embed(description=role.mention, colour=await self._event_colour(guild, Event.ROLE_CREATE), timestamp=datetime.datetime.utcnow())
+            e.set_author(name=_("Role created {role} ({r_id})").format(role=role.name, r_id=role.id))
+            if perp: e.add_field(name=_("Created by"), value=perp.mention)
+            if reason: e.add_field(name=_("Reason"), value=reason)
+            await ch.send(embed=e)
+        else:
+            await ch.send(_("{emoji} Role created {name}").format(emoji=gs.events[Event.ROLE_CREATE].emoji, name=role.name))
+
+    @commands.Cog.listener()
+    async def on_guild_role_delete(self, role: discord.Role):
+        guild = role.guild
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        if not gs.events[Event.ROLE_DELETE].enabled:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.ROLE_DELETE)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.ROLE_DELETE, guild)
+        perp, reason = None, None
+        if ch.permissions_for(guild.me).view_audit_log:
+            async for log in guild.audit_logs(limit=5, action=discord.AuditLogAction.role_delete):
+                if log.target.id == role.id:
+                    perp, reason = log.user, log.reason
+                    break
+        if embed_ok:
+            e = discord.Embed(description=role.name, timestamp=datetime.datetime.utcnow(), colour=await self._event_colour(guild, Event.ROLE_DELETE))
+            e.set_author(name=_("Role deleted {role} ({r_id})").format(role=role.name, r_id=role.id))
+            if perp: e.add_field(name=_("Deleted by"), value=perp.mention)
+            if reason: e.add_field(name=_("Reason"), value=reason)
+            await ch.send(embed=e)
+        else:
+            await ch.send(_("{emoji} Role deleted **{name}**").format(emoji=gs.events[Event.ROLE_DELETE].emoji, name=role.name))
+
+    @commands.Cog.listener()
+    async def on_guild_update(self, before: discord.Guild, after: discord.Guild):
+        guild = after
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        if not gs.events[Event.GUILD_CHANGE].enabled:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.GUILD_CHANGE)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.GUILD_CHANGE, guild)
+        time = datetime.datetime.utcnow()
+        e = discord.Embed(timestamp=time, colour=await self._event_colour(guild, Event.GUILD_CHANGE))
+        icon = self._guild_icon_url(guild)
+        e.set_author(name=_("Updated Guild"), icon_url=icon or discord.Embed.Empty)
+        if icon: e.set_thumbnail(url=icon)
+        changed = False
+        fields = {"name":_("Name:"), "afk_timeout":_("AFK Timeout:"), "afk_channel":_("AFK Channel:"),
+                  "icon":_("Server Icon:"), "owner":_("Server Owner:"), "system_channel":_("Welcome message channel:"), "verification_level":_("Verification Level:")}
+        for attr, name in fields.items():
+            b = getattr(before, attr, None); a = getattr(after, attr, None)
+            if b != a:
+                changed = True
+                e.add_field(name=_("Before ") + name, value=str(b)[:1024])
+                e.add_field(name=_("After ") + name, value=str(a)[:1024])
+        if changed:
+            if embed_ok:
+                await ch.send(embed=e)
+            else:
+                await ch.send(_("{emoji} Guild updated").format(emoji=gs.events[Event.GUILD_CHANGE].emoji))
+
+    @commands.Cog.listener()
+    async def on_guild_emojis_update(self, guild: discord.Guild, before: Sequence[discord.Emoji], after: Sequence[discord.Emoji]):
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        if not gs.events[Event.EMOJI_CHANGE].enabled:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.EMOJI_CHANGE)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.EMOJI_CHANGE, guild)
+        time = datetime.datetime.utcnow()
+        e = discord.Embed(description="", timestamp=time, colour=await self._event_colour(guild, Event.EMOJI_CHANGE))
+        e.set_author(name=_("Updated Server Emojis"))
+        msg = ""
+        b = set(before); a = set(after)
+        try:
+            added = (a - b).pop()
+        except KeyError:
+            added = None
+        try:
+            removed = (b - a).pop()
+        except KeyError:
+            removed = None
+
+        changed_pair = set((e, e.name, tuple(e.roles)) for e in after)
+        changed_pair.difference_update((e, e.name, tuple(e.roles)) for e in (before + ((added,) if added else tuple())))
+        try:
+            changed = next(iter(changed_pair))[0]
+        except Exception:
+            changed = None
+
+        action = None
+        if removed:
+            msg += f"`{removed}` (ID: {removed.id}) Removed from the server\n"
+            e.description += msg
+            action = discord.AuditLogAction.emoji_delete
+        elif added:
+            msg += f"{added} `{added}` Added to the server\n"
+            e.description += msg
+            action = discord.AuditLogAction.emoji_create
+        elif changed:
+            old = next((em for em in before if em.id == changed.id), None)
+            if old:
+                if old.name != changed.name:
+                    msg += f"{changed} `{changed}` Renamed from {old.name} to {changed.name}\n"
+                    e.description += msg
+                    action = discord.AuditLogAction.emoji_update
+                if old.roles != changed.roles:
+                    if not changed.roles:
+                        e.description += _(" Changed to unrestricted.\n")
+                    elif not old.roles:
+                        e.description += _(" Restricted to roles: ") + humanize_list([r.mention for r in changed.roles])
+                    else:
+                        e.description += _(" Role restriction changed.\n")
+        if not e.description:
+            return
+        perp, reason = None, None
+        if ch.permissions_for(guild.me).view_audit_log and action:
+            async for log in guild.audit_logs(limit=1, action=action):
+                perp, reason = log.user, log.reason
+                break
+        if perp: e.add_field(name=_("Updated by "), value=perp.mention)
+        if reason: e.add_field(name=_("Reason "), value=reason)
+        if embed_ok:
+            await ch.send(embed=e)
+        else:
+            await ch.send(gs.events[Event.EMOJI_CHANGE].emoji + " " + msg)
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        guild = member.guild
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        if not gs.events[Event.VOICE_CHANGE].enabled or member.bot:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.VOICE_CHANGE)
+        except RuntimeError:
+            return
+        if after.channel and await self._is_ignored(guild, after.channel): return
+        if before.channel and await self._is_ignored(guild, before.channel): return
+        embed_ok = await self._can_send_embed(ch, Event.VOICE_CHANGE, guild)
+        e = discord.Embed(timestamp=datetime.datetime.utcnow(), colour=await self._event_colour(guild, Event.VOICE_CHANGE))
+        e.set_author(name=f"{member} ({member.id}) Voice State Update")
+        changed = False
+        if before.deaf != after.deaf:
+            changed = True
+            e.description = member.mention + (" was deafened." if after.deaf else " was undeafened.")
+        if before.mute != after.mute:
+            changed = True
+            e.description = member.mention + (" was muted." if after.mute else " was unmuted.")
+        if before.channel != after.channel:
+            changed = True
+            if before.channel is None:
+                e.description = member.mention + _(" has joined ") + inline(after.channel.name)
+            elif after.channel is None:
+                e.description = member.mention + _(" has left ") + inline(before.channel.name)
+            else:
+                e.description = (member.mention + _(" has moved from ") + inline(before.channel.name) + _(" to ") + inline(after.channel.name))
+        if not changed:
+            return
+        perp, reason = None, None
+        if ch.permissions_for(guild.me).view_audit_log:
+            async for log in guild.audit_logs(limit=5, action=discord.AuditLogAction.member_update):
+                if log.target.id == member.id:
+                    perp, reason = log.user, log.reason
+                    break
+        if perp: e.add_field(name=_("Updated by"), value=perp.mention)
+        if reason: e.add_field(name=_("Reason"), value=reason)
+        if embed_ok:
+            await ch.send(embed=e)
+        else:
+            await ch.send(escape(e.description or "", mass_mentions=True))
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        guild = before.guild
+        if version_info >= VersionInfo.from_str("3.4.0"):
+            if await self.bot.cog_disabled_in_guild(self, guild):
+                return
+        gs = self._gs(guild)
+        es = gs.events[Event.USER_CHANGE]
+        if not es.enabled:
+            return
+        if not es.bots and after.bot:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.USER_CHANGE)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.USER_CHANGE, guild)
+        e = discord.Embed(timestamp=datetime.datetime.utcnow(), colour=await self._event_colour(guild, Event.USER_CHANGE))
+        e.set_author(name=f"{before} ({before.id}) updated", icon_url=before.display_avatar.url)
+        changed = False
+        perp, reason = None, None
+        if es.nicknames and before.nick != after.nick:
+            changed = True
+            e.add_field(name=_("Before Nickname"), value=str(before.nick)[:1024])
+            e.add_field(name=_("After Nickname"), value=str(after.nick)[:1024])
+        if before.roles != after.roles:
+            b = set(before.roles); a = set(after.roles)
+            removed = list(b - a); added = list(a - b)
+            if removed:
+                changed = True
+                e.add_field(name=_("Roles removed"), value=humanize_list([r.mention for r in removed])[:1024] or "-")
+            if added:
+                changed = True
+                e.add_field(name=_("Roles added"), value=humanize_list([r.mention for r in added])[:1024] or "-")
+        if not changed:
+            return
+        if ch.permissions_for(guild.me).view_audit_log:
+            async for log in guild.audit_logs(limit=5, action=discord.AuditLogAction.member_update):
+                if log.target.id == before.id:
+                    perp, reason = log.user, log.reason
+                    break
+        if perp: e.add_field(name=_("Updated by"), value=perp.mention)
+        if reason: e.add_field(name=_("Reason"), value=reason)
+        if embed_ok:
+            await ch.send(embed=e)
+        else:
+            await ch.send(_("{emoji} `{time}` Member updated **{m}** (`{mid}`)").format(
+                emoji=es.emoji, time=datetime.datetime.utcnow().strftime("%H:%M:%S"), m=before, mid=before.id
+            ))
+
+    # ---- Invite tracking (basic parity) ----
+
+    async def _invite_loop(self):
+        if version_info >= VersionInfo.from_str("3.2.0"):
+            await self.bot.wait_until_red_ready()
+        else:
+            await self.bot.wait_until_ready()
+        while self is self.bot.get_cog("ModLogV2"):
+            for gid, gs in list(self._cache.items()):
+                guild = self.bot.get_guild(gid)
+                if not guild:
+                    continue
+                if gs.events[Event.USER_JOIN].enabled:
+                    await self._save_invites(guild)
+            await asyncio.sleep(300)
+
+    async def _save_invites(self, guild: discord.Guild) -> bool:
+        invites = {}
+        if not guild.me.guild_permissions.manage_guild:
+            return False
+        for inv in await guild.invites():
             try:
-                invites = await guild.invites()
-            except Exception:
-                continue
-            snapshot = {}
-            for inv in invites:
-                created_at = getattr(inv, "created_at", datetime.utcnow())
+                created_at = getattr(inv, "created_at", datetime.datetime.utcnow())
                 channel = getattr(inv, "channel", discord.Object(id=0))
                 inviter = getattr(inv, "inviter", discord.Object(id=0))
-                snapshot[inv.code] = {
+                invites[inv.code] = {
                     "uses": getattr(inv, "uses", 0),
                     "max_age": getattr(inv, "max_age", None),
                     "created_at": created_at.timestamp(),
@@ -458,860 +1475,78 @@ class ModLogV2(commands.Cog):
                     "inviter": inviter.id,
                     "channel": channel.id,
                 }
-            gs.invite_links = snapshot
-            await self.config.guild_from_id(gid).invite_links.set(snapshot)
-
-    # ---------- listeners (parity + AutoMod) ----------
-    @commands.Cog.listener()
-    async def on_command(self, ctx: commands.Context):
-        guild = ctx.guild
-        if guild is None:
-            return
-        es = self._es(guild, Event.COMMANDS_USED)
-        if not es.enabled:
-            return
-        if self._ignored(guild, ctx.channel):
-            return
-        ch = await self._modlog_channel(guild, Event.COMMANDS_USED)
-        if not ch:
-            return
-
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-        command = ctx.message.content.replace(ctx.prefix, "")
-        cmd = ctx.bot.get_command(command)
-        if not cmd:
-            return
-        try:
-            priv = cmd.requires.privilege_level.name
-        except Exception:
-            return
-        if es.privs and priv not in es.privs:
-            return
-
-        async def role_line():
-            if priv == "MOD":
-                try:
-                    mods = await ctx.bot.db.guild(guild).mod_role()
-                except AttributeError:
-                    mods = await ctx.bot.get_mod_roles(guild)
-                roles = [guild.get_role(r) for r in mods]
-                names = ", ".join(r.mention for r in roles if r)
-                return names or _("Not Set") + "\nMOD"
-            if priv == "ADMIN":
-                try:
-                    admins = await ctx.bot.db.guild(guild).admin_role()
-                except AttributeError:
-                    admins = await ctx.bot.get_admin_roles(guild)
-                roles = [guild.get_role(r) for r in admins]
-                names = ", ".join(r.mention for r in roles if r)
-                return names or _("Not Set") + "\nADMIN"
-            if priv == "BOT_OWNER":
-                return f"<@!{ctx.bot.owner_id}>\nBOT_OWNER"
-            if priv == "GUILD_OWNER":
-                return guild.owner.mention + "\nGUILD_OWNER"
-            return "everyone\nNONE"
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.COMMANDS_USED), ts=ctx.message.created_at)
-            self.emb.author(emb, title=_("Command Used"), icon_url=ctx.author.display_avatar.url)
-            self.emb.add_fields(emb, [
-                (_("User"), self.emb.userline(ctx.author), True),
-                (_("Channel"), self.emb.ch_mention(ctx.channel), True),
-                (_("Can Run"), str(True), True),
-                (_("Required Role"), await role_line(), False),
-                (_("Command"), f"```\n{ctx.message.content[:1000]}\n```", False),
-            ])
-            self.emb.footer_ids(emb, user=ctx.author)
-            await ch.send(embed=emb)
-        else:
-            msg = _("{e} `{t}` {u} used:\n> {cmd}").format(
-                e=es.emoji or "🤖",
-                t=ctx.message.created_at.strftime("%H:%M:%S"),
-                u=str(ctx.author),
-                cmd=ctx.message.content,
-            )
-            await ch.send(msg[:2000])
-
-    @commands.Cog.listener("on_raw_message_delete")
-    async def _raw_delete(self, payload: discord.RawMessageDeleteEvent):
-        gid = payload.guild_id
-        if not gid: return
-        guild = self.bot.get_guild(gid)
-        if not guild: return
-        es = self._es(guild, Event.MESSAGE_DELETE)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.MESSAGE_DELETE)
-        if not ch: return
-
-        src = getattr(guild, "get_channel_or_thread", guild.get_channel)(payload.channel_id)
-        if self._ignored(guild, src): return
-
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-        msg = payload.cached_message
-
-        if msg is None:
-            if es.cached_only: return
-            mention = src.mention if src else f"<#{payload.channel_id}>"
-            if embed_links:
-                emb = self.emb.base(colour=await self._event_colour(guild, Event.MESSAGE_DELETE))
-                self.emb.author(emb, title=_("Deleted Message"))
-                self.emb.add_fields(emb, [(_("Channel"), mention, True), (_("Content"), _("*Unknown*"), False)])
-                return await ch.send(embed=emb)
-            return await ch.send(f"{es.emoji or '🗑️'} `{datetime.utcnow():%H:%M:%S}` " + _("A message was deleted in {c}").format(c=mention))
-
-        if msg.author.bot and not (es.bots or False):
-            return
-
-        perp = None
-        try:
-            if ch.permissions_for(guild.me).view_audit_log:
-                async for entry in guild.audit_logs(limit=3, action=discord.AuditLogAction.message_delete):
-                    same_chan = getattr(entry.extra, "channel", None) and entry.extra.channel.id == msg.channel.id
-                    if entry.target and entry.target.id == msg.author.id and same_chan:
-                        perp = entry.user
-                        break
-        except Exception:
-            pass
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.MESSAGE_DELETE), ts=msg.created_at)
-            self.emb.author(emb, title=_("Message Deleted"), icon_url=msg.author.display_avatar.url)
-            self.emb.add_fields(emb, [
-                (_("Author"), self.emb.userline(msg.author), True),
-                (_("Channel"), self.emb.ch_mention(msg.channel), True),
-                (_("Deleted by"), self.emb.userline(perp) if perp else "—", True),
-                (_("Content"), f"```\n{(msg.content or '')[:1000]}\n```" if msg.content else "—", False),
-                (_("Attachments"), ", ".join(a.filename for a in msg.attachments) or "—", False),
-            ])
-            self.emb.footer_ids(emb, user=msg.author, extra=f"Message ID: {msg.id}")
-            return await ch.send(embed=emb)
-
-        header = f"{es.emoji or '🗑️'} `{msg.created_at:%H:%M:%S}` " + (_("{perp} deleted a message from **{a}**").format(perp=perp, a=msg.author) if perp else _("A message from **{a}** was deleted").format(a=msg.author))
-        clean = escape(msg.clean_content or "", mass_mentions=True)
-        await ch.send(f"{header} in {self.emb.ch_mention(msg.channel)}\n>>> {clean}"[:2000])
-
-    @commands.Cog.listener()
-    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent):
-        gid = payload.guild_id
-        if not gid: return
-        guild = self.bot.get_guild(gid)
-        if not guild: return
-        es = self._es(guild, Event.MESSAGE_DELETE)
-        if not es.enabled or not (es.bulk_enabled or False): return
-        ch = await self._modlog_channel(guild, Event.MESSAGE_DELETE)
-        if not ch: return
-
-        get_ch = getattr(guild, "get_channel_or_thread", guild.get_channel)
-        src = get_ch(payload.channel_id)
-        if self._ignored(guild, src): return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.MESSAGE_DELETE))
-            self.emb.author(emb, title=_("Bulk Message Delete"))
-            self.emb.add_fields(emb, [
-                (_("Channel"), self.emb.ch_mention(src) if src else f"<#{payload.channel_id}>", True),
-                (_("Messages deleted"), str(len(payload.message_ids)), True),
-            ])
-            await ch.send(embed=emb)
-        else:
-            await ch.send(_("{e} `{t}` Bulk delete in {c}, {n} messages.").format(
-                e=es.emoji or "🗑️",
-                t=datetime.utcnow().strftime("%H:%M:%S"),
-                c=self.emb.ch_mention(src) if src else f"<#{payload.channel_id}>",
-                n=len(payload.message_ids),
-            ))
-        if es.bulk_individual:
-            for m in payload.cached_messages:
-                fake = discord.RawMessageDeleteEvent({"id": m.id, "channel_id": payload.channel_id, "guild_id": gid})
-                fake.cached_message = m
-                try:
-                    await self._raw_delete(fake)
-                except Exception:
-                    pass
-
-    @commands.Cog.listener()
-    async def on_message_edit(self, before: discord.Message, after: discord.Message):
-        guild = before.guild
-        if not guild:
-            return
-        es = self._es(guild, Event.MESSAGE_EDIT)
-        if not es.enabled:
-            return
-        if before.author.bot and not (es.bots or False):
-            return
-        if before.content == after.content:
-            return
-        ch = await self._modlog_channel(guild, Event.MESSAGE_EDIT)
-        if not ch:
-            return
-        if self._ignored(guild, after.channel):
-            return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.MESSAGE_EDIT), ts=before.created_at)
-            self.emb.author(emb, title=_("Message Edited"), icon_url=before.author.display_avatar.url)
-            jump = f"[Jump]({after.jump_url})" if after.jump_url else "—"
-            self.emb.add_fields(emb, [
-                (_("Author"), self.emb.userline(before.author), True),
-                (_("Channel"), self.emb.ch_mention(before.channel), True),
-                (_("Jump"), jump, True),
-                (_("Before"), f"```\n{(before.content or '')[:1000]}\n```", False),
-                (_("After"),  f"```\n{(after.content or '')[:1000]}\n```", False),
-            ])
-            self.emb.footer_ids(emb, user=before.author, extra=f"Message ID: {before.id}")
-            return await ch.send(embed=emb)
-
-        msg = _("{e} `{t}` {u} edited a message in {c}\nBefore:\n> {b}\nAfter:\n> {a}").format(
-            e=es.emoji or "📝",
-            t=datetime.utcnow().strftime("%H:%M:%S"),
-            u=str(before.author),
-            c=before.channel.mention,
-            b=escape(before.content or "", mass_mentions=True),
-            a=escape(after.content or "", mass_mentions=True),
-        )
-        await ch.send(msg[:2000])
-
-    @commands.Cog.listener()
-    async def on_member_join(self, member: discord.Member):
-        guild = member.guild
-        es = self._es(guild, Event.USER_JOIN)
-        if not es.enabled:
-            return
-        ch = await self._modlog_channel(guild, Event.USER_JOIN)
-        if not ch:
-            return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        possible = ""
-        try:
-            if guild.me.guild_permissions.manage_guild:
-                current = await guild.invites()
-                snapshot = self._gs(guild).invite_links
-                for inv in current:
-                    old = snapshot.get(inv.code)
-                    if old and inv.uses > old.get("uses", 0):
-                        inviter = inv.inviter.mention if inv.inviter else _("Unknown")
-                        possible = f"https://discord.gg/{inv.code}\nInvited by: {inviter}"
-                        break
-        except Exception:
-            pass
-
-        created_days = (datetime.utcnow() - member.created_at).days
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.USER_JOIN), ts=member.joined_at or datetime.utcnow())
-            self.emb.author(emb, title=_("Member Joined"), icon_url=member.display_avatar.url)
-            self.emb.add_fields(emb, [
-                (_("Member"), self.emb.userline(member), True),
-                (_("Total Users:"), str(len(guild.members)), True),
-                (_("Account created on:"), f"{member.created_at:%d %b %Y %H:%M}\n({created_days} days ago)", False),
-                (_("Invite Link"), possible or "—", False),
-            ])
-            self.emb.footer_ids(emb, user=member)
-            emb.set_thumbnail(url=member.display_avatar.url)
-            return await ch.send(embed=emb)
-
-        await ch.send(_("{e} `{t}` **{m}** (`{i}`) joined. Total members: {n}").format(
-            e=es.emoji or "📥",
-            t=datetime.utcnow().strftime("%H:%M:%S"),
-            m=member,
-            i=member.id,
-            n=len(guild.members),
-        ))
-
-    @commands.Cog.listener()
-    async def on_member_remove(self, member: discord.Member):
-        guild = member.guild
-        es = self._es(guild, Event.USER_LEFT)
-        if not es.enabled:
-            return
-        ch = await self._modlog_channel(guild, Event.USER_LEFT)
-        if not ch:
-            return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        perp, reason = None, None
-        try:
-            if ch.permissions_for(guild.me).view_audit_log:
-                after = datetime.utcnow() - timedelta(minutes=30)
-                async for log in guild.audit_logs(limit=5, action=discord.AuditLogAction.kick, after=after):
-                    if log.target.id == member.id:
-                        perp, reason = log.user, log.reason
-                        break
-        except Exception:
-            pass
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.USER_LEFT), ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Member Left"), icon_url=member.display_avatar.url)
-            self.emb.add_fields(emb, [
-                (_("Member"), self.emb.userline(member), True),
-                (_("Total Users:"), str(len(guild.members)), True),
-                (_("Kicked"), self.emb.userline(perp) if perp else "—", True),
-                (_("Reason"), str(reason) if reason else "—", False),
-            ])
-            self.emb.footer_ids(emb, user=member)
-            emb.set_thumbnail(url=member.display_avatar.url)
-            return await ch.send(embed=emb)
-
-        msg = _("{e} `{t}` **{m}** (`{i}`) {verb}. Total members: {n}").format(
-            e=es.emoji or "📤",
-            t=datetime.utcnow().strftime("%H:%M:%S"),
-            m=member, i=member.id,
-            verb=_("was kicked by {p}").format(p=perp) if perp else _("left the server"),
-            n=len(guild.members),
-        )
-        await ch.send(msg)
-
-    @commands.Cog.listener()
-    async def on_guild_channel_create(self, new_channel: discord.abc.GuildChannel):
-        guild = new_channel.guild
-        es = self._es(guild, Event.CHANNEL_CREATE)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.CHANNEL_CREATE)
-        if not ch: return
-        if self._ignored(guild, new_channel): return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        perp, reason = None, None
-        try:
-            if ch.permissions_for(guild.me).view_audit_log:
-                async for log in guild.audit_logs(limit=2, action=discord.AuditLogAction.channel_create):
-                    if log.target.id == new_channel.id:
-                        perp, reason = log.user, log.reason
-                        break
-        except Exception:
-            pass
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.CHANNEL_CREATE), ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Channel Created"))
-            self.emb.add_fields(emb, [
-                (_("Channel"), new_channel.mention, True),
-                (_("Type"), str(new_channel.type).title(), True),
-                (_("Created by"), self.emb.userline(perp) if perp else "—", True),
-                (_("Reason"), str(reason) if reason else "—", False),
-            ])
-            await ch.send(embed=emb)
-        else:
-            await ch.send(_("{e} `{t}` {typ} channel created {perp} {channel}").format(
-                e=es.emoji or "🧩",
-                t=datetime.utcnow().strftime("%H:%M:%S"),
-                typ=str(new_channel.type).title(),
-                perp=_("by {p}").format(p=perp) if perp else "",
-                channel=new_channel.mention,
-            ))
-
-    @commands.Cog.listener()
-    async def on_guild_channel_delete(self, old_channel: discord.abc.GuildChannel):
-        guild = old_channel.guild
-        es = self._es(guild, Event.CHANNEL_DELETE)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.CHANNEL_DELETE)
-        if not ch: return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        perp, reason = None, None
-        try:
-            if ch.permissions_for(guild.me).view_audit_log:
-                async for log in guild.audit_logs(limit=2, action=discord.AuditLogAction.channel_delete):
-                    if log.target.id == old_channel.id:
-                        perp, reason = log.user, log.reason
-                        break
-        except Exception:
-            pass
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.CHANNEL_DELETE), ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Channel Deleted"))
-            self.emb.add_fields(emb, [
-                (_("Name"), f"{old_channel.name} ({old_channel.id})", True),
-                (_("Type"), str(old_channel.type).title(), True),
-                (_("Deleted by"), self.emb.userline(perp) if perp else "—", True),
-                (_("Reason"), str(reason) if reason else "—", False),
-            ])
-            await ch.send(embed=emb)
-        else:
-            await ch.send(_("{e} `{t}` {typ} channel deleted {perp} #{name} ({cid})").format(
-                e=es.emoji or "🧩",
-                t=datetime.utcnow().strftime("%H:%M:%S"),
-                typ=str(old_channel.type).title(),
-                perp=_("by {p}").format(p=perp) if perp else "",
-                name=old_channel.name, cid=old_channel.id,
-            ))
-
-    @commands.Cog.listener()
-    async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
-        guild = before.guild
-        es = self._es(guild, Event.CHANNEL_CHANGE)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.CHANNEL_CHANGE)
-        if not ch: return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        fields = []
-        def add_change(name, b, a):
-            if b != a:
-                fields.append((_("Before ") + name, str(b) if b != "" else "None", True))
-                fields.append((_("After ") + name, str(a) if a != "" else "None", True))
-
-        typ = str(after.type).title()
-        if isinstance(before, discord.TextChannel) and isinstance(after, discord.TextChannel):
-            add_change(_("Name:"), before.name, after.name)
-            add_change(_("Topic:"), before.topic, after.topic)
-            add_change(_("Category:"), before.category, after.category)
-            add_change(_("Slowmode:"), before.slowmode_delay, after.slowmode_delay)
-            if before.is_nsfw() != after.is_nsfw():
-                add_change("NSFW", before.is_nsfw(), after.is_nsfw())
-        if isinstance(before, discord.VoiceChannel) and isinstance(after, discord.VoiceChannel):
-            add_change(_("Name:"), before.name, after.name)
-            add_change(_("Position:"), before.position, after.position)
-            add_change(_("Category:"), before.category, after.category)
-            add_change(_("Bitrate:"), before.bitrate, after.bitrate)
-            add_change(_("User limit:"), before.user_limit, after.user_limit)
-
-        if not fields:
-            return
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.CHANNEL_CHANGE), ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Channel Updated"))
-            self.emb.add_fields(emb, [(_("Channel"), after.mention, True), (_("Type"), typ, True), ("—", "—", True)])
-            for f in fields:
-                self.emb.add_fields(emb, [f])
-            await ch.send(embed=emb)
-        else:
-            await ch.send(_("{e} `{t}` Updated channel {c}").format(
-                e=es.emoji or "🧩", t=datetime.utcnow().strftime("%H:%M:%S"), c=before.name,
-            ))
-
-    def _role_perm_diff(self, before: discord.Role, after: discord.Role) -> str:
-        names = [p for p in dir(before.permissions) if not p.startswith("_") and isinstance(getattr(before.permissions, p), bool)]
-        lines = []
-        for n in names:
-            if getattr(before.permissions, n) != getattr(after.permissions, n):
-                lines.append(f"{n} → {getattr(after.permissions, n)}")
-        return "\n".join(lines)
-
-    @commands.Cog.listener()
-    async def on_guild_role_update(self, before: discord.Role, after: discord.Role):
-        guild = before.guild
-        es = self._es(guild, Event.ROLE_CHANGE)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.ROLE_CHANGE)
-        if not ch: return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        colour = await self._event_colour(guild, Event.ROLE_CHANGE, role=after)
-        fields = []
-        def add(name, b, a):
-            if b != a:
-                fields.append((_("Before ") + name, str(b), True))
-                fields.append((_("After ") + name, str(a), True))
-        add(_("Name:"), before.name, after.name)
-        add(_("Colour:"), before.colour, after.colour)
-        add(_("Mentionable:"), before.mentionable, after.mentionable)
-        add(_("Is Hoisted:"), before.hoist, after.hoist)
-        perm_diff = self._role_perm_diff(before, after)
-        if perm_diff:
-            fields.append((_('Permissions'), perm_diff[:1024], False))
-        if not fields:
-            return
-        if embed_links:
-            emb = self.emb.base(colour=colour, ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Role Updated"))
-            self.emb.add_fields(emb, [(_("Role"), after.mention if after != guild.default_role else "@everyone", True)])
-            for f in fields:
-                self.emb.add_fields(emb, [f])
-            await ch.send(embed=emb)
-        else:
-            await ch.send(_("{e} `{t}` Updated role **{r}**").format(e=es.emoji or "🏳️", t=datetime.utcnow().strftime("%H:%M:%S"), r=before.name))
-
-    @commands.Cog.listener()
-    async def on_guild_role_create(self, role: discord.Role):
-        guild = role.guild
-        es = self._es(guild, Event.ROLE_CREATE)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.ROLE_CREATE)
-        if not ch: return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.ROLE_CREATE), ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Role Created"))
-            self.emb.add_fields(emb, [(_("Role"), role.mention, True)])
-            await ch.send(embed=emb)
-        else:
-            await ch.send(_("{e} `{t}` Role created {r}").format(e=es.emoji or "🏳️", t=datetime.utcnow().strftime("%H:%M:%S"), r=role.name))
-
-    @commands.Cog.listener()
-    async def on_guild_role_delete(self, role: discord.Role):
-        guild = role.guild
-        es = self._es(guild, Event.ROLE_DELETE)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.ROLE_DELETE)
-        if not ch: return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.ROLE_DELETE), ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Role Deleted"))
-            self.emb.add_fields(emb, [(_("Role"), f"{role.name} ({role.id})", True)])
-            await ch.send(embed=emb)
-        else:
-            await ch.send(_("{e} `{t}` Role deleted **{r}**").format(e=es.emoji or "🏳️", t=datetime.utcnow().strftime("%H:%M:%S"), r=role.name))
-
-    @commands.Cog.listener()
-    async def on_guild_update(self, before: discord.Guild, after: discord.Guild):
-        guild = after
-        es = self._es(guild, Event.GUILD_CHANGE)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.GUILD_CHANGE)
-        if not ch: return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        changes = []
-        def add(name, b, a):
-            if b != a:
-                changes.append((_("Before ") + name, str(b), True))
-                changes.append((_("After ") + name, str(a), True))
-        add(_("Name:"), before.name, after.name)
-        add(_("Region:"), getattr(before, "region", None), getattr(after, "region", None))
-        add(_("AFK Timeout:"), before.afk_timeout, after.afk_timeout)
-        add(_("AFK Channel:"), before.afk_channel, after.afk_channel)
-        add(_("Server Icon:"), bool(before.icon), bool(after.icon))
-        add(_("Server Owner:"), before.owner, after.owner)
-        add(_("Splash Image:"), bool(before.splash), bool(after.splash))
-        add(_("Welcome message channel:"), before.system_channel, after.system_channel)
-        add(_("Verification Level:"), before.verification_level, after.verification_level)
-        if not changes:
-            return
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.GUILD_CHANGE), ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Guild Updated"))
-            for f in changes:
-                self.emb.add_fields(emb, [f])
-            icon = after.icon
-            if icon:
-                emb.set_thumbnail(url=icon.url)
-            await ch.send(embed=emb)
-        else:
-            await ch.send(_("{e} `{t}` Guild updated").format(e=es.emoji or "🛠️", t=datetime.utcnow().strftime("%H:%M:%S")))
-
-    @commands.Cog.listener()
-    async def on_guild_emojis_update(self, guild: discord.Guild, before, after):
-        es = self._es(guild, Event.EMOJI_CHANGE)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.EMOJI_CHANGE)
-        if not ch: return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        b, a = set(before), set(after)
-        added = list(a - b)
-        removed = list(b - a)
-        changed = []
-        for em in after:
-            for old in before:
-                if em.id == old.id and (em.name != old.name or set(em.roles) != set(old.roles)):
-                    changed.append((old, em))
-                    break
-        if not (added or removed or changed):
-            return
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.EMOJI_CHANGE), ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Emojis Updated"))
-            if added:
-                emb.add_field(name=_("Added"), value=" ".join(str(e) for e in added)[:1024], inline=False)
-            if removed:
-                emb.add_field(name=_("Removed"), value=" ".join(f"`{e}`" for e in removed)[:1024], inline=False)
-            for (old, em) in changed:
-                txt = ""
-                if old.name != em.name:
-                    txt += _("Renamed from **{a}** to **{b}**\n").format(a=old.name, b=em.name)
-                if set(old.roles) != set(em.roles):
-                    if em.roles:
-                        txt += _("Restricted to: ") + ", ".join(r.mention for r in em.roles)
-                    else:
-                        txt += _("Changed to unrestricted.")
-                emb.add_field(name=str(em), value=txt or "—", inline=False)
-            await ch.send(embed=emb)
-        else:
-            lines = [f"{es.emoji or '😶‍🌫️'} `{datetime.utcnow():%H:%M:%S}` " + _("Updated Server Emojis")]
-            if added:
-                lines.append(_("Added: ") + ", ".join(f"{e} `{e}`" for e in added))
-            if removed:
-                lines.append(_("Removed: ") + ", ".join(f"`{e}`" for e in removed))
-            for (old, em) in changed:
-                bit = f"{em} `{em}`"
-                if old.name != em.name:
-                    bit += _(" renamed from ") + old.name + _(" to ") + em.name
-                lines.append(bit)
-            await ch.send("\n".join(lines)[:2000])
-
-    @commands.Cog.listener()
-    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-        guild = member.guild
-        es = self._es(guild, Event.VOICE_CHANGE)
-        if not es.enabled: return
-        if member.bot: return
-        ch = await self._modlog_channel(guild, Event.VOICE_CHANGE)
-        if not ch: return
-        if after.channel and self._ignored(guild, after.channel): return
-        if before.channel and self._ignored(guild, before.channel): return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        change = None; desc = ""
-        if before.deaf != after.deaf:
-            change = "deaf"; desc = (member.mention + _(" was deafened.")) if after.deaf else (member.mention + _(" was undeafened."))
-        elif before.mute != after.mute:
-            change = "mute"; desc = (member.mention + _(" was muted.")) if after.mute else (member.mention + _(" was unmuted."))
-        elif before.channel != after.channel:
-            change = "channel"
-            if before.channel is None:
-                desc = member.mention + _(" has joined ") + inline(after.channel.name)
-            elif after.channel is None:
-                desc = member.mention + _(" has left ") + inline(before.channel.name)
-            else:
-                desc = member.mention + _(" moved from ") + inline(before.channel.name) + _(" to ") + inline(after.channel.name)
-        if not change:
-            return
-
-        perp, reason = None, None
-        try:
-            if ch.permissions_for(guild.me).view_audit_log and change in {"deaf","mute","channel"}:
-                async for log in guild.audit_logs(limit=5, action=discord.AuditLogAction.member_update):
-                    is_change = getattr(log.after, change, None)
-                    if log.target.id == member.id and is_change:
-                        perp, reason = log.user, log.reason
-                        break
-        except Exception:
-            pass
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.VOICE_CHANGE), ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Voice State Update"))
-            self.emb.add_fields(emb, [
-                (_("Member"), self.emb.userline(member), True),
-                (_("Change"), desc, False),
-                (_("Updated by"), self.emb.userline(perp) if perp else "—", True),
-                (_("Reason"), str(reason) if reason else "—", True),
-            ])
-            await ch.send(embed=emb)
-        else:
-            await ch.send(_("{e} `{t}` Updated Voice State for **{m}** (`{i}`)\n{d}").format(
-                e=es.emoji or "🎤",
-                t=datetime.utcnow().strftime("%H:%M:%S"),
-                m=member, i=member.id, d=desc,
-            ))
-
-    @commands.Cog.listener()
-    async def on_member_update(self, before: discord.Member, after: discord.Member):
-        guild = before.guild
-        es = self._es(guild, Event.USER_CHANGE)
-        if not es.enabled: return
-        if after.bot and not (es.bots or False): return
-        ch = await self._modlog_channel(guild, Event.USER_CHANGE)
-        if not ch: return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        fields = []; worth = False
-        if (es.nicknames or True) and before.nick != after.nick:
-            worth = True
-            fields.append((_("Before Nickname"), str(before.nick), True))
-            fields.append((_("After Nickname"), str(after.nick), True))
-        if before.roles != after.roles:
-            worth = True
-            b = set(before.roles); a = set(after.roles)
-            removed = [r for r in (b - a) if r.name != "@everyone"]
-            added   = [r for r in (a - b) if r.name != "@everyone"]
-            if added:
-                fields.append((_("Roles Added"), ", ".join(r.mention for r in added), False))
-            if removed:
-                fields.append((_("Roles Removed"), ", ".join(r.mention for r in removed), False))
-        if not worth: return
-
-        perp, reason = None, None
-        try:
-            if ch.permissions_for(guild.me).view_audit_log:
-                async for log in guild.audit_logs(limit=5, action=discord.AuditLogAction.member_role_update):
-                    if log.target.id == before.id:
-                        perp, reason = log.user, log.reason
-                        break
-                if not perp:
-                    async for log in guild.audit_logs(limit=5, action=discord.AuditLogAction.member_update):
-                        if log.target.id == before.id:
-                            perp, reason = log.user, log.reason
-                            break
-        except Exception:
-            pass
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.USER_CHANGE), ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Member Updated"), icon_url=before.display_avatar.url)
-            self.emb.add_fields(emb, [(_("Member"), self.emb.userline(before), True)])
-            for f in fields:
-                self.emb.add_fields(emb, [f])
-            if perp or reason:
-                self.emb.add_fields(emb, [
-                    (_("Updated by"), self.emb.userline(perp) if perp else "—", True),
-                    (_("Reason"), str(reason) if reason else "—", True),
-                ])
-            await ch.send(embed=emb)
-        else:
-            await ch.send(_("{e} `{t}` Member updated **{m}** (`{i}`)").format(
-                e=es.emoji or "👨‍🔧", t=datetime.utcnow().strftime("%H:%M:%S"), m=before, i=before.id
-            ))
+            except Exception:
+                logger.exception("Error saving invites.")
+                pass
+        self._gs(guild).invite_links = invites
+        await self._save(guild)
+        return True
 
     @commands.Cog.listener()
     async def on_invite_create(self, invite: discord.Invite):
         guild = invite.guild
-        # keep snapshot updated
         gs = self._gs(guild)
-        created_at = getattr(invite, "created_at", datetime.utcnow())
-        inviter = getattr(invite, "inviter", discord.Object(id=0))
-        channel = getattr(invite, "channel", discord.Object(id=0))
-        gs.invite_links[invite.code] = {
-            "uses": getattr(invite, "uses", 0),
-            "max_age": getattr(invite, "max_age", None),
-            "created_at": created_at.timestamp(),
-            "max_uses": getattr(invite, "max_uses", None),
-            "temporary": getattr(invite, "temporary", False),
-            "inviter": inviter.id,
-            "channel": channel.id,
-        }
-        await self.config.guild(guild).invite_links.set(gs.invite_links)
-
-        es = self._es(guild, Event.INVITE_CREATED)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.INVITE_CREATED)
-        if not ch: return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.INVITE_CREATED), ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Invite Created"))
-            self.emb.add_fields(emb, [
-                (_("Code:"), invite.code, True),
-                (_("Inviter:"), getattr(invite.inviter, "mention", "—"), True),
-                (_("Channel:"), getattr(invite.channel, "mention", "—"), True),
-                (_("Max Uses:"), str(getattr(invite, "max_uses", "—")), True),
-            ])
+        es = gs.events[Event.INVITE_CREATED]
+        # cache new code
+        if invite.code not in gs.invite_links:
+            created_at = getattr(invite, "created_at", datetime.datetime.utcnow())
+            inviter = getattr(invite, "inviter", discord.Object(id=0))
+            channel = getattr(invite, "channel", discord.Object(id=0))
+            gs.invite_links[invite.code] = {
+                "uses": getattr(invite, "uses", 0),
+                "max_age": getattr(invite, "max_age", None),
+                "created_at": created_at.timestamp(),
+                "max_uses": getattr(invite, "max_uses", None),
+                "temporary": getattr(invite, "temporary", False),
+                "inviter": inviter.id,
+                "channel": channel.id,
+            }
+            await self._save(guild)
+        if not es.enabled:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.INVITE_CREATED)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.INVITE_CREATED, guild)
+        attrs = {"code":_("Code:"), "inviter":_("Inviter:"), "channel":_("Channel:"), "max_uses":_("Max Uses:")}
+        msgbits = []
+        emb = discord.Embed(title=_("Invite Created"), colour=await self._event_colour(guild, Event.INVITE_CREATED))
+        for attr, name in attrs.items():
+            v = getattr(invite, attr, None)
+            if v:
+                msgbits.append(f"{name} {v}")
+                emb.add_field(name=name, value=str(v))
+        if not msgbits:
+            return
+        if embed_ok:
             await ch.send(embed=emb)
         else:
-            await ch.send(_("{e} `{t}` Invite created code: {c}").format(e=es.emoji or "🔗", t=datetime.utcnow().strftime("%H:%M:%S"), c=invite.code))
+            await ch.send(gs.events[Event.INVITE_CREATED].emoji + " " + " | ".join(msgbits))
 
     @commands.Cog.listener()
     async def on_invite_delete(self, invite: discord.Invite):
         guild = invite.guild
-        es = self._es(guild, Event.INVITE_DELETED)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.INVITE_DELETED)
-        if not ch: return
-        embed_links = ch.permissions_for(guild.me).embed_links and es.embed
-
-        if embed_links:
-            emb = self.emb.base(colour=await self._event_colour(guild, Event.INVITE_DELETED), ts=datetime.utcnow())
-            self.emb.author(emb, title=_("Invite Deleted"))
-            self.emb.add_fields(emb, [
-                (_("Code:"), invite.code, True),
-                (_("Inviter:"), getattr(invite.inviter, "mention", "—"), True),
-                (_("Channel:"), getattr(invite.channel, "mention", "—"), True),
-                (_("Used:"), str(getattr(invite, "uses", "—")), True),
-            ])
+        gs = self._gs(guild)
+        es = gs.events[Event.INVITE_DELETED]
+        if not es.enabled:
+            return
+        try:
+            ch = await self._modlog_channel(guild, Event.INVITE_DELETED)
+        except RuntimeError:
+            return
+        embed_ok = await self._can_send_embed(ch, Event.INVITE_DELETED, guild)
+        attrs = {"code":_("Code: "), "inviter":_("Inviter: "), "channel":_("Channel: "), "max_uses":_("Max Uses: "), "uses":_("Used: ")}
+        emb = discord.Embed(title=_("Invite Deleted"), colour=await self._event_colour(guild, Event.INVITE_DELETED))
+        msgbits = []
+        for attr, name in attrs.items():
+            v = getattr(invite, attr, None)
+            if v:
+                msgbits.append(f"{name}{v}")
+                emb.add_field(name=name, value=str(v))
+        if not msgbits:
+            return
+        if embed_ok:
             await ch.send(embed=emb)
         else:
-            await ch.send(_("{e} `{t}` Invite deleted code: {c}").format(e=es.emoji or "⛓️", t=datetime.utcnow().strftime("%H:%M:%S"), c=invite.code))
-
-    # AutoMod rule lifecycle + execution
-    @commands.Cog.listener()
-    async def on_automod_rule_create(self, rule: discord.AutoModRule):
-        guild = rule.guild
-        es = self._es(guild, Event.AUTOMOD_RULE_CREATE)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.AUTOMOD_RULE_CREATE)
-        if not ch: return
-        emb = self.emb.base(colour=await self._event_colour(guild, Event.AUTOMOD_RULE_CREATE), ts=datetime.utcnow())
-        self.emb.author(emb, title=_("AutoMod: Rule Created"))
-        self.emb.add_fields(emb, [
-            (_("Name"), rule.name, True),
-            (_("Enabled"), str(rule.enabled), True),
-            (_("Event Type"), str(rule.event_type), True),
-            (_("Trigger Type"), str(getattr(rule.trigger, 'type', 'unknown')), True),
-            (_("Exempt Roles"), ", ".join(r.mention for r in rule.exempt_roles) or "—", False),
-            (_("Exempt Channels"), ", ".join(c.mention for c in rule.exempt_channels) or "—", False),
-        ])
-        self.emb.footer_ids(emb, extra=f"Rule ID: {rule.id}")
-        await ch.send(embed=emb)
-
-    @commands.Cog.listener()
-    async def on_automod_rule_update(self, rule: discord.AutoModRule):
-        guild = rule.guild
-        es = self._es(guild, Event.AUTOMOD_RULE_UPDATE)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.AUTOMOD_RULE_UPDATE)
-        if not ch: return
-        emb = self.emb.base(colour=await self._event_colour(guild, Event.AUTOMOD_RULE_UPDATE), ts=datetime.utcnow())
-        self.emb.author(emb, title=_("AutoMod: Rule Updated"))
-        self.emb.add_fields(emb, [
-            (_("Name"), rule.name, True),
-            (_("Enabled"), str(rule.enabled), True),
-            (_("Trigger Type"), str(getattr(rule.trigger, 'type', 'unknown')), True),
-        ])
-        self.emb.footer_ids(emb, extra=f"Rule ID: {rule.id}")
-        await ch.send(embed=emb)
-
-    @commands.Cog.listener()
-    async def on_automod_rule_delete(self, rule: discord.AutoModRule):
-        guild = rule.guild
-        es = self._es(guild, Event.AUTOMOD_RULE_DELETE)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.AUTOMOD_RULE_DELETE)
-        if not ch: return
-        emb = self.emb.base(colour=await self._event_colour(guild, Event.AUTOMOD_RULE_DELETE), ts=datetime.utcnow())
-        self.emb.author(emb, title=_("AutoMod: Rule Deleted"))
-        self.emb.add_fields(emb, [
-            (_("Name"), rule.name, True),
-            (_("Trigger Type"), str(getattr(rule.trigger, 'type', 'unknown')), True),
-        ])
-        self.emb.footer_ids(emb, extra=f"Rule ID: {rule.id}")
-        await ch.send(embed=emb)
-
-    @commands.Cog.listener()
-    async def on_automod_action_execution(self, payload: discord.AutoModAction):
-        guild = self.bot.get_guild(payload.guild_id)
-        if not guild: return
-        es = self._es(guild, Event.AUTOMOD_ACTION)
-        if not es.enabled: return
-        ch = await self._modlog_channel(guild, Event.AUTOMOD_ACTION)
-        if not ch: return
-
-        user = guild.get_member(payload.user_id) or (await self.bot.fetch_user(payload.user_id))
-        channel = getattr(guild, "get_channel_or_thread", guild.get_channel)(payload.channel_id) if payload.channel_id else None
-        colour = await self._event_colour(guild, Event.AUTOMOD_ACTION)
-
-        emb = self.emb.base(colour=colour, ts=datetime.utcnow())
-        self.emb.author(emb, title=_("AutoMod: Action Executed"), icon_url=getattr(user, "display_avatar", None).url if user else None)
-
-        action_name = getattr(payload.action, "type", "Unknown")
-        jump = ""
-        if payload.message_id and channel:
-            try:
-                msg = await channel.fetch_message(payload.message_id)
-                jump = f"[Jump]({msg.jump_url})"
-            except Exception:
-                pass
-
-        fields = [
-            (_("User"), self.emb.userline(user) if user else f"`{payload.user_id}`", True),
-            (_("Channel"), self.emb.ch_mention(channel) if channel else "—", True),
-            (_("Action"), str(action_name), True),
-            (_("Matched Keyword"), payload.matched_keyword or "—", True),
-            (_("Matched Content"), f"```\n{(payload.matched_content or '')[:900]}\n```" if payload.matched_content else "—", False),
-            (_("Original Content"), f"```\n{(payload.content or '')[:900]}\n```" if payload.content else "—", False),
-            (_("Jump"), jump or "—", True),
-        ]
-        self.emb.add_fields(emb, fields)
-        self.emb.footer_ids(emb, user=user, extra=f"Rule ID: {payload.rule_id}")
-        await ch.send(embed=emb)
+            await ch.send(gs.events[Event.INVITE_DELETED].emoji + " " + " | ".join(msgbits))
