@@ -1,4 +1,7 @@
+from redbot.core.bot import Red
+
 from .modplus import ModPlus
 
-def setup(bot):
-    bot.add_cog(ModPlus(bot))
+
+async def setup(bot: Red) -> None:
+    await bot.add_cog(ModPlus(bot))

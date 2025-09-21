@@ -1,17 +1,19 @@
-from discord import user
-from redbot.core import commands, Config, checks, modlog
 import discord
-import asyncio
-import datetime
-import time
-from pyrate_limiter import (
-    BucketFullException,
-    Duration,
-    Rate,
-    Limiter,
-    MemoryListBucket,
-    MemoryQueueBucket,
-)
+
+try:
+    from pyrate_limiter import Duration, Limiter, Rate
+except ImportError:  # pyrate-limiter<3.0 exposed RequestRate instead of Rate
+    from pyrate_limiter import Duration, Limiter, RequestRate as Rate  # type: ignore[assignment]
+
+try:  # pyrate-limiter<=2 named the in-memory bucket MemoryListBucket
+    from pyrate_limiter import MemoryListBucket  # type: ignore[attr-defined]
+except ImportError:
+    try:
+        from pyrate_limiter.buckets import InMemoryBucket as MemoryListBucket  # type: ignore[attr-defined,assignment]
+    except ImportError:  # pragma: no cover - library missing optional bucket alias
+        MemoryListBucket = None  # type: ignore[assignment]
+from redbot.core import checks, commands, Config
+from redbot.core.bot import Red
 
 ERROR_MESSAGES = {
     'NOTIF_UNRECOGNIZED': "Notification Key was not recognized, please do `!notifs info` to get more info about the keys. List of valid keys: kick, ban, mute, jail, warn, channelperms, editchannel, deletemessages, ratelimit, adminrole, bot",
@@ -49,7 +51,8 @@ You will be DMed on the events that you choose, listed below:
 
 class ModPlus(commands.Cog):
     """Ultimate Moderation Cog for RedBot"""
-    def __init__(self, bot):
+
+    def __init__(self, bot: Red) -> None:
         self.bot = bot
         self.config = Config.get_conf(self, 8818154, force_registration=True)
         # PyRateLimit.init(redis_host="localhost", redis_port=6379)
@@ -263,7 +266,7 @@ class ModPlus(commands.Cog):
             except Exception:
                 pass
         for channel in data['notifchannels'][notifkey]:
-            guild: discord.guild = self.bot.get_guild(channel[0])
+            guild: discord.Guild = self.bot.get_guild(channel[0])
             if guild is not None:
                 txtchannel = guild.get_channel(channel[1])
             try:
