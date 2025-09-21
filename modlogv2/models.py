@@ -43,7 +43,7 @@ class EventSettings:
     colour: Optional[int] = None
     emoji: str = ""
     embed: bool = True
-    # per-event flags (used by various listeners)
+    # optional flags
     bots: Optional[bool] = None
     bulk_enabled: Optional[bool] = None
     bulk_individual: Optional[bool] = None

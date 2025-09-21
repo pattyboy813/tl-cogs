@@ -53,6 +53,7 @@ class EmbedFactory:
     @staticmethod
     def add_fields(emb: discord.Embed, fields: Iterable[Tuple[str, str, bool]]):
         for name, value, inline in fields:
-            if value:
-                emb.add_field(name=name, value=value[:1024], inline=inline)
+            if value is None:
+                continue
+            emb.add_field(name=name, value=str(value)[:1024] or "—", inline=inline)
         return emb
