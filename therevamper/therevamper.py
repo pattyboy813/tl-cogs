@@ -77,8 +77,19 @@ def _cat_key(c: discord.CategoryChannel) -> str:
     return c.name.lower()
 
 
-def _chan_key(ch: discord.abc.GuildChannel) -> Tuple[str, int]:
-    return (ch.name.lower(), int(ch.type))
+def _chan_key(ch: discord.abc.GuildChannel) -> Tuple[str, str]:
+    # Robust across discord.py variants where ChannelType may not be IntEnum
+    if isinstance(ch, discord.TextChannel):
+        kind = "text"
+    elif isinstance(ch, discord.VoiceChannel):
+        kind = "voice"
+    elif isinstance(ch, discord.CategoryChannel):
+        kind = "category"
+    else:
+        t = getattr(ch, "type", None)
+        # Fall back to enum name or string
+        kind = getattr(t, "name", str(t))
+    return (ch.name.lower(), kind)
 
 
 # ------------------------
@@ -127,11 +138,11 @@ class ConfirmView(discord.ui.View):
 class TheRevamper(commands.Cog):
     """
     Sync selected structure from a **revamp** (source) guild to your **main** (target) guild, with
-    optional **permission overwrite** syncing and **transactional rollback** if anything fails.
+    **permission overwrite** syncing and **transactional rollback** if anything fails.
 
     Scope (v1.1):
     - Roles: create/update (colour, hoist, mentionable, permissions) and reorder.
-    - Categories + channels: create/update/move/reorder text & voice. Sync permission overwrites (on by default now).
+    - Categories + channels: create/update/move/reorder text & voice. Permission overwrites synced (ON by default).
     - Optional pruning to delete items missing from the revamp guild.
     - Transactional run: if any step errors, previously-applied changes are rolled back best-effort.
 
@@ -142,7 +153,7 @@ class TheRevamper(commands.Cog):
         "source_guild_id": None,  # revamp guild
         "target_guild_id": None,  # main guild
         "prune": False,
-        "sync_overwrites": True,  # now default True per request
+        "sync_overwrites": True,  # default True per request
         "last_operator": None,
         "transactional": True,
     }
@@ -438,7 +449,7 @@ class TheRevamper(commands.Cog):
                         )
                     txn.add(lambda c=tc: c.delete(reason="TheRevamper rollback: remove created channel"))
                 else:
-                    # snapshot
+                    # snapshot + edits
                     if is_text and isinstance(tc, discord.TextChannel) and isinstance(sc, discord.TextChannel):
                         before = dict(
                             category=tc.category,
@@ -565,7 +576,7 @@ class TheRevamper(commands.Cog):
         if not src or not tgt:
             return await interaction.edit_original_response(content="Guilds not found; is the bot in both servers?", view=None)
 
-        embed = discord.Embed(title="Revamp Sync — Running", colour=discord.Colour.blurple())
+        embed = discord.Embed(title="TheRevamper — Running", colour=discord.Colour.blurple())
         embed.add_field(name="From", value=f"{src.name} ({src.id})", inline=True)
         embed.add_field(name="To", value=f"{tgt.name} ({tgt.id})", inline=True)
         embed.set_footer(text="This may take a while depending on server size.")
@@ -592,7 +603,7 @@ class TheRevamper(commands.Cog):
             await progress(f"Error: {e}")
         else:
             await progress("✅ Sync complete!")
-            done = discord.Embed(title="Revamp Sync — Complete", colour=discord.Colour.green())
+            done = discord.Embed(title="TheRevamper — Complete", colour=discord.Colour.green())
             done.add_field(name="Created", value=str(plan.total_create))
             done.add_field(name="Updated", value=str(plan.total_update))
             done.add_field(name="Deleted", value=str(plan.total_delete))
@@ -603,12 +614,12 @@ class TheRevamper(commands.Cog):
     # ------------------------
     @commands.group(name="TheRevamper")
     @checks.admin_or_permissions(manage_guild=True)
-    async def TheRevamper(self, ctx: commands.Context):
-        """Configure and run a server revamp sync from a source (revamp) guild to a target (main) guild."""
+    async def therevamper(self, ctx: commands.Context):
+        """Configure and run the server revamp sync (source -> main)."""
         pass
 
-    @TheRevamper.command(name="set")
-    async def TheRevamper_set(self, ctx: commands.Context, sub: str, *args):
+    @therevamper.command(name="set")
+    async def therevamper_set(self, ctx: commands.Context, sub: str, *args):
         """Settings:
         - guilds <source_id> <target_id>
         - prune <true|false>
@@ -645,13 +656,13 @@ class TheRevamper(commands.Cog):
         else:
             await ctx.send("Unknown setting. See `[p]help TheRevamper set`.")
 
-    @TheRevamper.command(name="preview")
+    @therevamper.command(name="preview")
     async def TheRevamper_preview(self, ctx: commands.Context):
         """Show a live-updating embed with planned changes and a confirmation UI."""
         src, tgt = await self._get_guilds(ctx)
         plan = self._build_summary(src, tgt)
 
-        emb = discord.Embed(title="Revamp Sync — Preview", colour=discord.Colour.gold())
+        emb = discord.Embed(title="TheRevamper — Preview", colour=discord.Colour.gold())
         emb.add_field(name="Source (revamp)", value=f"{src.name} ({src.id})", inline=True)
         emb.add_field(name="Target (main)", value=f"{tgt.name} ({tgt.id})", inline=True)
         emb.add_field(
@@ -701,11 +712,7 @@ class TheRevamper(commands.Cog):
         msg = await ctx.send(embed=emb, view=view)
         view.message = msg
 
-    @TheRevamper.command(name="run")
+    @therevamper.command(name="run")
     async def TheRevamper_run(self, ctx: commands.Context):
         """Shortcut: generate preview and immediately show the Proceed/Cancel UI."""
         await self.TheRevamper_preview(ctx)
-
-
-async def setup(bot):
-    await bot.add_cog(TheRevamper(bot))
