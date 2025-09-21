@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, Union, Iterable
 
@@ -18,7 +19,7 @@ _ = Translator("ModLogV2", __file__)
 GuildChannel = Union[discord.abc.GuildChannel, discord.Thread]
 
 
-# ---- interactive setup UI ---------------------------------------------------
+# ---- interactive setup UI (uses Select for channels for broad compat) -------
 class SetupView(discord.ui.View):
     def __init__(self, cog: "ModLogV2", guild: discord.Guild, author_id: int):
         super().__init__(timeout=600)  # 10 minutes
@@ -31,6 +32,12 @@ class SetupView(discord.ui.View):
         # populate event selector options
         self.event_select.options = [
             discord.SelectOption(label=e.value, value=e.value) for e in Event
+        ]
+
+        # populate channel picker with up to 25 text/news channels
+        chs = [c for c in guild.channels if isinstance(c, discord.TextChannel) or getattr(c, "type", None) == discord.ChannelType.news]
+        self.channel_picker.options = [
+            discord.SelectOption(label=f"#{c.name}", value=str(c.id)) for c in chs[:25]
         ]
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -68,14 +75,15 @@ class SetupView(discord.ui.View):
         self.selected_events = select.values
         await interaction.response.defer()
 
-    @discord.ui.channel_select(
+    @discord.ui.select(
         placeholder="Pick a modlog channel (optional)",
-        channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+        min_values=0,
+        max_values=1,
         row=1
     )
-    async def channel_picker(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect):
-        ch = select.values[0] if select.values else None
-        self._last_channel_id = ch.id if ch else None
+    async def channel_picker(self, interaction: discord.Interaction, select: discord.ui.Select):
+        # values contain stringified channel IDs from the options we set in __init__
+        self._last_channel_id = int(select.values[0]) if select.values else None
         await interaction.response.defer()
 
     @discord.ui.button(label="Enable", style=discord.ButtonStyle.success, row=2)
@@ -134,10 +142,10 @@ class SetupView(discord.ui.View):
 # ---- main cog ---------------------------------------------------------------
 @cog_i18n(_)
 class ModLogV2(commands.Cog):
-    """Extended moderation logs (parity with your old cog) — modernised & themed."""
+    """Extended moderation logs — modern embeds + interactive setup."""
 
     __author__ = ["RePulsar", "TrustyJAID", "you"]
-    __version__ = "5.0.0"
+    __version__ = "5.0.1"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -164,7 +172,7 @@ class ModLogV2(commands.Cog):
             try:
                 gs = GuildSettings.from_dict(data)
             except Exception:
-                # migrate from flat shape (old ExtendedModLog)
+                # migrate from legacy flat config shape
                 gs = initial_guild_settings()
                 for e, defaults in DEFAULTS.items():
                     flat = data.get(e.value) or {}
@@ -172,7 +180,6 @@ class ModLogV2(commands.Cog):
                     gs.events[e] = EventSettings(**merged)
                 gs.ignored_channels = list(data.get("ignored_channels", []))
                 gs.invite_links = dict(data.get("invite_links", {}))
-            # fill new events if missing
             for e, defaults in DEFAULTS.items():
                 gs.events.setdefault(e, EventSettings(**vars(defaults)))
             self._cache[gid] = gs
@@ -254,19 +261,13 @@ class ModLogV2(commands.Cog):
 
     def _settings_text(self, guild: discord.Guild) -> str:
         gs = self._gs(guild)
+        modlog_channel = _("Not Set")
         try:
-            main = guild and self.bot.loop.create_task(modlog.get_modlog_channel(guild))
-        except Exception:
-            main = None
-        if main and isinstance(main, asyncio.Task):
-            # best effort; this is only used for ephemeral summary
-            try:
-                ch = main.result()
+            ch = self.bot.loop.run_until_complete(modlog.get_modlog_channel(guild))  # best effort
+            if ch:
                 modlog_channel = ch.mention
-            except Exception:
-                modlog_channel = _("Not Set")
-        else:
-            modlog_channel = _("Not Set")
+        except Exception:
+            pass
         lines = [f"**ModLogV2** v{self.__version__}", _("Modlog channel: {c}").format(c=modlog_channel), ""]
         get_ch = getattr(guild, "get_channel_or_thread", guild.get_channel)
         for e in Event:
@@ -289,7 +290,7 @@ class ModLogV2(commands.Cog):
 
     # ---------- commands ----------
     @checks.admin_or_permissions(manage_channels=True)
-    @commands.group(name="modlogv2", aliases=["modlog","modlogs"])
+    @commands.group(name="modlogv2", aliases=["modlogs2"])
     @commands.guild_only()
     async def grp(self, ctx: commands.Context):
         """Configure ModLogV2 settings."""
@@ -447,7 +448,7 @@ class ModLogV2(commands.Cog):
             gs.invite_links = snapshot
             await self.config.guild_from_id(gid).invite_links.set(snapshot)
 
-    # ---------- listeners (full parity + AutoMod) ----------
+    # ---------- listeners (parity + AutoMod) ----------
     @commands.Cog.listener()
     async def on_command(self, ctx: commands.Context):
         guild = ctx.guild
@@ -504,7 +505,7 @@ class ModLogV2(commands.Cog):
                 (_("User"), self.emb.userline(ctx.author), True),
                 (_("Channel"), self.emb.ch_mention(ctx.channel), True),
                 (_("Can Run"), str(True), True),
-                (_("Required Role"), role_line(), False),
+                (_("Required Role"), await role_line(), False),
                 (_("Command"), f"```\n{ctx.message.content[:1000]}\n```", False),
             ])
             self.emb.footer_ids(emb, user=ctx.author)
@@ -779,14 +780,15 @@ class ModLogV2(commands.Cog):
                 (_("Created by"), self.emb.userline(perp) if perp else "—", True),
                 (_("Reason"), str(reason) if reason else "—", False),
             ])
-            return await ch.send(embed=emb)
-        await ch.send(_("{e} `{t}` {typ} channel created {perp} {channel}").format(
-            e=es.emoji or "🧩",
-            t=datetime.utcnow().strftime("%H:%M:%S"),
-            typ=str(new_channel.type).title(),
-            perp=_("by {p}").format(p=perp) if perp else "",
-            channel=new_channel.mention,
-        ))
+            await ch.send(embed=emb)
+        else:
+            await ch.send(_("{e} `{t}` {typ} channel created {perp} {channel}").format(
+                e=es.emoji or "🧩",
+                t=datetime.utcnow().strftime("%H:%M:%S"),
+                typ=str(new_channel.type).title(),
+                perp=_("by {p}").format(p=perp) if perp else "",
+                channel=new_channel.mention,
+            ))
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, old_channel: discord.abc.GuildChannel):
@@ -816,14 +818,15 @@ class ModLogV2(commands.Cog):
                 (_("Deleted by"), self.emb.userline(perp) if perp else "—", True),
                 (_("Reason"), str(reason) if reason else "—", False),
             ])
-            return await ch.send(embed=emb)
-        await ch.send(_("{e} `{t}` {typ} channel deleted {perp} #{name} ({cid})").format(
-            e=es.emoji or "🧩",
-            t=datetime.utcnow().strftime("%H:%M:%S"),
-            typ=str(old_channel.type).title(),
-            perp=_("by {p}").format(p=perp) if perp else "",
-            name=old_channel.name, cid=old_channel.id,
-        ))
+            await ch.send(embed=emb)
+        else:
+            await ch.send(_("{e} `{t}` {typ} channel deleted {perp} #{name} ({cid})").format(
+                e=es.emoji or "🧩",
+                t=datetime.utcnow().strftime("%H:%M:%S"),
+                typ=str(old_channel.type).title(),
+                perp=_("by {p}").format(p=perp) if perp else "",
+                name=old_channel.name, cid=old_channel.id,
+            ))
 
     @commands.Cog.listener()
     async def on_guild_channel_update(self, before: discord.abc.GuildChannel, after: discord.abc.GuildChannel):
@@ -863,10 +866,11 @@ class ModLogV2(commands.Cog):
             self.emb.add_fields(emb, [(_("Channel"), after.mention, True), (_("Type"), typ, True), ("—", "—", True)])
             for f in fields:
                 self.emb.add_fields(emb, [f])
-            return await ch.send(embed=emb)
-        await ch.send(_("{e} `{t}` Updated channel {c}").format(
-            e=es.emoji or "🧩", t=datetime.utcnow().strftime("%H:%M:%S"), c=before.name,
-        ))
+            await ch.send(embed=emb)
+        else:
+            await ch.send(_("{e} `{t}` Updated channel {c}").format(
+                e=es.emoji or "🧩", t=datetime.utcnow().strftime("%H:%M:%S"), c=before.name,
+            ))
 
     def _role_perm_diff(self, before: discord.Role, after: discord.Role) -> str:
         names = [p for p in dir(before.permissions) if not p.startswith("_") and isinstance(getattr(before.permissions, p), bool)]
@@ -890,7 +894,6 @@ class ModLogV2(commands.Cog):
         def add(name, b, a):
             if b != a:
                 fields.append((_("Before ") + name, str(b), True))
-            if b != a:
                 fields.append((_("After ") + name, str(a), True))
         add(_("Name:"), before.name, after.name)
         add(_("Colour:"), before.colour, after.colour)
@@ -907,8 +910,9 @@ class ModLogV2(commands.Cog):
             self.emb.add_fields(emb, [(_("Role"), after.mention if after != guild.default_role else "@everyone", True)])
             for f in fields:
                 self.emb.add_fields(emb, [f])
-            return await ch.send(embed=emb)
-        await ch.send(_("{e} `{t}` Updated role **{r}**").format(e=es.emoji or "🏳️", t=datetime.utcnow().strftime("%H:%M:%S"), r=before.name))
+            await ch.send(embed=emb)
+        else:
+            await ch.send(_("{e} `{t}` Updated role **{r}**").format(e=es.emoji or "🏳️", t=datetime.utcnow().strftime("%H:%M:%S"), r=before.name))
 
     @commands.Cog.listener()
     async def on_guild_role_create(self, role: discord.Role):
@@ -923,8 +927,9 @@ class ModLogV2(commands.Cog):
             emb = self.emb.base(colour=await self._event_colour(guild, Event.ROLE_CREATE), ts=datetime.utcnow())
             self.emb.author(emb, title=_("Role Created"))
             self.emb.add_fields(emb, [(_("Role"), role.mention, True)])
-            return await ch.send(embed=emb)
-        await ch.send(_("{e} `{t}` Role created {r}").format(e=es.emoji or "🏳️", t=datetime.utcnow().strftime("%H:%M:%S"), r=role.name))
+            await ch.send(embed=emb)
+        else:
+            await ch.send(_("{e} `{t}` Role created {r}").format(e=es.emoji or "🏳️", t=datetime.utcnow().strftime("%H:%M:%S"), r=role.name))
 
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role: discord.Role):
@@ -939,8 +944,9 @@ class ModLogV2(commands.Cog):
             emb = self.emb.base(colour=await self._event_colour(guild, Event.ROLE_DELETE), ts=datetime.utcnow())
             self.emb.author(emb, title=_("Role Deleted"))
             self.emb.add_fields(emb, [(_("Role"), f"{role.name} ({role.id})", True)])
-            return await ch.send(embed=emb)
-        await ch.send(_("{e} `{t}` Role deleted **{r}**").format(e=es.emoji or "🏳️", t=datetime.utcnow().strftime("%H:%M:%S"), r=role.name))
+            await ch.send(embed=emb)
+        else:
+            await ch.send(_("{e} `{t}` Role deleted **{r}**").format(e=es.emoji or "🏳️", t=datetime.utcnow().strftime("%H:%M:%S"), r=role.name))
 
     @commands.Cog.listener()
     async def on_guild_update(self, before: discord.Guild, after: discord.Guild):
@@ -976,8 +982,9 @@ class ModLogV2(commands.Cog):
             icon = after.icon
             if icon:
                 emb.set_thumbnail(url=icon.url)
-            return await ch.send(embed=emb)
-        await ch.send(_("{e} `{t}` Guild updated").format(e=es.emoji or "🛠️", t=datetime.utcnow().strftime("%H:%M:%S")))
+            await ch.send(embed=emb)
+        else:
+            await ch.send(_("{e} `{t}` Guild updated").format(e=es.emoji or "🛠️", t=datetime.utcnow().strftime("%H:%M:%S")))
 
     @commands.Cog.listener()
     async def on_guild_emojis_update(self, guild: discord.Guild, before, after):
@@ -1016,19 +1023,19 @@ class ModLogV2(commands.Cog):
                     else:
                         txt += _("Changed to unrestricted.")
                 emb.add_field(name=str(em), value=txt or "—", inline=False)
-            return await ch.send(embed=emb)
-
-        lines = [f"{es.emoji or '😶‍🌫️'} `{datetime.utcnow():%H:%M:%S}` " + _("Updated Server Emojis")]
-        if added:
-            lines.append(_("Added: ") + ", ".join(f"{e} `{e}`" for e in added))
-        if removed:
-            lines.append(_("Removed: ") + ", ".join(f"`{e}`" for e in removed))
-        for (old, em) in changed:
-            bit = f"{em} `{em}`"
-            if old.name != em.name:
-                bit += _(" renamed from ") + old.name + _(" to ") + em.name
-            lines.append(bit)
-        await ch.send("\n".join(lines)[:2000])
+            await ch.send(embed=emb)
+        else:
+            lines = [f"{es.emoji or '😶‍🌫️'} `{datetime.utcnow():%H:%M:%S}` " + _("Updated Server Emojis")]
+            if added:
+                lines.append(_("Added: ") + ", ".join(f"{e} `{e}`" for e in added))
+            if removed:
+                lines.append(_("Removed: ") + ", ".join(f"`{e}`" for e in removed))
+            for (old, em) in changed:
+                bit = f"{em} `{em}`"
+                if old.name != em.name:
+                    bit += _(" renamed from ") + old.name + _(" to ") + em.name
+                lines.append(bit)
+            await ch.send("\n".join(lines)[:2000])
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
@@ -1078,12 +1085,13 @@ class ModLogV2(commands.Cog):
                 (_("Updated by"), self.emb.userline(perp) if perp else "—", True),
                 (_("Reason"), str(reason) if reason else "—", True),
             ])
-            return await ch.send(embed=emb)
-        await ch.send(_("{e} `{t}` Updated Voice State for **{m}** (`{i}`)\n{d}").format(
-            e=es.emoji or "🎤",
-            t=datetime.utcnow().strftime("%H:%M:%S"),
-            m=member, i=member.id, d=desc,
-        ))
+            await ch.send(embed=emb)
+        else:
+            await ch.send(_("{e} `{t}` Updated Voice State for **{m}** (`{i}`)\n{d}").format(
+                e=es.emoji or "🎤",
+                t=datetime.utcnow().strftime("%H:%M:%S"),
+                m=member, i=member.id, d=desc,
+            ))
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
@@ -1137,10 +1145,11 @@ class ModLogV2(commands.Cog):
                     (_("Updated by"), self.emb.userline(perp) if perp else "—", True),
                     (_("Reason"), str(reason) if reason else "—", True),
                 ])
-            return await ch.send(embed=emb)
-        await ch.send(_("{e} `{t}` Member updated **{m}** (`{i}`)").format(
-            e=es.emoji or "👨‍🔧", t=datetime.utcnow().strftime("%H:%M:%S"), m=before, i=before.id
-        ))
+            await ch.send(embed=emb)
+        else:
+            await ch.send(_("{e} `{t}` Member updated **{m}** (`{i}`)").format(
+                e=es.emoji or "👨‍🔧", t=datetime.utcnow().strftime("%H:%M:%S"), m=before, i=before.id
+            ))
 
     @commands.Cog.listener()
     async def on_invite_create(self, invite: discord.Invite):
@@ -1176,8 +1185,9 @@ class ModLogV2(commands.Cog):
                 (_("Channel:"), getattr(invite.channel, "mention", "—"), True),
                 (_("Max Uses:"), str(getattr(invite, "max_uses", "—")), True),
             ])
-            return await ch.send(embed=emb)
-        await ch.send(_("{e} `{t}` Invite created code: {c}").format(e=es.emoji or "🔗", t=datetime.utcnow().strftime("%H:%M:%S"), c=invite.code))
+            await ch.send(embed=emb)
+        else:
+            await ch.send(_("{e} `{t}` Invite created code: {c}").format(e=es.emoji or "🔗", t=datetime.utcnow().strftime("%H:%M:%S"), c=invite.code))
 
     @commands.Cog.listener()
     async def on_invite_delete(self, invite: discord.Invite):
@@ -1197,8 +1207,9 @@ class ModLogV2(commands.Cog):
                 (_("Channel:"), getattr(invite.channel, "mention", "—"), True),
                 (_("Used:"), str(getattr(invite, "uses", "—")), True),
             ])
-            return await ch.send(embed=emb)
-        await ch.send(_("{e} `{t}` Invite deleted code: {c}").format(e=es.emoji or "⛓️", t=datetime.utcnow().strftime("%H:%M:%S"), c=invite.code))
+            await ch.send(embed=emb)
+        else:
+            await ch.send(_("{e} `{t}` Invite deleted code: {c}").format(e=es.emoji or "⛓️", t=datetime.utcnow().strftime("%H:%M:%S"), c=invite.code))
 
     # AutoMod rule lifecycle + execution
     @commands.Cog.listener()
