@@ -139,7 +139,7 @@ class ModLogV2(commands.Cog):
 
     # ---------- commands (same UX as old, but grouped under modlogv2) ----------
     @checks.admin_or_permissions(manage_channels=True)
-    @commands.group(name="modlogv2", aliases=["modlog", "modlogs"])
+    @commands.group(name="modlogv2", aliases=["modlogs2"])  # or no aliases at all
     @commands.guild_only()
     async def grp(self, ctx: commands.Context):
         """Configure ModLogV2 settings."""
