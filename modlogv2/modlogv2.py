@@ -239,7 +239,7 @@ class SetupView(discord.ui.View):
 # -------------------------
 
 @cog_i18n(_)
-class ModLogV2(commands.Cog):
+class ModLogV2(redcommands.Cog):
     """Modern, nicer modlogs with a setup UI and quickstart."""
 
     __author__ = ["Pat+ChatGPT"]
