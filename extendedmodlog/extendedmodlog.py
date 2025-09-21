@@ -1,10 +1,12 @@
-import discord
+import asyncio
 import logging
+
+import discord
 
 from redbot.core import commands, checks, Config, modlog
 from redbot.core.utils.chat_formatting import humanize_list
 from redbot.core.i18n import Translator, cog_i18n
-from typing import Union
+from typing import Optional, Union
 
 from .eventmixin import EventMixin, CommandPrivs, EventChooser
 from .settings import inv_settings
@@ -22,7 +24,7 @@ class ExtendedModLog(EventMixin, commands.Cog):
     """
 
     __author__ = ["RePulsar", "TrustyJAID"]
-    __version__ = "2.8.9"
+    __version__ = "3.0.0"
 
     def __init__(self, bot):
         self.bot = bot
@@ -30,7 +32,7 @@ class ExtendedModLog(EventMixin, commands.Cog):
         self.config.register_guild(**inv_settings)
         self.config.register_global(version="0.0.0")
         self.settings = {}
-        self.loop = bot.loop.create_task(self.invite_links_loop())
+        self.invite_links_task: Optional[asyncio.Task] = None
 
     def format_help_for_context(self, ctx: commands.Context):
         """
@@ -47,6 +49,7 @@ class ExtendedModLog(EventMixin, commands.Cog):
 
     async def initialize(self) -> None:
         all_data = await self.config.all_guilds()
+        stored_version = await self.config.version()
         for guild_id, data in all_data.items():
             guild = discord.Object(id=guild_id)
             for entry, default in inv_settings.items():
@@ -64,12 +67,24 @@ class ExtendedModLog(EventMixin, commands.Cog):
                             # del all_data[guild_id][entry]
                             logger.error("Somehow your dict was invalid.")
                             continue
-            if await self.config.version() < "2.8.5":
-                logger.info("Saving all guild data to new version type")
-                await self.config.guild(guild).set(all_data[guild_id])
-                await self.config.version.set("2.8.5")
+        if stored_version != self.__version__:
+            logger.info("Saving all guild data to new version type")
+            for guild_id, data in all_data.items():
+                guild = discord.Object(id=guild_id)
+                await self.config.guild(guild).set(data)
+            await self.config.version.set(self.__version__)
 
         self.settings = all_data
+        if self.invite_links_task is None or self.invite_links_task.done():
+            try:
+                self.invite_links_task = asyncio.create_task(self.invite_links_loop())
+            except RuntimeError:
+                logger.exception("Failed to start invite links loop task.")
+                self.invite_links_task = None
+
+    def cog_unload(self) -> None:
+        if self.invite_links_task:
+            self.invite_links_task.cancel()
 
     async def modlog_settings(self, ctx: commands.Context) -> None:
         guild = ctx.message.guild
@@ -104,10 +119,11 @@ class ExtendedModLog(EventMixin, commands.Cog):
             self.settings[guild.id] = inv_settings
 
         data = self.settings[guild.id]
+        get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
         ign_chans = data["ignored_channels"]
         ignored_channels = []
         for c in ign_chans:
-            chn = guild.get_channel(c)
+            chn = get_channel(c)
             if chn is None:
                 # a bit of automatic cleanup so things don't break
                 data["ignored_channels"].remove(c)
@@ -118,7 +134,7 @@ class ExtendedModLog(EventMixin, commands.Cog):
         for settings, name in cur_settings.items():
             msg += f"{name}: **{data[settings]['enabled']}**"
             if data[settings]["channel"]:
-                chn = guild.get_channel(data[settings]["channel"])
+                chn = get_channel(data[settings]["channel"])
                 if chn is None:
                     # a bit of automatic cleanup so things don't break
                     data[settings]["channel"] = None
@@ -175,7 +191,7 @@ class ExtendedModLog(EventMixin, commands.Cog):
                 `guild_change`
                 `emoji_change`
                 `commands_used`
-                **Requires Red 3.3 and discord.py 1.3**
+                **Requires Red 3.5.3 and discord.py 2.6.2**
                 `invite_created`
                 `invite_deleted`
         """
@@ -219,7 +235,7 @@ class ExtendedModLog(EventMixin, commands.Cog):
                 `guild_change`
                 `emoji_change`
                 `commands_used`
-                **Requires Red 3.3 and discord.py 1.3**
+                **Requires Red 3.5.3 and discord.py 2.6.2**
                 `invite_created`
                 `invite_deleted`
         """
@@ -241,7 +257,10 @@ class ExtendedModLog(EventMixin, commands.Cog):
     @_modlog.command(name="emojiset", send_help=True)
     @commands.bot_has_permissions(add_reactions=True)
     async def _set_event_emoji(
-        self, ctx: commands.Context, emoji: Union[discord.Emoji, str], *events: EventChooser,
+        self,
+        ctx: commands.Context,
+        emoji: Union[discord.Emoji, discord.PartialEmoji, str],
+        *events: EventChooser,
     ) -> None:
         """
             Set the emoji used in text modlogs.
@@ -262,7 +281,7 @@ class ExtendedModLog(EventMixin, commands.Cog):
                 `guild_change`
                 `emoji_change`
                 `commands_used`
-                **Requires Red 3.3 and discord.py 1.3**
+                **Requires Red 3.5.3 and discord.py 2.6.2**
                 `invite_created`
                 `invite_deleted`
         """
@@ -310,7 +329,7 @@ class ExtendedModLog(EventMixin, commands.Cog):
                 `guild_change`
                 `emoji_change`
                 `commands_used`
-                **Requires Red 3.3 and discord.py 1.3**
+                **Requires Red 3.5.3 and discord.py 2.6.2**
                 `invite_created`
                 `invite_deleted`
         """
@@ -352,7 +371,7 @@ class ExtendedModLog(EventMixin, commands.Cog):
                 `guild_change`
                 `emoji_change`
                 `commands_used`
-                **Requires Red 3.3 and discord.py 1.3**
+                **Requires Red 3.5.3 and discord.py 2.6.2**
                 `invite_created`
                 `invite_deleted`
         """
@@ -393,7 +412,7 @@ class ExtendedModLog(EventMixin, commands.Cog):
                 `guild_change`
                 `emoji_change`
                 `commands_used`
-                **Requires Red 3.3 and discord.py 1.3**
+                **Requires Red 3.5.3 and discord.py 2.6.2**
                 `invite_created`
                 `invite_deleted`
         """
@@ -586,7 +605,14 @@ class ExtendedModLog(EventMixin, commands.Cog):
     async def ignore(
         self,
         ctx: commands.Context,
-        channel: Union[discord.TextChannel, discord.CategoryChannel, discord.VoiceChannel],
+        channel: Union[
+            discord.TextChannel,
+            discord.CategoryChannel,
+            discord.VoiceChannel,
+            discord.StageChannel,
+            discord.ForumChannel,
+            discord.Thread,
+        ],
     ) -> None:
         """
             Ignore a channel from message delete/edit events and bot commands
@@ -610,7 +636,14 @@ class ExtendedModLog(EventMixin, commands.Cog):
     async def unignore(
         self,
         ctx: commands.Context,
-        channel: Union[discord.TextChannel, discord.CategoryChannel, discord.VoiceChannel],
+        channel: Union[
+            discord.TextChannel,
+            discord.CategoryChannel,
+            discord.VoiceChannel,
+            discord.StageChannel,
+            discord.ForumChannel,
+            discord.Thread,
+        ],
     ) -> None:
         """
             Unignore a channel from message delete/edit events and bot commands
@@ -630,5 +663,3 @@ class ExtendedModLog(EventMixin, commands.Cog):
         else:
             await ctx.send(channel.mention + _(" is not being ignored."))
 
-    def __unload(self):
-        self.loop.cancel()
