@@ -289,7 +289,7 @@ class ModLogV2(commands.Cog):
 
     # ---------- commands ----------
     @checks.admin_or_permissions(manage_channels=True)
-    @commands.group(name="modlogv2", aliases=["modlogs2"])
+    @commands.group(name="modlogv2", aliases=["modlog","modlogs"])
     @commands.guild_only()
     async def grp(self, ctx: commands.Context):
         """Configure ModLogV2 settings."""
@@ -474,7 +474,7 @@ class ModLogV2(commands.Cog):
         if es.privs and priv not in es.privs:
             return
 
-        def role_line():
+        async def role_line():
             if priv == "MOD":
                 try:
                     mods = await ctx.bot.db.guild(guild).mod_role()
