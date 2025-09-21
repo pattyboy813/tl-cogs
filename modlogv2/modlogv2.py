@@ -224,7 +224,7 @@ class SetupView(discord.ui.View):
 
     @discord.ui.button(label="Show Summary", style=discord.ButtonStyle.primary, row=4)
     async def btn_summary(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        text = self.cog._settings_text(self.guild)
+        text = await self.cog._settings_text(self.guild)
         await interaction.response.send_message(text, ephemeral=True)
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, row=4)
@@ -409,13 +409,17 @@ class ModLogV2(redcommands.Cog):
             modch = "Not Set"
 
         lines = [f"**Settings for {guild.name}**\nCore Modlog Channel: {modch}\n"]
+        get_channel = getattr(guild, "get_channel_or_thread", guild.get_channel)
         for ev in Event:
             es = gs.events[ev]
-            ch = guild.get_channel(es.channel) if es.channel else None
+            ch = get_channel(es.channel) if es.channel else None  # type: ignore[arg-type]
             lines.append(f"• `{ev.value}`: **{es.enabled}**"
                          + (f" → {ch.mention}" if ch else ""))
         if gs.ignored_channels:
-            chs = ", ".join(self._chan_mention(cid, guild.get_channel(cid)) for cid in gs.ignored_channels)
+            chs = ", ".join(
+                self._chan_mention(cid, get_channel(cid))  # type: ignore[arg-type]
+                for cid in gs.ignored_channels
+            )
             lines.append(f"\nIgnored Channels: {chs}")
         return "\n".join(lines)
 
@@ -427,7 +431,7 @@ class ModLogV2(redcommands.Cog):
     @commands.guild_only()
     async def grp(self, ctx: redcommands.Context):
         """Show ModLogV2 settings"""
-        await ctx.maybe_send_embed(self._settings_text(ctx.guild))
+        await ctx.maybe_send_embed(await self._settings_text(ctx.guild))
 
     @grp.command(name="setup")
     @commands.guild_only()
@@ -564,7 +568,7 @@ class ModLogV2(redcommands.Cog):
         for ev in Event:
             gs.events[ev].enabled = set_to
         await self._save(ctx.guild)
-        await ctx.maybe_send_embed(self._settings_text(ctx.guild))
+        await ctx.maybe_send_embed(await self._settings_text(ctx.guild))
 
     @grp.command(name="botedits")
     async def cmd_botedits(self, ctx: redcommands.Context):
@@ -1050,19 +1054,27 @@ class ModLogV2(redcommands.Cog):
             bp[str(o.id)] = [i for i in p]
         for o, p in after.overwrites.items():
             ap[str(o.id)] = [i for i in p]
+        def fmt_entity(guild: discord.Guild, ent_id: int) -> str:
+            role = guild.get_role(ent_id)
+            if role is not None:
+                return role.mention if embed_links else role.name
+            member = guild.get_member(ent_id)
+            if member is not None:
+                return member.mention if embed_links else member.display_name
+            return f"`{ent_id}`"
         for ent in bp:
-            ent_obj = before.guild.get_role(int(ent)) or before.guild.get_member(int(ent))
+            name = fmt_entity(before.guild, int(ent))
             if ent not in ap:
-                p_msg += (f"{ent_obj.mention if embed_links else ent_obj.name} Overwrites removed.\n")
+                p_msg += (f"{name} Overwrites removed.\n")
                 continue
             if ap[ent] != bp[ent]:
                 a = set(ap[ent]); b = set(bp[ent])
                 for diff in list(a - b):
-                    p_msg += (f"{ent_obj.mention if embed_links else ent_obj.name} {diff[0]} Set to {diff[1]}\n")
+                    p_msg += (f"{name} {diff[0]} Set to {diff[1]}\n")
         for ent in ap:
-            ent_obj = after.guild.get_role(int(ent)) or after.guild.get_member(int(ent))
+            name = fmt_entity(after.guild, int(ent))
             if ent not in bp:
-                p_msg += (f"{ent_obj.mention if embed_links else ent_obj.name} Overwrites added.\n")
+                p_msg += (f"{name} Overwrites added.\n")
         return p_msg
 
     @commands.Cog.listener()
@@ -1300,7 +1312,10 @@ class ModLogV2(redcommands.Cog):
             removed = None
 
         changed_pair = set((e, e.name, tuple(e.roles)) for e in after)
-        changed_pair.difference_update((e, e.name, tuple(e.roles)) for e in (before + ((added,) if added else tuple())))
+        baseline = list(before)
+        if added:
+            baseline.append(added)
+        changed_pair.difference_update((e, e.name, tuple(e.roles)) for e in baseline)
         try:
             changed = next(iter(changed_pair))[0]
         except Exception:
