@@ -396,7 +396,7 @@ class ModLogV2(commands.Cog):
     def _guild_icon_url(guild: discord.Guild) -> Optional[str]:
         return guild.icon.url if guild.icon else None
 
-    def _settings_text(self, guild: discord.Guild) -> str:
+    async def _settings_text(self, guild: discord.Guild) -> str:
         gs = self._gs(guild)
         try:
             core = self.bot.get_cog("ModLog")
