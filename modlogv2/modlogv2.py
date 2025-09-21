@@ -22,23 +22,34 @@ GuildChannel = Union[discord.abc.GuildChannel, discord.Thread]
 # ---- interactive setup UI (uses Select for channels for broad compat) -------
 class SetupView(discord.ui.View):
     def __init__(self, cog: "ModLogV2", guild: discord.Guild, author_id: int):
-        super().__init__(timeout=600)  # 10 minutes
+        super().__init__(timeout=600)
         self.cog = cog
         self.guild = guild
         self.author_id = author_id
         self.selected_events: list[str] = []
         self._last_channel_id: Optional[int] = None
 
-        # populate event selector options
+        # event selector (max 25 options allowed by Discord)
         self.event_select.options = [
             discord.SelectOption(label=e.value, value=e.value) for e in Event
         ]
 
-        # populate channel picker with up to 25 text/news channels
-        chs = [c for c in guild.channels if isinstance(c, discord.TextChannel) or getattr(c, "type", None) == discord.ChannelType.news]
-        self.channel_picker.options = [
-            discord.SelectOption(label=f"#{c.name}", value=str(c.id)) for c in chs[:25]
+        # channel picker — build options; if none visible, add a safe fallback
+        chs = [
+            c for c in guild.channels
+            if isinstance(c, discord.TextChannel) or getattr(c, "type", None) == discord.ChannelType.news
         ]
+        if chs:
+            self.channel_picker.options = [
+                discord.SelectOption(label=f"#{c.name}", value=str(c.id)) for c in chs[:25]
+            ]
+            self.channel_picker.placeholder = "Pick a modlog channel (optional)"
+        else:
+            # fallback so the select is valid (non-empty) even if bot can't see channels
+            self.channel_picker.options = [
+                discord.SelectOption(label="Use core modlog channel (default)", value="__core__")
+            ]
+            self.channel_picker.placeholder = "No channels visible — will use core modlog"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
@@ -82,8 +93,11 @@ class SetupView(discord.ui.View):
         row=1
     )
     async def channel_picker(self, interaction: discord.Interaction, select: discord.ui.Select):
-        # values contain stringified channel IDs from the options we set in __init__
-        self._last_channel_id = int(select.values[0]) if select.values else None
+        # "__core__" means "use the core modlog channel"
+        if select.values and select.values[0] != "__core__":
+            self._last_channel_id = int(select.values[0])
+        else:
+            self._last_channel_id = None
         await interaction.response.defer()
 
     @discord.ui.button(label="Enable", style=discord.ButtonStyle.success, row=2)
@@ -111,12 +125,10 @@ class SetupView(discord.ui.View):
 
     @discord.ui.button(label="Set Channel", style=discord.ButtonStyle.secondary, row=3)
     async def btn_set_channel(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        ch_id = self._last_channel_id
         if not self.selected_events:
             return await interaction.response.send_message(_("Select events first."), ephemeral=True)
-        if not ch_id:
-            return await interaction.response.send_message(_("Pick a channel above first."), ephemeral=True)
-        n = self._mutate_selected(lambda es: setattr(es, "channel", ch_id))
+        # _last_channel_id == None → use core modlog channel
+        n = self._mutate_selected(lambda es: setattr(es, "channel", self._last_channel_id))
         await self._save_and_ack(interaction, _("Set channel for {n} event(s).").format(n=n))
 
     @discord.ui.button(label="Reset Channel", style=discord.ButtonStyle.secondary, row=3)
@@ -137,6 +149,7 @@ class SetupView(discord.ui.View):
             item.disabled = True
         await interaction.response.edit_message(content=_("Setup closed."), view=self)
         self.stop()
+
 
 
 # ---- main cog ---------------------------------------------------------------
