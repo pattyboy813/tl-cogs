@@ -792,6 +792,3 @@ class RevampSync(commands.Cog):
             except Exception as e:
                 plan.warnings.append(f"Lockdown change failed in #{ch.name}: {e}")
 
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(RevampSync(bot))
