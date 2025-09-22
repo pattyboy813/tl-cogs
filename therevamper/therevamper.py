@@ -1,7 +1,3 @@
-# revamp_sync.py
-# Red-DiscordBot Cog — Revamp -> Main Sync
-# Single-server confirm, Control Panel embed + Live Log embed, role reorder fix, rollback, lockdown, backoff.
-
 from __future__ import annotations
 import asyncio, time
 from dataclasses import dataclass, field
@@ -653,5 +649,3 @@ class RevampSync(commands.Cog):
         except Exception as e:
             p.warnings.append(f"Role reordering issues: {e}")
 
-async def setup(bot: commands.Bot):
-    await bot.add_cog(RevampSync(bot))
