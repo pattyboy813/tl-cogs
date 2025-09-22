@@ -128,8 +128,8 @@ class Plan:
     include_deletes: bool
     lockdown: bool=False
     sync_threads: bool=False
-    mode: str="auto"                      # auto|clone|update|sync|dry
-    mirror_overwrites: bool=True          # False => preserve target perms
+    mode: str="auto"                      # auto|clone|update|sync
+    mirror_overwrites: bool=True          # False => preserve target perms (SYNC)
     role_actions: List[RoleAction]=field(default_factory=list)
     channel_actions: List[ChannelAction]=field(default_factory=list)
     role_id_map: Dict[int,int]=field(default_factory=dict)
@@ -176,6 +176,95 @@ class RevampSync(commands.Cog):
         # rollback storage: last changelog per target guild id
         self.last_applied: Dict[int, List[ChangeLogEntry]] = {}
 
+    # ---------- pretty panel/progress embeds ----------
+    def _panel_embed(self, p: Plan, step: str="Ready", note: Optional[str]=None) -> discord.Embed:
+        rc=sum(1 for a in p.role_actions if a.kind=="create")
+        ru=sum(1 for a in p.role_actions if a.kind=="update")
+        rd=sum(1 for a in p.role_actions if a.kind=="delete")
+        cc=sum(1 for c in p.channel_actions if c.op=="create")
+        cu=sum(1 for c in p.channel_actions if c.op=="update")
+        cd=sum(1 for c in p.channel_actions if c.op=="delete")
+
+        emb=discord.Embed(
+            title="✨ Revamp Control Panel",
+            color=discord.Color.blurple(),
+            description=(
+                f"**Source:** `{discord.utils.escape_markdown(p.source.name)}`\n"
+                f"**Target:** `{discord.utils.escape_markdown(p.target.name) if p.target else '—'}`"
+            ),
+        )
+        if p.source.icon:
+            try: emb.set_thumbnail(url=p.source.icon.url)
+            except Exception: pass
+        if p.target and p.target.icon:
+            try: emb.set_image(url=p.target.icon.url)
+            except Exception: pass
+
+        mode_label = p.mode.upper()
+        emb.add_field(name="Mode", value=f"`{mode_label}`", inline=True)
+        emb.add_field(name="Deletes", value=("`Yes`" if p.include_deletes else "`No`"), inline=True)
+        emb.add_field(name="Lockdown", value=("`Yes`" if p.lockdown else "`No`"), inline=True)
+        emb.add_field(name="Threads", value=("`Yes`" if p.sync_threads else "`No`"), inline=True)
+        emb.add_field(name="Perms Strategy", value=("`Mirror`" if p.mirror_overwrites else "`Preserve`"), inline=True)
+
+        emb.add_field(name="👤 Roles", value=f"Create **{rc}** • Update **{ru}** • Delete **{rd}**", inline=False)
+        emb.add_field(name="📺 Channels", value=f"Create **{cc}** • Update **{cu}** • Delete **{cd}**", inline=False)
+
+        bullets = []
+        if p.mode=="clone":
+            bullets += [
+                "Copy **all roles** (ordered under ADMIN) and **all categories/channels**.",
+                "Apply **role overwrites** to channels.",
+            ]
+        elif p.mode=="sync":
+            bullets += [
+                "Apply new/changed **roles/channels** from Source.",
+                "**Preserve** target channel permissions (no overwrite edits).",
+                "Optional deletes if enabled.",
+            ]
+        else:
+            bullets += [
+                "Create/Update roles & channels to match Source.",
+                "Optional deletes if enabled.",
+                "Mirror role overwrites.",
+            ]
+        emb.add_field(name="Plan Summary", value="• " + "\n• ".join(bullets), inline=False)
+
+        emb.add_field(name="Status", value=f"{_icon(step.lower())} **{step}**", inline=False)
+        if note:
+            emb.add_field(name="Hint", value=note, inline=False)
+
+        if p.warnings:
+            preview="\n".join(f"• {w}" for w in p.warnings[:5])
+            if len(p.warnings)>5: preview+=f"\n… +{len(p.warnings)-5} more"
+            emb.add_field(name="Notes", value=preview, inline=False)
+
+        footer = f"ADMIN is never moved • Requested by {p.requested_by}"
+        try:
+            emb.set_footer(text=footer, icon_url=(p.requested_by.display_avatar.url if hasattr(p.requested_by,'display_avatar') else discord.Embed.Empty))
+        except Exception:
+            emb.set_footer(text=footer)
+        emb.timestamp=discord.utils.utcnow()
+        return emb
+
+    def _progress_embed(self, p: Plan, mode: str, results: dict, step: str) -> discord.Embed:
+        emb=self._panel_embed(p, step)
+        done = sum(results.values())
+        target = max(done, len(p.role_actions)+len(p.channel_actions))
+        slots = 16
+        filled = int((done/target)*slots) if target else 0
+        bar = "█"*filled + "░"*(slots-filled)
+        emb.add_field(
+            name="Progress",
+            value=(
+                f"`{bar}`  {done}/{target}\n"
+                f"Roles — C:{results['role_create']} U:{results['role_update']} D:{results['role_delete']}\n"
+                f"Chans — C:{results['chan_create']} U:{results['chan_update']} D:{results['chan_delete']}"
+            ),
+            inline=False
+        )
+        return emb
+
     # ---------- public command (source = ctx.guild) ----------
     @commands.hybrid_command(name="revamp", with_app_command=True)  # call as !revamp
     @commands.guild_only()
@@ -208,241 +297,7 @@ class RevampSync(commands.Cog):
         msg = await ctx.send(embed=emb, view=view)
         plan.control_msg = msg
 
-    # ---------- UI view ----------
-class ControlView(ui.View):
-    def __init__(self, cog:"RevampSync", plan_key:str, timeout:float=900):
-        super().__init__(timeout=timeout)
-        self.cog=cog
-        self.plan_key=plan_key
-        # full-width selects on rows 0 and 1
-        self.add_item(TargetSelect(cog, plan_key))  # row=0
-        self.add_item(ModeSelect(cog, plan_key))    # row=1
-        # toggles on row=2
-        self.add_item(ToggleDeletes(cog, plan_key))
-        self.add_item(ToggleLockdown(cog, plan_key))
-        self.add_item(ToggleThreads(cog, plan_key))
-
-    async def interaction_check(self, inter: discord.Interaction) -> bool:
-        if not inter.user.guild_permissions.administrator:
-            await _ireply(inter, "Admin only.", ephemeral=True)
-            return False
-        return True
-
-    @ui.button(label="Apply", style=discord.ButtonStyle.danger, row=3)
-    async def apply(self, inter: discord.Interaction, btn: ui.Button):
-        plan = self.cog.pending.get(self.plan_key)
-        if not plan:
-            return await _ireply(inter, "This request expired.", ephemeral=True)
-
-        t = plan.target
-        if not (t and t.me and t.me.guild_permissions.administrator):
-            return await _ireply(inter, "I need **Administrator** in the target server.", ephemeral=True)
-
-        full = await self.cog._build_plan(
-            plan.source, plan.target, plan.include_deletes, inter.user,
-            plan.lockdown, plan.sync_threads, plan.mode
-        )
-        full.control_msg = plan.control_msg
-        self.cog.pending[self.plan_key] = full
-
-        confirm = ConfirmApplyView(self.cog, self.plan_key)
-        try:
-            await plan.control_msg.edit(embed=self.cog._panel_embed(full, step="Review Plan"), view=confirm)
-        except Exception:
-            pass
-        await _ireply(inter, "Plan prepared. Review and confirm.", ephemeral=True)
-
-    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=3)
-    async def cancel(self, inter: discord.Interaction, btn: ui.Button):
-        plan = self.cog.pending.pop(self.plan_key, None)
-        await _ireply(inter, "Cancelled. No changes made.", ephemeral=True)
-        if plan and plan.control_msg:
-            try:
-                cancelled = discord.Embed(title="❎ Revamp — Cancelled", color=discord.Color.red())
-                await plan.control_msg.edit(embed=cancelled, view=None)
-            except Exception:
-                pass
-
-    @ui.button(label="Rollback last", style=discord.ButtonStyle.primary, row=3)
-    async def rollback(self, inter: discord.Interaction, btn: ui.Button):
-        plan = self.cog.pending.get(self.plan_key)
-        if not plan:
-            return await _ireply(inter, "This request expired.", ephemeral=True)
-        target_id = plan.target.id if plan.target else 0
-        if target_id not in self.cog.last_applied:
-            return await _ireply(inter, "No previous apply found for rollback on the selected target.", ephemeral=True)
-        try:
-            if not inter.response.is_done():
-                await inter.response.defer(thinking=True, ephemeral=True)
-        except Exception:
-            pass
-        emb = await self.cog._rollback(plan.target)
-        try:
-            if plan.control_msg:
-                await plan.control_msg.edit(embed=emb, view=None)
-        except Exception:
-            pass
-        await _ireply(inter, embed=emb, ephemeral=True)
-
-# ---------- UI bits ----------
-class TargetSelect(ui.Select):
-    def __init__(self, cog:"RevampSync", plan_key:str):
-        self.cog=cog; self.plan_key=plan_key
-        options=[]
-        plan = self.cog.pending.get(plan_key)
-        src = plan.source if plan else None
-        for g in cog.bot.guilds:
-            if not src or g.id == src.id:
-                continue
-            label = g.name[:100]
-            options.append(discord.SelectOption(label=label, value=str(g.id)))
-        if not options:
-            options = [discord.SelectOption(label="No other servers available", value="0", default=True)]
-        super().__init__(placeholder="Select target server…", options=options, min_values=1, max_values=1, row=0)
-
-    async def callback(self, inter: discord.Interaction):
-        plan = self.cog.pending.get(self.plan_key)
-        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
-        gid = int(self.values[0])
-        tgt = next((g for g in self.cog.bot.guilds if g.id==gid), None)
-        if not tgt:
-            return await _ireply(inter, "Target not found.", ephemeral=True)
-        plan.target = tgt
-        try:
-            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step="Target selected"))
-        except Exception:
-            pass
-        await _ireply(inter, f"Target set to **{tgt.name}**.", ephemeral=True)
-
-class ModeSelect(ui.Select):
-    def __init__(self, cog:"RevampSync", plan_key:str):
-        self.cog=cog; self.plan_key=plan_key
-        opts = [
-            ("Auto", "auto", "Clone if empty, else Update"),
-            ("Clone", "clone", "Copy everything; mirror overwrites"),
-            ("Update", "update", "Create/Update/Delete; mirror overwrites"),
-            ("Sync", "sync", "Only propagate changes; preserve overwrites"),
-        ]
-        options=[discord.SelectOption(label=l, value=v, description=d) for (l,v,d) in opts]
-        super().__init__(placeholder="Mode…", options=options, min_values=1, max_values=1, row=1)
-
-    async def callback(self, inter: discord.Interaction):
-        plan = self.cog.pending.get(self.plan_key)
-        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
-        mode = self.values[0]
-        plan.mode = mode
-        plan.mirror_overwrites = (mode != "sync")
-        try:
-            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step=f"Mode: {mode.upper()}"))
-        except Exception:
-            pass
-        await _ireply(inter, f"Mode set to **{mode.upper()}**.", ephemeral=True)
-
-class ToggleDeletes(ui.Button):
-    def __init__(self, cog:"RevampSync", plan_key:str):
-        self.cog=cog; self.plan_key=plan_key
-        super().__init__(style=discord.ButtonStyle.secondary, label="Deletes: Off", row=2)
-
-    async def callback(self, inter: discord.Interaction):
-        plan = self.cog.pending.get(self.plan_key)
-        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
-        plan.include_deletes = not plan.include_deletes
-        self.label = f"Deletes: {'On' if plan.include_deletes else 'Off'}"
-        try:
-            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step="Toggled Deletes"))
-        except Exception:
-            pass
-        await _ireply(inter, f"Deletes set to **{'On' if plan.include_deletes else 'Off'}**.", ephemeral=True)
-
-class ToggleLockdown(ui.Button):
-    def __init__(self, cog:"RevampSync", plan_key:str):
-        self.cog=cog; self.plan_key=plan_key
-        super().__init__(style=discord.ButtonStyle.secondary, label="Lockdown: On", row=2)
-
-    async def callback(self, inter: discord.Interaction):
-        plan = self.cog.pending.get(self.plan_key)
-        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
-        plan.lockdown = not plan.lockdown
-        self.label = f"Lockdown: {'On' if plan.lockdown else 'Off'}"
-        try:
-            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step="Toggled Lockdown"))
-        except Exception:
-            pass
-        await _ireply(inter, f"Lockdown set to **{'On' if plan.lockdown else 'Off'}**.", ephemeral=True)
-
-class ToggleThreads(ui.Button):
-    def __init__(self, cog:"RevampSync", plan_key:str):
-        self.cog=cog; self.plan_key=plan_key
-        super().__init__(style=discord.ButtonStyle.secondary, label="Threads: Off", row=2)
-
-    async def callback(self, inter: discord.Interaction):
-        plan = self.cog.pending.get(self.plan_key)
-        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
-        plan.sync_threads = not plan.sync_threads
-        self.label = f"Threads: {'On' if plan.sync_threads else 'Off'}"
-        try:
-            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step="Toggled Threads"))
-        except Exception:
-            pass
-        await _ireply(inter, f"Threads set to **{'On' if plan.sync_threads else 'Off'}**.", ephemeral=True)
-
-class ConfirmApplyView(ui.View):
-    def __init__(self, cog:"RevampSync", plan_key:str, timeout:float=900):
-        super().__init__(timeout=timeout); self.cog=cog; self.plan_key=plan_key
-
-    async def interaction_check(self, inter: discord.Interaction) -> bool:
-        if not inter.user.guild_permissions.administrator:
-            await _ireply(inter, "Admin only.", ephemeral=True)
-            return False
-        return True
-
-    @ui.button(label="Confirm Apply", style=discord.ButtonStyle.danger, row=3)
-    async def confirm(self, inter: discord.Interaction, btn: ui.Button):
-        plan = self.cog.pending.get(self.plan_key)
-        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
-        try:
-            if not inter.response.is_done():
-                await inter.response.defer(thinking=True)
-        except Exception:
-            pass
-        try:
-            result = await self.cog.apply_plan(plan)
-            self.cog.pending.pop(self.plan_key, None)
-            try:
-                if plan.control_msg: await plan.control_msg.edit(embed=result, view=None)
-            except Exception:
-                pass
-            await _ireply(inter, embed=result)
-            self.stop()
-        except Exception as e:
-            await _ireply(inter, f"❌ Apply failed: {e}")
-            self.stop()
-
-    @ui.button(label="Rollback last", style=discord.ButtonStyle.primary, row=3)
-    async def rollback(self, inter: discord.Interaction, btn: ui.Button):
-        plan = self.cog.pending.get(self.plan_key)
-        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
-        try:
-            if not inter.response.is_done():
-                await inter.response.defer(thinking=True, ephemeral=True)
-        except Exception:
-            pass
-        emb = await self.cog._rollback(plan.target)
-        await _ireply(inter, embed=emb, ephemeral=True)
-
-    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=3)
-    async def cancel(self, inter: discord.Interaction, btn: ui.Button):
-        plan = self.cog.pending.pop(self.plan_key, None)
-        await _ireply(inter, "Cancelled. No changes made.", ephemeral=True)
-        if plan and plan.control_msg:
-            try:
-                cancelled = discord.Embed(title="❎ Revamp — Cancelled", color=discord.Color.red())
-                await plan.control_msg.edit(embed=cancelled, view=None)
-            except Exception:
-                pass
-        self.stop()
-
-# ---------- Core logic (planning/apply/rollback) ----------
+    # ---------- core helpers ----------
     async def _is_empty_guild(self, g: discord.Guild) -> bool:
         roles = [r for r in await g.fetch_roles() if not r.managed and r.id != g.default_role.id]
         chans = await g.fetch_channels()
@@ -533,88 +388,6 @@ class ConfirmApplyView(ui.View):
                     plan.channel_actions.append(ChannelAction("channel","delete", id=tc.id, name=tc.name, type=tc.type))
 
         return plan
-
-    # ---------- pretty panel/progress embeds ----------
-    def _panel_embed(self, p: Plan, step: str="Ready", note: Optional[str]=None) -> discord.Embed:
-        rc=sum(1 for a in p.role_actions if a.kind=="create")
-        ru=sum(1 for a in p.role_actions if a.kind=="update")
-        rd=sum(1 for a in p.role_actions if a.kind=="delete")
-        cc=sum(1 for c in p.channel_actions if c.op=="create")
-        cu=sum(1 for c in p.channel_actions if c.op=="update")
-        cd=sum(1 for c in p.channel_actions if c.op=="delete")
-
-        emb=discord.Embed(
-            title="✨ Revamp Control Panel",
-            color=discord.Color.blurple(),
-            description=(
-                f"**Source:** `{discord.utils.escape_markdown(p.source.name)}`\n"
-                f"**Target:** `{discord.utils.escape_markdown(p.target.name) if p.target else '—'}`"
-            ),
-        )
-        if p.source.icon: emb.set_thumbnail(url=p.source.icon.url)
-        if p.target and p.target.icon: emb.set_image(url=p.target.icon.url)
-
-        mode_label = p.mode.upper()
-        emb.add_field(name="Mode", value=f"`{mode_label}`", inline=True)
-        emb.add_field(name="Deletes", value=("`Yes`" if p.include_deletes else "`No`"), inline=True)
-        emb.add_field(name="Lockdown", value=("`Yes`" if p.lockdown else "`No`"), inline=True)
-        emb.add_field(name="Threads", value=("`Yes`" if p.sync_threads else "`No`"), inline=True)
-        emb.add_field(name="Perms Strategy", value=("`Mirror`" if p.mirror_overwrites else "`Preserve`"), inline=True)
-
-        emb.add_field(name="👤 Roles", value=f"Create **{rc}** • Update **{ru}** • Delete **{rd}**", inline=False)
-        emb.add_field(name="📺 Channels", value=f"Create **{cc}** • Update **{cu}** • Delete **{cd}**", inline=False)
-
-        bullets = []
-        if p.mode=="clone":
-            bullets += [
-                "Copy **all roles** (ordered under ADMIN) and **all categories/channels**.",
-                "Apply **role overwrites** to channels.",
-            ]
-        elif p.mode=="sync":
-            bullets += [
-                "Apply new/changed **roles/channels** from Source.",
-                "**Preserve** target channel permissions (no overwrite edits).",
-                "Optional deletes if enabled.",
-            ]
-        else:
-            bullets += [
-                "Create/Update roles & channels to match Source.",
-                "Optional deletes if enabled.",
-                "Mirror role overwrites.",
-            ]
-        emb.add_field(name="Plan Summary", value="• " + "\n• ".join(bullets), inline=False)
-
-        emb.add_field(name="Status", value=f"{_icon(step.lower())} **{step}**", inline=False)
-        if note:
-            emb.add_field(name="Hint", value=note, inline=False)
-
-        if p.warnings:
-            preview="\n".join(f"• {w}" for w in p.warnings[:5])
-            if len(p.warnings)>5: preview+=f"\n… +{len(p.warnings)-5} more"
-            emb.add_field(name="Notes", value=preview, inline=False)
-
-        footer = f"ADMIN is never moved • Requested by {p.requested_by}"
-        emb.set_footer(text=footer, icon_url=(p.requested_by.display_avatar.url if hasattr(p.requested_by,'display_avatar') else discord.Embed.Empty))
-        emb.timestamp=discord.utils.utcnow()
-        return emb
-
-    def _progress_embed(self, p: Plan, mode: str, results: dict, step: str) -> discord.Embed:
-        emb=self._panel_embed(p, step)
-        done = sum(results.values())
-        target = max(done, len(p.role_actions)+len(p.channel_actions))
-        slots = 16
-        filled = int((done/target)*slots) if target else 0
-        bar = "█"*filled + "░"*(slots-filled)
-        emb.add_field(
-            name="Progress",
-            value=(
-                f"`{bar}`  {done}/{target}\n"
-                f"Roles — C:{results['role_create']} U:{results['role_update']} D:{results['role_delete']}\n"
-                f"Chans — C:{results['chan_create']} U:{results['chan_update']} D:{results['chan_delete']}"
-            ),
-            inline=False
-        )
-        return emb
 
     # ---------- ADMIN anchor (never moved) ----------
     def _bot_top_position(self, guild: discord.Guild) -> int:
@@ -1316,3 +1089,236 @@ class ConfirmApplyView(ui.View):
                 except discord.HTTPException as e:
                     p.warnings.append(f"Failed moving role {role.name}: {e}")
             pos += 1
+
+# ---------- UI view & components (top-level classes) ----------
+class ControlView(ui.View):
+    def __init__(self, cog:"RevampSync", plan_key:str, timeout:float=900):
+        super().__init__(timeout=timeout)
+        self.cog=cog
+        self.plan_key=plan_key
+        # full-width selects on rows 0 and 1
+        self.add_item(TargetSelect(cog, plan_key))  # row=0
+        self.add_item(ModeSelect(cog, plan_key))    # row=1
+        # toggles on row=2
+        self.add_item(ToggleDeletes(cog, plan_key))
+        self.add_item(ToggleLockdown(cog, plan_key))
+        self.add_item(ToggleThreads(cog, plan_key))
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if not inter.user.guild_permissions.administrator:
+            await _ireply(inter, "Admin only.", ephemeral=True)
+            return False
+        return True
+
+    @ui.button(label="Apply", style=discord.ButtonStyle.danger, row=3)
+    async def apply(self, inter: discord.Interaction, btn: ui.Button):
+        plan = self.cog.pending.get(self.plan_key)
+        if not plan:
+            return await _ireply(inter, "This request expired.", ephemeral=True)
+
+        t = plan.target
+        if not (t and t.me and t.me.guild_permissions.administrator):
+            return await _ireply(inter, "I need **Administrator** in the target server.", ephemeral=True)
+
+        full = await self.cog._build_plan(
+            plan.source, plan.target, plan.include_deletes, inter.user,
+            plan.lockdown, plan.sync_threads, plan.mode
+        )
+        full.control_msg = plan.control_msg
+        self.cog.pending[self.plan_key] = full
+
+        confirm = ConfirmApplyView(self.cog, self.plan_key)
+        try:
+            await plan.control_msg.edit(embed=self.cog._panel_embed(full, step="Review Plan"), view=confirm)
+        except Exception:
+            pass
+        await _ireply(inter, "Plan prepared. Review and confirm.", ephemeral=True)
+
+    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=3)
+    async def cancel(self, inter: discord.Interaction, btn: ui.Button):
+        plan = self.cog.pending.pop(self.plan_key, None)
+        await _ireply(inter, "Cancelled. No changes made.", ephemeral=True)
+        if plan and plan.control_msg:
+            try:
+                cancelled = discord.Embed(title="❎ Revamp — Cancelled", color=discord.Color.red())
+                await plan.control_msg.edit(embed=cancelled, view=None)
+            except Exception:
+                pass
+
+    @ui.button(label="Rollback last", style=discord.ButtonStyle.primary, row=3)
+    async def rollback(self, inter: discord.Interaction, btn: ui.Button):
+        plan = self.cog.pending.get(self.plan_key)
+        if not plan:
+            return await _ireply(inter, "This request expired.", ephemeral=True)
+        target_id = plan.target.id if plan.target else 0
+        if target_id not in self.cog.last_applied:
+            return await _ireply(inter, "No previous apply found for rollback on the selected target.", ephemeral=True)
+        try:
+            if not inter.response.is_done():
+                await inter.response.defer(thinking=True, ephemeral=True)
+        except Exception:
+            pass
+        emb = await self.cog._rollback(plan.target)
+        try:
+            if plan.control_msg:
+                await plan.control_msg.edit(embed=emb, view=None)
+        except Exception:
+            pass
+        await _ireply(inter, embed=emb, ephemeral=True)
+
+class TargetSelect(ui.Select):
+    def __init__(self, cog:"RevampSync", plan_key:str):
+        self.cog=cog; self.plan_key=plan_key
+        options=[]
+        plan = self.cog.pending.get(plan_key)
+        src = plan.source if plan else None
+        for g in cog.bot.guilds:
+            if not src or g.id == src.id:
+                continue
+            label = g.name[:100]
+            options.append(discord.SelectOption(label=label, value=str(g.id)))
+        if not options:
+            options = [discord.SelectOption(label="No other servers available", value="0", default=True)]
+        super().__init__(placeholder="Select target server…", options=options, min_values=1, max_values=1, row=0)
+
+    async def callback(self, inter: discord.Interaction):
+        plan = self.cog.pending.get(self.plan_key)
+        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
+        gid = int(self.values[0])
+        tgt = next((g for g in self.cog.bot.guilds if g.id==gid), None)
+        if not tgt:
+            return await _ireply(inter, "Target not found.", ephemeral=True)
+        plan.target = tgt
+        try:
+            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step="Target selected"))
+        except Exception:
+            pass
+        await _ireply(inter, f"Target set to **{tgt.name}**.", ephemeral=True)
+
+class ModeSelect(ui.Select):
+    def __init__(self, cog:"RevampSync", plan_key:str):
+        self.cog=cog; self.plan_key=plan_key
+        opts = [
+            ("Auto", "auto", "Clone if empty, else Update"),
+            ("Clone", "clone", "Copy everything; mirror overwrites"),
+            ("Update", "update", "Create/Update/Delete; mirror overwrites"),
+            ("Sync", "sync", "Only propagate changes; preserve overwrites"),
+        ]
+        options=[discord.SelectOption(label=l, value=v, description=d) for (l,v,d) in opts]
+        super().__init__(placeholder="Mode…", options=options, min_values=1, max_values=1, row=1)
+
+    async def callback(self, inter: discord.Interaction):
+        plan = self.cog.pending.get(self.plan_key)
+        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
+        mode = self.values[0]
+        plan.mode = mode
+        plan.mirror_overwrites = (mode != "sync")
+        try:
+            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step=f"Mode: {mode.upper()}"))
+        except Exception:
+            pass
+        await _ireply(inter, f"Mode set to **{mode.upper()}**.", ephemeral=True)
+
+class ToggleDeletes(ui.Button):
+    def __init__(self, cog:"RevampSync", plan_key:str):
+        self.cog=cog; self.plan_key=plan_key
+        super().__init__(style=discord.ButtonStyle.secondary, label="Deletes: Off", row=2)
+
+    async def callback(self, inter: discord.Interaction):
+        plan = self.cog.pending.get(self.plan_key)
+        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
+        plan.include_deletes = not plan.include_deletes
+        self.label = f"Deletes: {'On' if plan.include_deletes else 'Off'}"
+        try:
+            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step="Toggled Deletes"))
+        except Exception:
+            pass
+        await _ireply(inter, f"Deletes set to **{'On' if plan.include_deletes else 'Off'}**.", ephemeral=True)
+
+class ToggleLockdown(ui.Button):
+    def __init__(self, cog:"RevampSync", plan_key:str):
+        self.cog=cog; self.plan_key=plan_key
+        super().__init__(style=discord.ButtonStyle.secondary, label="Lockdown: On", row=2)
+
+    async def callback(self, inter: discord.Interaction):
+        plan = self.cog.pending.get(self.plan_key)
+        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
+        plan.lockdown = not plan.lockdown
+        self.label = f"Lockdown: {'On' if plan.lockdown else 'Off'}"
+        try:
+            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step="Toggled Lockdown"))
+        except Exception:
+            pass
+        await _ireply(inter, f"Lockdown set to **{'On' if plan.lockdown else 'Off'}**.", ephemeral=True)
+
+class ToggleThreads(ui.Button):
+    def __init__(self, cog:"RevampSync", plan_key:str):
+        self.cog=cog; self.plan_key=plan_key
+        super().__init__(style=discord.ButtonStyle.secondary, label="Threads: Off", row=2)
+
+    async def callback(self, inter: discord.Interaction):
+        plan = self.cog.pending.get(self.plan_key)
+        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
+        plan.sync_threads = not plan.sync_threads
+        self.label = f"Threads: {'On' if plan.sync_threads else 'Off'}"
+        try:
+            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step="Toggled Threads"))
+        except Exception:
+            pass
+        await _ireply(inter, f"Threads set to **{'On' if plan.sync_threads else 'Off'}**.", ephemeral=True)
+
+class ConfirmApplyView(ui.View):
+    def __init__(self, cog:"RevampSync", plan_key:str, timeout:float=900):
+        super().__init__(timeout=timeout); self.cog=cog; self.plan_key=plan_key
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if not inter.user.guild_permissions.administrator:
+            await _ireply(inter, "Admin only.", ephemeral=True)
+            return False
+        return True
+
+    @ui.button(label="Confirm Apply", style=discord.ButtonStyle.danger)
+    async def confirm(self, inter: discord.Interaction, btn: ui.Button):
+        plan = self.cog.pending.get(self.plan_key)
+        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
+        try:
+            if not inter.response.is_done():
+                await inter.response.defer(thinking=True)
+        except Exception:
+            pass
+        try:
+            result = await self.cog.apply_plan(plan)
+            self.cog.pending.pop(self.plan_key, None)
+            try:
+                if plan.control_msg: await plan.control_msg.edit(embed=result, view=None)
+            except Exception:
+                pass
+            await _ireply(inter, embed=result)
+            self.stop()
+        except Exception as e:
+            await _ireply(inter, f"❌ Apply failed: {e}")
+            self.stop()
+
+    @ui.button(label="Rollback last", style=discord.ButtonStyle.primary)
+    async def rollback(self, inter: discord.Interaction, btn: ui.Button):
+        plan = self.cog.pending.get(self.plan_key)
+        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
+        try:
+            if not inter.response.is_done():
+                await inter.response.defer(thinking=True, ephemeral=True)
+        except Exception:
+            pass
+        emb = await self.cog._rollback(plan.target)
+        await _ireply(inter, embed=emb, ephemeral=True)
+
+    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, inter: discord.Interaction, btn: ui.Button):
+        plan = self.cog.pending.pop(self.plan_key, None)
+        await _ireply(inter, "Cancelled. No changes made.", ephemeral=True)
+        if plan and plan.control_msg:
+            try:
+                cancelled = discord.Embed(title="❎ Revamp — Cancelled", color=discord.Color.red())
+                await plan.control_msg.edit(embed=cancelled, view=None)
+            except Exception:
+                pass
+        self.stop()
