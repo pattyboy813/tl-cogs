@@ -4,6 +4,7 @@
 # - Role edits/deletes respect the bot's movable range; forbidden moves skipped with log notes
 # - Reordering only under ADMIN
 # - Safer channel/thread ops; clearer Forbidden handling
+# - Forum creation: uses Guild.create_forum (compat with discord.py 2.x)
 
 from __future__ import annotations
 import asyncio, time
@@ -613,20 +614,22 @@ class RevampSync(commands.Cog):
                         reason="Revamp sync: create channel"
                     ), f"Failed to create voice channel {src.name}")
                 elif src.type is discord.ChannelType.forum:
+                    # Use Guild.create_forum (discord.py 2.x). Avoid unknown kwargs for cross-version safety.
                     fkw = {
                         "category": parent_obj,
                         "nsfw": getattr(src,"nsfw",False),
-                        "topic": getattr(src,"topic", None),
                         "default_layout": getattr(src,"default_layout", None),
                         "default_sort_order": getattr(src,"default_sort_order", None),
                         "default_reaction_emoji": getattr(src,"default_reaction_emoji", None),
                         "default_thread_slowmode_delay": getattr(src,"default_thread_slowmode_delay", 0),
-                        "reason": "Revamp sync: create forum"
+                        "reason": "Revamp sync: create forum",
                     }
                     src_tags = getattr(src, "available_tags", [])
                     if src_tags:
                         fkw["available_tags"] = [discord.ForumTag(name=tag.name) for tag in src_tags]
-                    ch=await do(t.create_forum_channel(name=src.name, **{k:v for k,v in fkw.items() if v is not None}),
+                    # filter Nones
+                    kwargs = {k:v for k,v in fkw.items() if v is not None}
+                    ch=await do(t.create_forum(name=src.name, **kwargs),
                                 f"Failed to create forum channel {src.name}")
                 else:
                     ch=await do(t.create_text_channel(name=src.name, category=parent_obj,
@@ -820,7 +823,7 @@ class RevampSync(commands.Cog):
             src_sorted.sort(key=lambda r:r.position)  # bottom→top
 
             desired: List[discord.Role] = []
-            skipped: List[str] = []
+            skipped: List[str] = []  # for log
             for sr in src_sorted:
                 tr = target.get_role(p.role_id_map.get(sr.id, 0))
                 if not tr:
