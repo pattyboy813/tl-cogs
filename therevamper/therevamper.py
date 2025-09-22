@@ -3,8 +3,14 @@
 # - Never moves the ADMIN role; only verifies/assigns it if needed
 # - Minimal logging: no live log message; only a single control panel updated occasionally
 # - Speed-ups: skip no-op edits (roles/channels/positions/overwrites), lighter sleeps
-# - Optional thread sync (off by default): avoids extra calls unless requested
-# - Cleaner control embed
+# - Optional thread sync (off by default)
+# - Cleaner, more helpful control/progress embed
+#
+# NEW:
+# - Modes: auto | clone | update | sync  (plus "dry" preview UI)
+# - Empty-server detection for first-time clone
+# - "sync" preserves target channel overwrites (permissions) and only changes what's needed
+# - "update" keeps your previous smart-mirror behavior (incl. deletes if requested)
 
 from __future__ import annotations
 import asyncio, time
@@ -25,7 +31,7 @@ def _norm(s: str) -> str: return (s or "").strip().lower()
 
 def _icon(step: str) -> str:
     return {
-        "start": "🟡", "lock": "🔒", "roles": "👤",
+        "ready": "🟡", "start": "🟡", "lock": "🔒", "roles": "👤",
         "cats": "🗂️", "chans": "📺", "overwrites": "🔐",
         "threads": "🧵", "unlock": "🔓", "done": "✅"
     }.get(step, "🔧")
@@ -94,12 +100,6 @@ def _diff_overwrites_roles(src_overwrites, tgt_overwrites, role_map) -> Optional
         a, d = po.pair()
         want[tgt_role] = discord.PermissionOverwrite.from_pair(discord.Permissions(a.value), discord.Permissions(d.value))
 
-    # Compare with current target overwrites (roles)
-    for obj, po in list(tgt_overwrites.items()):
-        if not isinstance(obj, discord.Role): 
-            # we don’t touch member overwrites at all
-            continue
-
     # Determine if any role overwrite differs
     for role, desired_po in want.items():
         current_po = tgt_overwrites.get(role)
@@ -143,6 +143,9 @@ class Plan:
     include_deletes: bool
     lockdown: bool=False
     sync_threads: bool=False
+    # NEW/CHANGED:
+    mode: str="auto"                       # auto|clone|update|sync|dry (display only for 'dry')
+    mirror_overwrites: bool=True           # False => preserve target perms (sync mode)
     role_actions: List[RoleAction]=field(default_factory=list)
     channel_actions: List[ChannelAction]=field(default_factory=list)
     role_id_map: Dict[int,int]=field(default_factory=dict)
@@ -220,13 +223,19 @@ class RevampSync(commands.Cog):
     Fast/minimal-logging sync of roles, categories/channels, and (optionally) threads.
     - Never moves ADMIN; only ensures it exists and the bot has it.
     - Aggressively avoids no-op API calls.
+    - Modes:
+        • auto  — if target is "empty", do a full clone; otherwise do update
+        • clone — copy everything from source (first-time bring-up)
+        • update— create/update/delete as planned (your previous behavior)
+        • sync  — only propagate changes from source; PRESERVE target channel overwrites
+        • dry   — just show the plan UI (Confirm still applies)
     """
 
     def __init__(self, bot: commands.Bot):
         self.bot=bot
         self.pending: Dict[str, Plan]={}
-        self.rate_delay=0.20            # slightly quicker; still polite
-        self.progress_every=30          # update control embed less often
+        self.rate_delay=0.20
+        self.progress_every=30
         self.progress_min_secs=5.0
 
     # [p]revamp <target> [mode] [include_deletes] [lockdown] [sync_threads]
@@ -234,7 +243,7 @@ class RevampSync(commands.Cog):
     @commands.guild_only()
     async def revamp_group(self, ctx: commands.Context,
                            target_guild_id: Optional[int]=None,
-                           mode: str="apply",
+                           mode: str="auto",
                            include_deletes: Optional[bool]=False,
                            lockdown: Optional[bool]=True,
                            sync_threads: Optional[bool]=False):
@@ -249,7 +258,7 @@ class RevampSync(commands.Cog):
     @commands.admin_or_permissions(administrator=True)
     async def revamp_sync(self, ctx: commands.Context,
                           source_guild_id: int, target_guild_id: int,
-                          mode: str="dry",
+                          mode: str="auto",                         # NEW default
                           include_deletes: Optional[bool]=False,
                           lockdown: Optional[bool]=True,
                           sync_threads: Optional[bool]=False):
@@ -258,11 +267,16 @@ class RevampSync(commands.Cog):
         if not (source.me.guild_permissions.administrator and target.me.guild_permissions.administrator):
             return await ctx.send("I need **Administrator** in both guilds.")
 
+        # Normalize mode
+        mode = (_norm(mode) or "auto")
+        if mode not in {"auto","clone","update","sync","dry"}:
+            mode = "auto"
+
         await ctx.typing()
-        plan=await self._build_plan(source, target, bool(include_deletes), ctx.author, bool(lockdown), bool(sync_threads))
+        plan=await self._build_plan(source, target, bool(include_deletes), ctx.author, bool(lockdown), bool(sync_threads), mode)
         self.pending[plan.key]=plan
 
-        ctrl=self._control_embed(plan, mode)
+        ctrl=self._control_embed(plan, mode, "Ready")
         view=ConfirmView(self, plan.key)
         plan.control_msg=await ctx.send(embed=ctrl, view=view)
 
@@ -278,11 +292,33 @@ class RevampSync(commands.Cog):
                 except: pass
         self.bot.loop.create_task(expire())
 
+    # ---------- NEW: empty target detection ----------
+    async def _is_empty_guild(self, g: discord.Guild) -> bool:
+        roles = [r for r in await g.fetch_roles() if not r.managed and r.id != g.default_role.id]
+        chans = await g.fetch_channels()
+        cats = [c for c in chans if isinstance(c, discord.CategoryChannel)]
+        noncats = [c for c in chans if not isinstance(c, discord.CategoryChannel)]
+        return (len(roles) == 0) and (len(cats) == 0) and (len(noncats) == 0)
+
     # ---------- planning ----------
     async def _build_plan(self, source: discord.Guild, target: discord.Guild, include_deletes: bool,
-                          requested_by: discord.abc.User, lockdown: bool, sync_threads: bool) -> Plan:
+                          requested_by: discord.abc.User, lockdown: bool, sync_threads: bool,
+                          mode: str) -> Plan:
         key=f"{source.id}:{target.id}:{int(time.time())}"
-        plan=Plan(key, source, target, requested_by, include_deletes, lockdown, sync_threads)
+
+        # Decide final mode if auto
+        mirror_overwrites = True
+        final_mode = mode
+        if mode == "auto":
+            if await self._is_empty_guild(target):
+                final_mode = "clone"
+            else:
+                final_mode = "update"
+        if final_mode == "sync":
+            mirror_overwrites = False  # PRESERVE target perms
+
+        plan=Plan(key, source, target, requested_by, include_deletes, lockdown, sync_threads,
+                  mode=final_mode, mirror_overwrites=mirror_overwrites)
 
         # roles
         src_roles={r.id:r for r in (await source.fetch_roles())}
@@ -299,7 +335,8 @@ class RevampSync(commands.Cog):
                 if diff: plan.role_actions.append(RoleAction("update", r.name, id=t.id, changes=ch))
                 plan.role_id_map[r.id]=t.id
 
-        if include_deletes:
+        if include_deletes and plan.mode in {"update","sync"}:
+            # In clone we don't need delete; in sync we keep deletes optional
             for r in tgt_roles.values():
                 if r.id==target.default_role.id or r.managed: continue
                 if not any(_norm(sr.name)==_norm(r.name) for sr in src_roles.values()):
@@ -319,7 +356,7 @@ class RevampSync(commands.Cog):
                 if ex.position!=c.position:
                     plan.channel_actions.append(ChannelAction("category","update", id=ex.id, name=c.name, what="position"))
 
-        if include_deletes:
+        if include_deletes and plan.mode in {"update","sync"}:
             for tc in tgt_cats:
                 if tc.name not in {c.name for c in src_cats}:
                     plan.channel_actions.append(ChannelAction("category","delete", id=tc.id, name=tc.name))
@@ -344,7 +381,7 @@ class RevampSync(commands.Cog):
                                                               parent_name=(s.category.name if s.category else None),
                                                               what="config/position/overwrites"))
 
-        if include_deletes:
+        if include_deletes and plan.mode in {"update","sync"}:
             for tc in tgt_non:
                 parent=tc.category.name if tc.category else "__ROOT__"
                 kk=f"{parent}|{tc.type}|{tc.name}"
@@ -353,7 +390,7 @@ class RevampSync(commands.Cog):
 
         return plan
 
-    # ---------- embeds ----------
+    # ---------- PRETTY embeds ----------
     def _control_embed(self, p: Plan, mode: str, step: str="Ready") -> discord.Embed:
         rc=sum(1 for a in p.role_actions if a.kind=="create")
         ru=sum(1 for a in p.role_actions if a.kind=="update")
@@ -366,20 +403,37 @@ class RevampSync(commands.Cog):
             title="✨ Revamp → Main",
             color=discord.Color.blurple(),
             description=(
-                f"**Source:** {discord.utils.escape_markdown(p.source.name)}\n"
-                f"**Target:** {discord.utils.escape_markdown(p.target.name)}"
+                f"**Source:** `{discord.utils.escape_markdown(p.source.name)}`\n"
+                f"**Target:** `{discord.utils.escape_markdown(p.target.name)}`"
             ),
         )
-        emb.add_field(name="Mode", value=("DRY RUN" if mode.lower()=="dry" else "APPLY"), inline=True)
-        emb.add_field(name="Deletes", value=("Yes" if p.include_deletes else "No"), inline=True)
-        emb.add_field(name="Lockdown", value=("Yes" if p.lockdown else "No"), inline=True)
-        emb.add_field(name="Threads", value=("Yes" if p.sync_threads else "No"), inline=True)
+        mode_label= p.mode.upper() if p.mode!="dry" else "DRY (Preview)"
+        emb.add_field(name="Mode", value=f"`{mode_label}`", inline=True)
+        emb.add_field(name="Deletes", value=("`Yes`" if p.include_deletes else "`No`"), inline=True)
+        emb.add_field(name="Lockdown", value=("`Yes`" if p.lockdown else "`No`"), inline=True)
+        emb.add_field(name="Threads", value=("`Yes`" if p.sync_threads else "`No`"), inline=True)
+        emb.add_field(name="Perms Strategy", value=("`Mirror`" if p.mirror_overwrites else "`Preserve`"), inline=True)
 
         emb.add_field(name="👤 Roles", value=f"Create **{rc}** • Update **{ru}** • Delete **{rd}**", inline=False)
         emb.add_field(name="📺 Channels", value=f"Create **{cc}** • Update **{cu}** • Delete **{cd}**", inline=False)
 
+        # Helpful summary of "what will happen"
+        bullets = []
+        if p.mode=="clone":
+            bullets.append("Copy **all roles** (ordered under ADMIN) and **all categories/channels**.")
+            bullets.append("Apply **role overwrites** to channels.")
+        elif p.mode=="sync":
+            bullets.append("Apply new/changed **roles/channels** from Source.")
+            bullets.append("**Preserve** target channel permissions (no overwrite edits).")
+            if p.include_deletes: bullets.append("Delete roles/channels not in Source.")
+        else:  # update
+            bullets.append("Create/Update roles & channels to match Source.")
+            if p.include_deletes: bullets.append("Delete items not in Source.")
+
+        emb.add_field(name="Plan", value="• " + "\n• ".join(bullets), inline=False)
+
         if step:
-            emb.add_field(name="Status", value=f"{_icon(step.lower())} {step}", inline=False)
+            emb.add_field(name="Status", value=f"{_icon(step.lower())} **{step}**", inline=False)
 
         if p.warnings:
             preview="\n".join(f"• {w}" for w in p.warnings[:5])
@@ -392,9 +446,21 @@ class RevampSync(commands.Cog):
 
     def _progress_embed(self, p: Plan, mode: str, results: dict, step: str) -> discord.Embed:
         emb=self._control_embed(p, mode, step)
+
+        # tiny progress bar
+        total_roles = sum(results[k] for k in ("role_create","role_update","role_delete"))
+        total_chans = sum(results[k] for k in ("chan_create","chan_update","chan_delete"))
+        # not exact target counts, but still informative
+        done = total_roles + total_chans
+        target = max(done, len(p.role_actions)+len(p.channel_actions))
+        slots = 14
+        filled = int((done/target)*slots) if target else 0
+        bar = "█"*filled + "░"*(slots-filled)
+
         emb.add_field(
             name="Progress",
             value=(
+                f"`{bar}`  {done}/{target}\n"
                 f"Roles — C:{results['role_create']} U:{results['role_update']} D:{results['role_delete']}\n"
                 f"Chans — C:{results['chan_create']} U:{results['chan_update']} D:{results['chan_delete']}"
             ),
@@ -447,7 +513,7 @@ class RevampSync(commands.Cog):
     # ---------- apply ----------
     async def apply_plan(self, p: Plan) -> discord.Embed:
         s, t = p.source, p.target
-        mode = "apply"  # control embed wording only
+        mode_label = p.mode  # for embed wording
         results={"role_create":0,"role_update":0,"role_delete":0,"chan_create":0,"chan_update":0,"chan_delete":0}
 
         last_edit=time.monotonic(); ops=0
@@ -456,7 +522,7 @@ class RevampSync(commands.Cog):
             now=time.monotonic()
             if (ops >= self.progress_every) or ((now - last_edit) >= self.progress_min_secs):
                 if p.control_msg:
-                    try: await p.control_msg.edit(embed=self._progress_embed(p, mode, results, step_text))
+                    try: await p.control_msg.edit(embed=self._progress_embed(p, mode_label, results, step_text))
                     except: pass
                 last_edit=now; ops=0
 
@@ -485,7 +551,7 @@ class RevampSync(commands.Cog):
 
         # start
         if p.control_msg:
-            try: await p.control_msg.edit(embed=self._control_embed(p, mode, "Starting"))
+            try: await p.control_msg.edit(embed=self._control_embed(p, mode_label, "Starting"))
             except: pass
 
         # lockdown
@@ -568,7 +634,7 @@ class RevampSync(commands.Cog):
         await progress("Roles")
 
         # ---- channels: deletes first (optional) ----
-        if p.include_deletes:
+        if p.include_deletes and p.mode in {"update","sync"}:
             all_t=await t.fetch_channels()
             for ch in sorted([c for c in all_t if not isinstance(c, discord.CategoryChannel)], key=lambda c:c.position, reverse=True):
                 if any(x.op=="delete" and x.id==ch.id for x in p.channel_actions):
@@ -628,7 +694,6 @@ class RevampSync(commands.Cog):
                         reason="Revamp sync: create channel"
                     ), f"Create voice {src_ch.name}")
                 elif src_ch.type is discord.ChannelType.forum:
-                    # discord.py 2.x
                     fkw = {
                         "category": parent_obj,
                         "nsfw": getattr(src_ch,"nsfw",False),
@@ -707,19 +772,21 @@ class RevampSync(commands.Cog):
                 p.chan_id_map[src_ch.id]=ex.id
                 created_map[src_ch.id]=ex
 
-        # ---- overwrites (roles only), but only if *different* ----
-        # Build role-id -> target role obj map
-        role_map_full: Dict[int, discord.Role] = {sid: t.get_role(tid) for sid, tid in p.role_id_map.items() if t.get_role(tid)}
-        for src_ch in src_non:
-            tgt_ch = created_map.get(src_ch.id)
-            if not tgt_ch:
-                continue
-            desired = _diff_overwrites_roles(src_ch.overwrites, tgt_ch.overwrites, role_map_full)
-            if desired is not None:
-                ok=await do(tgt_ch.edit(overwrites=desired, reason="Revamp sync: mirror role overwrites"),
-                            f"Overwrites in {getattr(src_ch,'name','?')}")
-                if ok is not None:
-                    results["chan_update"]+=1; await progress("Permissions")
+        # ---- overwrites (roles only)
+        # CLONE/UPDATE => mirror role overwrites
+        # SYNC (preserve) => skip this section
+        if p.mirror_overwrites:
+            role_map_full: Dict[int, discord.Role] = {sid: t.get_role(tid) for sid, tid in p.role_id_map.items() if t.get_role(tid)}
+            for src_ch in src_non:
+                tgt_ch = created_map.get(src_ch.id)
+                if not tgt_ch:
+                    continue
+                desired = _diff_overwrites_roles(src_ch.overwrites, tgt_ch.overwrites, role_map_full)
+                if desired is not None:
+                    ok=await do(tgt_ch.edit(overwrites=desired, reason="Revamp sync: mirror role overwrites"),
+                                f"Overwrites in {getattr(src_ch,'name','?')}")
+                    if ok is not None:
+                        results["chan_update"]+=1; await progress("Permissions")
 
         # ---- Threads (optional) ----
         if p.sync_threads:
@@ -733,6 +800,9 @@ class RevampSync(commands.Cog):
 
         # done
         final=discord.Embed(title="✅ Revamp → Main — Completed", color=discord.Color.green())
+        final.add_field(name="Mode", value=p.mode.upper(), inline=True)
+        final.add_field(name="Perms", value=("Mirror" if p.mirror_overwrites else "Preserve"), inline=True)
+        final.add_field(name="Deletes", value=("Yes" if p.include_deletes else "No"), inline=True)
         final.add_field(name="👤 Roles", value=f"C **{results['role_create']}** • U **{results['role_update']}** • D **{results['role_delete']}**", inline=False)
         final.add_field(name="📺 Channels", value=f"C **{results['chan_create']}** • U **{results['chan_update']}** • D **{results['chan_delete']}**", inline=False)
         if p.warnings:
@@ -772,7 +842,6 @@ class RevampSync(commands.Cog):
                 continue
             tgt_parent = created_map.get(src_parent.id)
             if not tgt_parent:
-                # resolve by name/type/category if not touched
                 parent_id = p.cat_id_map.get(getattr(src_parent,"category_id",None)) if getattr(src_parent,"category_id",None) else None
                 for c in (await t.fetch_channels()):
                     if not isinstance(c, (discord.TextChannel, discord.ForumChannel)): continue
@@ -862,6 +931,5 @@ class RevampSync(commands.Cog):
                     except discord.HTTPException as e:
                         p.warnings.append(f"Failed moving role {role.name}: {e}")
                 pos += 1
-
         except Exception as e:
             p.warnings.append(f"Role reordering issue: {e}")
