@@ -53,6 +53,24 @@ def _chan_changed(tgt, src) -> bool:
     except: return True
     return False
 
+# --- safe interaction replies (prevents 10008 Unknown Message) ---
+async def _ireply(inter: discord.Interaction, content: Optional[str] = None,
+                  *, embed: Optional[discord.Embed] = None, ephemeral: bool = False):
+    try:
+        if not inter.response.is_done():
+            await inter.response.send_message(content or None, embed=embed, ephemeral=ephemeral)
+        else:
+            await inter.followup.send(content or None, embed=embed, ephemeral=ephemeral)
+    except discord.NotFound:
+        # Fallback if token/msg is gone
+        try:
+            await inter.channel.send(content or None, embed=embed)
+        except Exception:
+            pass
+    except Exception:
+        # Don’t let UI reply errors kill the flow
+        pass
+
 # ---------- plan data ----------
 @dataclass
 class RoleAction:
@@ -98,34 +116,47 @@ class ConfirmView(ui.View):
 
     async def interaction_check(self, inter: discord.Interaction) -> bool:
         if not inter.user.guild_permissions.administrator:
-            await inter.response.send_message("Admin only.", ephemeral=True); return False
+            await _ireply(inter, "Admin only.", ephemeral=True)
+            return False
         return True
 
     @ui.button(label="Confirm Apply", style=discord.ButtonStyle.danger)
     async def confirm(self, inter: discord.Interaction, btn: ui.Button):
-        plan=self.cog.pending.get(self.plan_key)
-        if not plan: return await inter.response.send_message("This sync request expired.", ephemeral=True)
-        await inter.response.defer(thinking=True)
+        plan = self.cog.pending.get(self.plan_key)
+        if not plan:
+            return await _ireply(inter, "This sync request expired.", ephemeral=True)
+
+        # Acknowledge ASAP to keep the token valid
         try:
-            result=await self.cog.apply_plan(plan)
+            if not inter.response.is_done():
+                await inter.response.defer(thinking=True)
+        except Exception:
+            pass
+
+        try:
+            result = await self.cog.apply_plan(plan)
             self.cog.pending.pop(self.plan_key, None)
-            if plan.control_msg: await plan.control_msg.edit(embed=result, view=None)
-            if plan.log_msg: await plan.log_msg.edit(embed=self.cog._log_embed(plan, tail_only=True))
-            await inter.followup.send(embed=result)
+            try:
+                if plan.control_msg: await plan.control_msg.edit(embed=result, view=None)
+                if plan.log_msg:     await plan.log_msg.edit(embed=self.cog._log_embed(plan))
+            except Exception:
+                pass
+            await _ireply(inter, embed=result)
             self.stop()
         except Exception as e:
-            await inter.followup.send(f"❌ Apply failed: {e}")
+            await _ireply(inter, f"❌ Apply failed: {e}")
             self.stop()
 
     @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, inter: discord.Interaction, btn: ui.Button):
-        plan=self.cog.pending.pop(self.plan_key, None)
-        await inter.response.send_message("Cancelled. No changes made.")
+        plan = self.cog.pending.pop(self.plan_key, None)
+        await _ireply(inter, "Cancelled. No changes made.")
         if plan:
-            cancelled=discord.Embed(title="❎ Sync Cancelled", color=discord.Color.red())
+            cancelled = discord.Embed(title="❎ Sync Cancelled", color=discord.Color.red())
             try:
                 if plan.control_msg: await plan.control_msg.edit(embed=cancelled, view=None)
-            except: pass
+            except Exception:
+                pass
         self.stop()
 
 # ---------- the cog ----------
@@ -441,7 +472,7 @@ class RevampSync(commands.Cog):
             tr=by_name.get(_norm(sr.name))
             if tr: p.role_id_map[sr.id]=tr.id
 
-        # reorder roles (FIX: absolute positions bottom -> top, min pos = 1)
+        # reorder roles (absolute positions bottom -> top, min pos = 1, skip above bot top)
         await self._reorder_roles_like_source(p)
         await progress("roles_order", "reordered roles to match source")
 
@@ -588,24 +619,39 @@ class RevampSync(commands.Cog):
 
     async def _reorder_roles_like_source(self, p: Plan) -> None:
         """Place roles to match source exactly, bottom→top using absolute positions (1..n)."""
-        target=p.target; source=p.source
+        target, source = p.target, p.source
         try:
-            src_sorted=[r for r in await source.fetch_roles() if not r.managed and r.id!=source.default_role.id]
+            src_sorted = [r for r in await source.fetch_roles()
+                          if not r.managed and r.id != source.default_role.id]
             src_sorted.sort(key=lambda r:r.position)  # bottom→top
-            # build desired sequence of target Role objects
-            desired=[]
+
+            # Bot cannot move roles above its highest role
+            try:
+                bot_top = max((r.position for r in target.me.roles), default=1)
+            except Exception:
+                bot_top = 1
+
+            desired: List[discord.Role] = []
             for sr in src_sorted:
-                tr=target.get_role(p.role_id_map.get(sr.id, 0))
-                if tr and not tr.managed: desired.append(tr)
-            # assign absolute positions (min 1; @everyone is 0)
-            pos=1
+                tr = target.get_role(p.role_id_map.get(sr.id, 0))
+                if not tr or tr.managed:
+                    continue
+                if tr.position > bot_top:
+                    p.warnings.append(f"Cannot move role {tr.name}: above bot’s top role")
+                    continue
+                desired.append(tr)
+
+            pos = 1  # @everyone is 0
             for role in desired:
                 try:
-                    if role.position!=pos:
-                        await role.edit(position=max(1,pos), reason="Revamp sync: reorder roles")
+                    if role.position != pos:
+                        await role.edit(position=max(1, pos), reason="Revamp sync: reorder roles")
                         await asyncio.sleep(self.rate_delay)
-                    pos+=1
+                    pos += 1
                 except discord.HTTPException as e:
                     p.warnings.append(f"Unable to move role {role.name}: {e}")
         except Exception as e:
             p.warnings.append(f"Role reordering issues: {e}")
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(RevampSync(bot))
