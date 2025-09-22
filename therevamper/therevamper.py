@@ -1,8 +1,9 @@
 # revamp_sync.py
-# Red-DiscordBot Cog — Revamp -> Main Sync
-# ADMIN anchor at top (required), roles ordered strictly between @everyone and ADMIN,
-# Forums + Threads support, Single-server confirm, Control Panel + Live Log,
-# Rollback on critical errors, optional lockdown, safe interaction replies, backoff.
+# Red-DiscordBot Cog — Revamp -> Main Sync (ADMIN position is never changed)
+# - Never moves the ADMIN role; only verifies and logs if it's not top-most
+# - Role edits/deletes respect the bot's movable range; forbidden moves skipped with log notes
+# - Reordering only under ADMIN
+# - Safer channel/thread ops; clearer Forbidden handling
 
 from __future__ import annotations
 import asyncio, time
@@ -16,10 +17,11 @@ from redbot.core import commands
 __red_end_user_data_statement__ = "This cog stores no personal user data."
 
 # ---------- config ----------
-ADMIN_ANCHOR_NAME = "ADMIN"  # required top-most anchor role the bot must hold
+ADMIN_ANCHOR_NAME = "ADMIN"  # anchor role the bot uses as a ceiling for synced roles
 
 # ---------- helpers ----------
 def _norm(s: str) -> str: return (s or "").strip().lower()
+
 def _icon(step: str) -> str:
     return {"start":"🟡","lock":"🔒","roles_create":"👤","roles_update":"👤","roles_delete":"🧹",
             "roles_order":"📚","chan_delete":"🧹","cat_create":"🗂️","chan_create":"📺",
@@ -175,7 +177,11 @@ class ConfirmView(ui.View):
 
 # ---------- the cog ----------
 class RevampSync(commands.Cog):
-    """Mirror roles, channels, forums, threads, and role overwrites from a revamp server to a main server."""
+    """Mirror roles, channels, forums, threads, and role overwrites from a revamp server to a main server.
+
+    ADMIN handling: This cog **never moves ADMIN**. It only ensures it exists and the bot has it.
+    If ADMIN is not the top-most role, a warning is logged, but no movement occurs.
+    """
 
     def __init__(self, bot: commands.Bot):
         self.bot=bot
@@ -347,9 +353,14 @@ class RevampSync(commands.Cog):
             try: await p.log_msg.edit(embed=self._log_embed(p))
             except: pass
 
-    # ---------- ADMIN anchor ----------
-    async def _ensure_admin_anchor(self, guild: discord.Guild) -> discord.Role:
-        """Ensure there is a single, top-most ADMIN role; bot has it; move it to top."""
+    # ---------- ADMIN anchor (never moved) ----------
+    def _bot_top_position(self, guild: discord.Guild) -> int:
+        me = guild.me
+        return max((r.position for r in (me.roles if me else [])), default=0)
+
+    async def _ensure_admin_anchor(self, plan: Plan) -> discord.Role:
+        """Ensure ADMIN exists and the bot has it. Do NOT move it; only report if not top."""
+        guild = plan.target
         me = guild.me
         if not me:
             raise RuntimeError("Bot member not found in target guild.")
@@ -368,15 +379,23 @@ class RevampSync(commands.Cog):
             )
             await asyncio.sleep(self.rate_delay)
 
+        # give it to the bot if missing
         if admin_role not in me.roles:
-            await me.add_roles(admin_role, reason="Revamp sync: grant ADMIN anchor to bot")
-            await asyncio.sleep(self.rate_delay)
+            try:
+                await me.add_roles(admin_role, reason="Revamp sync: grant ADMIN anchor to bot")
+                await asyncio.sleep(self.rate_delay)
+            except discord.Forbidden:
+                raise RuntimeError("Missing permissions to assign ADMIN anchor to the bot.")
 
-        # Move ADMIN to absolute top (highest possible)
+        # confirm/announce position; DO NOT MOVE
         top_pos = len(guild.roles) - 1
+        pos_msg = f"🔐 ADMIN position is {admin_role.position}/{top_pos} (top index = {top_pos})"
+        await self._append_log(plan, pos_msg)
         if admin_role.position != top_pos:
-            await admin_role.edit(position=top_pos, reason="Revamp sync: elevate ADMIN anchor to top")
-            await asyncio.sleep(self.rate_delay)
+            warn = (f"ADMIN is not at the very top (pos {admin_role.position} < {top_pos}). "
+                    f"This cog will NOT move it; drag ADMIN to the top manually if required.")
+            plan.warnings.append(warn)
+            await self._append_log(plan, f"⚠️ {warn}")
 
         return admin_role
 
@@ -407,6 +426,11 @@ class RevampSync(commands.Cog):
                     out=await coro
                     await asyncio.sleep(self.rate_delay); ops+=1
                     return out
+                except discord.Forbidden as e:
+                    msg=f"{note}: Forbidden ({e})"; p.warnings.append(msg)
+                    if critical:
+                        await rollback(msg); raise
+                    return None
                 except discord.HTTPException as e:
                     if retries<=0:
                         msg=f"{note}: {e}"; p.warnings.append(msg)
@@ -447,7 +471,7 @@ class RevampSync(commands.Cog):
             except: pass
             try:
                 err=discord.Embed(title="❗ Sync rolled back due to error", description=reason, color=discord.Color.red())
-                if p.control_msg: await p.control_msg.channel.send("<@BigPattyOG>", embed=err)
+                if p.control_msg: await p.control_msg.channel.send(embed=err)
             except: pass
 
         # start
@@ -458,15 +482,16 @@ class RevampSync(commands.Cog):
             await self._toggle_lock(t, enable=True, plan=p)
             await progress("lock", "target locked for maintenance")
 
-        # ***** ADMIN anchor must exist + be top + bot must have it *****
+        # ***** ADMIN anchor exists + bot has it (NEVER MOVED) *****
         try:
-            admin_role = await self._ensure_admin_anchor(t)
-            await self._append_log(p, f"🔐 Using ADMIN anchor at position {admin_role.position}")
+            admin_role = await self._ensure_admin_anchor(p)
         except Exception as e:
-            await self._append_log(p, f"❌ ADMIN anchor failed: {e}")
+            await self._append_log(p, f"❌ ADMIN anchor setup failed: {e}")
             raise
 
-        # roles create/update/delete
+        bot_top = self._bot_top_position(t)
+
+        # roles create/update/delete (respect hierarchy)
         for a in p.role_actions:
             if a.kind=="create" and a.data:
                 created=await do(t.create_role(
@@ -475,7 +500,6 @@ class RevampSync(commands.Cog):
                     reason="Revamp sync: create role"
                 ), f"Failed to create role {a.data.get('name')}", critical=True)
                 if created:
-                    # seed at bottom (1); reorder will place exactly later
                     try:
                         await created.edit(position=1, reason="Revamp sync: seed under ADMIN")
                         await asyncio.sleep(self.rate_delay)
@@ -487,6 +511,10 @@ class RevampSync(commands.Cog):
             elif a.kind=="update" and a.id and a.changes:
                 tgt=t.get_role(a.id)
                 if not tgt: continue
+                if tgt.position >= bot_top:
+                    p.warnings.append(f"Skip update for role {tgt.name!r}: at/above bot's highest role (pos {tgt.position} ≥ {bot_top})")
+                    await self._append_log(p, f"⚠️ skipping update for {tgt.name!r} due to hierarchy")
+                    continue
                 prev=_strip_role(tgt)
                 edited=await do(tgt.edit(
                     colour=discord.Colour(a.changes.get("color",{}).get("to", tgt.colour.value)),
@@ -494,7 +522,7 @@ class RevampSync(commands.Cog):
                     mentionable=a.changes.get("mentionable",{}).get("to", tgt.mentionable),
                     permissions=discord.Permissions(a.changes.get("permissions",{}).get("to", tgt.permissions.value)),
                     reason="Revamp sync: update role"
-                ), f"Failed to update role {a.name}", critical=True)
+                ), f"Failed to update role {a.name}")
                 if edited is not None:
                     journal["updated_roles"].append((tgt.id, prev))
                     results["role_update"]+=1
@@ -503,6 +531,10 @@ class RevampSync(commands.Cog):
             elif a.kind=="delete" and a.id:
                 tgt=t.get_role(a.id)
                 if tgt:
+                    if tgt.position >= bot_top:
+                        p.warnings.append(f"Skip delete for role {tgt.name!r}: at/above bot's highest role (pos {tgt.position} ≥ {bot_top})")
+                        await self._append_log(p, f"⚠️ skipping delete for {tgt.name!r} due to hierarchy")
+                        continue
                     if any(_norm(sr.name)==_norm(tgt.name) for sr in (await s.fetch_roles())):
                         continue
                     prev=_strip_role(tgt)
@@ -520,7 +552,7 @@ class RevampSync(commands.Cog):
             tr=by_name.get(_norm(sr.name))
             if tr: p.role_id_map[sr.id]=tr.id
 
-        # reorder roles strictly between @everyone and ADMIN
+        # reorder roles strictly between @everyone and ADMIN (ADMIN never moved)
         await self._reorder_roles_like_source(p)
         await progress("roles_order", "reordered roles under ADMIN")
 
@@ -584,7 +616,7 @@ class RevampSync(commands.Cog):
                     fkw = {
                         "category": parent_obj,
                         "nsfw": getattr(src,"nsfw",False),
-                        "topic": getattr(src,"topic",None),
+                        "topic": getattr(src,"topic", None),
                         "default_layout": getattr(src,"default_layout", None),
                         "default_sort_order": getattr(src,"default_sort_order", None),
                         "default_reaction_emoji": getattr(src,"default_reaction_emoji", None),
@@ -764,6 +796,8 @@ class RevampSync(commands.Cog):
                     prev=plan.lockdown_prev.get(ch.id, current)
                     await ch.set_permissions(everyone, overwrite=prev, reason="Revamp sync: unlock")
                 await asyncio.sleep(self.rate_delay)
+            except discord.Forbidden as e:
+                plan.warnings.append(f"Lockdown change forbidden in #{ch.name}: {e}")
             except Exception as e:
                 plan.warnings.append(f"Lockdown change failed in #{ch.name}: {e}")
 
@@ -771,7 +805,7 @@ class RevampSync(commands.Cog):
     async def _reorder_roles_like_source(self, p: Plan) -> None:
         """
         Reorder roles bottom→top to match source, but strictly between:
-          @everyone (pos 0)  <  [ALL SYNCED ROLES]  <  ADMIN anchor (pos top)
+          @everyone (pos 0)  <  [ALL SYNCED ROLES]  <  ADMIN anchor (our ceiling)
         We never move @everyone or ADMIN; we never place anything at/above ADMIN or below 1.
         """
         target, source = p.target, p.source
@@ -780,7 +814,6 @@ class RevampSync(commands.Cog):
             if not admin:
                 raise RuntimeError(f"{ADMIN_ANCHOR_NAME} anchor not found on target.")
             admin_pos = admin.position
-            max_target_pos = max(1, admin_pos - 1)
 
             src_sorted = [r for r in await source.fetch_roles()
                           if not r.managed and r.id != source.default_role.id]
@@ -807,12 +840,16 @@ class RevampSync(commands.Cog):
             pos = 1
             for role in desired:
                 try:
-                    new_pos = min(max_target_pos, max(1, pos))
+                    new_pos = min(admin_pos - 1, max(1, pos))
                     if role.position != new_pos:
                         await role.edit(position=new_pos, reason="Revamp sync: reorder under ADMIN")
                         await asyncio.sleep(self.rate_delay)
                         await self._append_log(p, f"📚 moved {role.name!r}: {role.position} → {new_pos}")
                     pos += 1
+                except discord.Forbidden as e:
+                    msg = f"Unable to move role {role.name} (forbidden): {e}"
+                    p.warnings.append(msg)
+                    await self._append_log(p, f"⚠️ {msg}")
                 except discord.HTTPException as e:
                     msg = f"Unable to move role {role.name}: {e}"
                     p.warnings.append(msg)
