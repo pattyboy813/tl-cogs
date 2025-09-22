@@ -6,7 +6,7 @@
 # - Empty-target detection => clone on first run when mode=auto.
 # - Only changes what’s needed; ADMIN never moved (only ensured).
 # - Minimal logging; progress embed updates occasionally.
-# - Rollback of last apply per-target (roles, channels, overwrites, positions).
+# - Rollback of last apply per-target (roles, channels, role-overwrites, positions).
 #
 # This cog stores no personal user data.
 
@@ -82,7 +82,7 @@ def _diff_overwrites_roles(src_overwrites, tgt_overwrites, role_map) -> Optional
     want: Dict[discord.Role, discord.PermissionOverwrite] = {}
     changed = False
     for obj, po in src_overwrites.items():
-        if not isinstance(obj, discord.Role): 
+        if not isinstance(obj, discord.Role):
             continue
         tgt_role = role_map.get(obj.id)
         if not tgt_role:
@@ -184,13 +184,11 @@ class RevampSync(commands.Cog):
         source = ctx.guild
         mutual_targets = [g for g in self.bot.guilds if g.id != source.id]
 
-        # pre-check admin perms for source + potential targets
         if not source.me.guild_permissions.administrator:
             return await ctx.send("I need **Administrator** in this (source) server.")
 
         await ctx.typing()
 
-        # Build a lightweight default plan shell (target chosen later)
         dummy_target = mutual_targets[0] if mutual_targets else source
         plan = Plan(
             key=f"{source.id}:{int(time.time())}",
@@ -205,7 +203,6 @@ class RevampSync(commands.Cog):
         )
         self.pending[plan.key] = plan
 
-        # UI
         view = ControlView(self, plan_key=plan.key)
         emb = self._panel_embed(plan, step="Ready", note="Pick a target server and options, then **Apply**.")
         msg = await ctx.send(embed=emb, view=view)
@@ -217,8 +214,10 @@ class ControlView(ui.View):
         super().__init__(timeout=timeout)
         self.cog=cog
         self.plan_key=plan_key
-        self.add_item(TargetSelect(cog, plan_key))
-        self.add_item(ModeSelect(cog, plan_key))
+        # full-width selects on rows 0 and 1
+        self.add_item(TargetSelect(cog, plan_key))  # row=0
+        self.add_item(ModeSelect(cog, plan_key))    # row=1
+        # toggles on row=2
         self.add_item(ToggleDeletes(cog, plan_key))
         self.add_item(ToggleLockdown(cog, plan_key))
         self.add_item(ToggleThreads(cog, plan_key))
@@ -229,18 +228,16 @@ class ControlView(ui.View):
             return False
         return True
 
-    @ui.button(label="Apply", style=discord.ButtonStyle.danger, row=2)
+    @ui.button(label="Apply", style=discord.ButtonStyle.danger, row=3)
     async def apply(self, inter: discord.Interaction, btn: ui.Button):
         plan = self.cog.pending.get(self.plan_key)
         if not plan:
             return await _ireply(inter, "This request expired.", ephemeral=True)
 
-        # Validate target/admin
         t = plan.target
         if not (t and t.me and t.me.guild_permissions.administrator):
             return await _ireply(inter, "I need **Administrator** in the target server.", ephemeral=True)
 
-        # Build full plan now that target is chosen
         full = await self.cog._build_plan(
             plan.source, plan.target, plan.include_deletes, inter.user,
             plan.lockdown, plan.sync_threads, plan.mode
@@ -248,7 +245,6 @@ class ControlView(ui.View):
         full.control_msg = plan.control_msg
         self.cog.pending[self.plan_key] = full
 
-        # Replace view with Confirm/Cancel/Rollback
         confirm = ConfirmApplyView(self.cog, self.plan_key)
         try:
             await plan.control_msg.edit(embed=self.cog._panel_embed(full, step="Review Plan"), view=confirm)
@@ -256,7 +252,7 @@ class ControlView(ui.View):
             pass
         await _ireply(inter, "Plan prepared. Review and confirm.", ephemeral=True)
 
-    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=2)
+    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=3)
     async def cancel(self, inter: discord.Interaction, btn: ui.Button):
         plan = self.cog.pending.pop(self.plan_key, None)
         await _ireply(inter, "Cancelled. No changes made.", ephemeral=True)
@@ -267,7 +263,7 @@ class ControlView(ui.View):
             except Exception:
                 pass
 
-    @ui.button(label="Rollback last", style=discord.ButtonStyle.primary, row=2)
+    @ui.button(label="Rollback last", style=discord.ButtonStyle.primary, row=3)
     async def rollback(self, inter: discord.Interaction, btn: ui.Button):
         plan = self.cog.pending.get(self.plan_key)
         if not plan:
@@ -296,7 +292,7 @@ class TargetSelect(ui.Select):
         plan = self.cog.pending.get(plan_key)
         src = plan.source if plan else None
         for g in cog.bot.guilds:
-            if not src or g.id == src.id: 
+            if not src or g.id == src.id:
                 continue
             label = g.name[:100]
             options.append(discord.SelectOption(label=label, value=str(g.id)))
@@ -312,7 +308,6 @@ class TargetSelect(ui.Select):
         if not tgt:
             return await _ireply(inter, "Target not found.", ephemeral=True)
         plan.target = tgt
-        # reset embed
         try:
             await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step="Target selected"))
         except Exception:
@@ -346,7 +341,7 @@ class ModeSelect(ui.Select):
 class ToggleDeletes(ui.Button):
     def __init__(self, cog:"RevampSync", plan_key:str):
         self.cog=cog; self.plan_key=plan_key
-        super().__init__(style=discord.ButtonStyle.secondary, label="Deletes: Off", row=1)
+        super().__init__(style=discord.ButtonStyle.secondary, label="Deletes: Off", row=2)
 
     async def callback(self, inter: discord.Interaction):
         plan = self.cog.pending.get(self.plan_key)
@@ -362,7 +357,7 @@ class ToggleDeletes(ui.Button):
 class ToggleLockdown(ui.Button):
     def __init__(self, cog:"RevampSync", plan_key:str):
         self.cog=cog; self.plan_key=plan_key
-        super().__init__(style=discord.ButtonStyle.secondary, label="Lockdown: On", row=1)
+        super().__init__(style=discord.ButtonStyle.secondary, label="Lockdown: On", row=2)
 
     async def callback(self, inter: discord.Interaction):
         plan = self.cog.pending.get(self.plan_key)
@@ -378,7 +373,7 @@ class ToggleLockdown(ui.Button):
 class ToggleThreads(ui.Button):
     def __init__(self, cog:"RevampSync", plan_key:str):
         self.cog=cog; self.plan_key=plan_key
-        super().__init__(style=discord.ButtonStyle.secondary, label="Threads: Off", row=1)
+        super().__init__(style=discord.ButtonStyle.secondary, label="Threads: Off", row=2)
 
     async def callback(self, inter: discord.Interaction):
         plan = self.cog.pending.get(self.plan_key)
@@ -401,7 +396,7 @@ class ConfirmApplyView(ui.View):
             return False
         return True
 
-    @ui.button(label="Confirm Apply", style=discord.ButtonStyle.danger)
+    @ui.button(label="Confirm Apply", style=discord.ButtonStyle.danger, row=3)
     async def confirm(self, inter: discord.Interaction, btn: ui.Button):
         plan = self.cog.pending.get(self.plan_key)
         if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
@@ -423,7 +418,7 @@ class ConfirmApplyView(ui.View):
             await _ireply(inter, f"❌ Apply failed: {e}")
             self.stop()
 
-    @ui.button(label="Rollback last", style=discord.ButtonStyle.primary)
+    @ui.button(label="Rollback last", style=discord.ButtonStyle.primary, row=3)
     async def rollback(self, inter: discord.Interaction, btn: ui.Button):
         plan = self.cog.pending.get(self.plan_key)
         if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
@@ -435,7 +430,7 @@ class ConfirmApplyView(ui.View):
         emb = await self.cog._rollback(plan.target)
         await _ireply(inter, embed=emb, ephemeral=True)
 
-    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    @ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=3)
     async def cancel(self, inter: discord.Interaction, btn: ui.Button):
         plan = self.cog.pending.pop(self.plan_key, None)
         await _ireply(inter, "Cancelled. No changes made.", ephemeral=True)
@@ -704,7 +699,6 @@ class ConfirmApplyView(ui.View):
 
         # lockdown
         if p.lockdown:
-            # record previous everyone perms for rollback
             snapshot = await self._snapshot_lockdown(t)
             changelog.append(ChangeLogEntry("lockdown","set",{"snapshot":snapshot}))
             await self._toggle_lock(t, enable=True, plan=p)
@@ -723,9 +717,7 @@ class ConfirmApplyView(ui.View):
                     reason="Revamp sync: create role"
                 ), f"Create role {a.data.get('name')}", critical=True)
                 if created:
-                    # rollback: delete this role
                     changelog.append(ChangeLogEntry("role","create",{"role_id":created.id}))
-                    # seed position under ADMIN
                     if created.position != 1:
                         try:
                             await created.edit(position=1, reason="Revamp sync: seed under ADMIN")
@@ -740,7 +732,6 @@ class ConfirmApplyView(ui.View):
                 if tgt.position >= bot_top:
                     p.warnings.append(f"Skip update for {tgt.name!r}: at/above bot's highest role (pos {tgt.position} ≥ {bot_top})")
                     continue
-                # snapshot for rollback
                 pre = {
                     "id": tgt.id, "color": tgt.colour.value, "hoist": tgt.hoist,
                     "mentionable": tgt.mentionable, "permissions": tgt.permissions.value
@@ -771,7 +762,6 @@ class ConfirmApplyView(ui.View):
                         continue
                     if any(_norm(sr.name)==_norm(tgt.name) for sr in (await s.fetch_roles())):
                         continue
-                    # snapshot for rollback (recreate)
                     snap = {
                         "name": tgt.name, "color": tgt.colour.value, "hoist": tgt.hoist,
                         "mentionable": tgt.mentionable, "permissions": tgt.permissions.value, "position": tgt.position
@@ -806,7 +796,7 @@ class ConfirmApplyView(ui.View):
                 if any(x.op=="delete" and x.id==ch.id for x in p.channel_actions):
                     snap = await self._snapshot_channel(ch)
                     ok = await ch.delete(reason="Revamp sync: cleanup channel")
-                    if ok is None:  # delete returns None
+                    if ok is None:
                         changelog.append(ChangeLogEntry("channel","delete",{"snapshot":snap}))
                         results["chan_delete"]+=1; await progress("Channels")
             for cat in sorted([c for c in all_t if isinstance(c, discord.CategoryChannel)], key=lambda c:c.position, reverse=True):
@@ -831,7 +821,6 @@ class ConfirmApplyView(ui.View):
             else:
                 p.cat_id_map[cat.id]=ex.id
                 if ex.position!=cat.position:
-                    # snapshot pos
                     prepos = ex.position
                     await ex.edit(position=cat.position, reason="Revamp sync: reorder category")
                     changelog.append(ChangeLogEntry("channel","update",{"id":ex.id,"pre":{"position":prepos}}))
@@ -889,16 +878,14 @@ class ConfirmApplyView(ui.View):
                     changelog.append(ChangeLogEntry("channel","create",{"id":ch.id}))
                     created_map[src_ch.id]=ch; results["chan_create"]+=1; await progress("Channels")
             else:
-                # snapshot for rollback
                 pre = await self._snapshot_channel(ex)
 
-                # diffs
                 kwargs={"reason":"Revamp sync: update channel"}
                 if hasattr(ex,"category"):
                     if (ex.category.id if ex.category else None) != (parent_obj.id if parent_obj else None):
                         kwargs["category"]=parent_obj
                 if hasattr(ex,"topic"):
-                    src_topic=getattr(src_ch,"topic",None); 
+                    src_topic=getattr(src_ch,"topic",None);
                     if (ex.topic or None) != (src_topic or None):
                         kwargs["topic"]=src_topic
                 if hasattr(ex,"nsfw"):
@@ -957,7 +944,6 @@ class ConfirmApplyView(ui.View):
                     continue
                 desired = _diff_overwrites_roles(src_ch.overwrites, tgt_ch.overwrites, role_map_full)
                 if desired is not None:
-                    # snapshot for rollback
                     pre_ov = await self._snapshot_role_overwrites(tgt_ch)
                     await tgt_ch.edit(overwrites=desired, reason="Revamp sync: mirror role overwrites")
                     changelog.append(ChangeLogEntry("overwrites","set",{"channel_id":tgt_ch.id,"pre":pre_ov}))
@@ -1046,7 +1032,6 @@ class ConfirmApplyView(ui.View):
                     ch = target.get_channel(entry.payload["channel_id"])
                     pre = entry.payload["pre"]
                     if ch:
-                        # rebuild overwrites (roles only) from snapshot pairs
                         ov = {}
                         for rid, (a_val,d_val) in pre.items():
                             role = target.get_role(int(rid))
@@ -1067,7 +1052,6 @@ class ConfirmApplyView(ui.View):
                     restored["reorder"]+=1
 
                 elif entry.kind=="lockdown" and entry.op=="set":
-                    # restore previous everyone overwrites per channel
                     snap = entry.payload["snapshot"]  # {channel_id: (allow,deny)}
                     everyone = target.default_role
                     for cid, pair in snap.items():
@@ -1083,10 +1067,8 @@ class ConfirmApplyView(ui.View):
 
                 await asyncio.sleep(self.rate_delay)
             except Exception:
-                # best-effort rollback; keep going
                 continue
 
-        # clear after rollback
         self.last_applied.pop(target.id, None)
 
         emb = discord.Embed(title=f"{_icon('rollback')} Rollback — Completed", color=discord.Color.blurple())
@@ -1137,17 +1119,14 @@ class ConfirmApplyView(ui.View):
                 "default_thread_slowmode_delay": getattr(ch,"default_thread_slowmode_delay", 0),
                 "tags": [t.name for t in getattr(ch,"available_tags", [])],
             })
-        # role overwrites only (members not touched by this cog)
         snap["role_overwrites"] = await self._snapshot_role_overwrites(ch)
         return snap
 
     async def _restore_channel_partial(self, ch: discord.abc.GuildChannel, pre: dict):
         kwargs={}
-        # category
         if "category" in pre:
             cat = ch.guild.get_channel(pre["category"]) if pre["category"] else None
             kwargs["category"] = cat
-        # common
         if "name" in pre and ch.name != pre["name"]:
             kwargs["name"]=pre["name"]
         if "topic" in pre and hasattr(ch,"topic") and (ch.topic or None) != (pre["topic"] or None):
@@ -1164,13 +1143,11 @@ class ConfirmApplyView(ui.View):
             kwargs["user_limit"]=pre["user_limit"]
         if kwargs:
             await ch.edit(**kwargs, reason="Revamp rollback: channel revert")
-        # position
         if "position" in pre and getattr(ch,"position",None) is not None and ch.position != pre["position"]:
             try:
                 await ch.edit(position=pre["position"], reason="Revamp rollback: channel position")
             except Exception:
                 pass
-        # overwrites
         if "role_overwrites" in pre:
             ov = {}
             for rid, (a_val, d_val) in pre["role_overwrites"].items():
@@ -1218,7 +1195,6 @@ class ConfirmApplyView(ui.View):
         if ch:
             try: await ch.edit(position=snap["position"])
             except Exception: pass
-            # overwrites
             ov = {}
             for rid, (a_val, d_val) in (snap.get("role_overwrites") or {}).items():
                 role = guild.get_role(int(rid))
