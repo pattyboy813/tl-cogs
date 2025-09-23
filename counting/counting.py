@@ -22,7 +22,7 @@ from redbot.core import commands, checks, Config
 
 log = logging.getLogger("red.counting")
 
-BOT_CREDITS = "Bot by: Legend Gaming | Generaleoley"
+BOT_CREDITS = "Original by Generaleoley | Made better by Pat"
 
 # Emojis
 OK_EMOJI = "✅"
