@@ -2,5 +2,4 @@ from .counting import Counting
 
 
 async def setup(bot):
-    cog = Counting(bot)
-    await bot.add_cog(cog)
+    await bot.add_cog(Counting(bot))
