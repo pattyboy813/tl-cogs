@@ -100,14 +100,23 @@ def chn(o: Optional[Union[discord.abc.GuildChannel, discord.Thread]]) -> str:
     if not o:
         return "Unknown"
     mention = getattr(o, "mention", None)
-    if mention:
-        pretty = mention
-    else:
-        # fall back to #name
-        name = getattr(o, "name", "?")
-        pretty = f"#{name}"
+    pretty = mention if mention else f"#{getattr(o, 'name', '?')}"
     return f"{pretty} (`{o.id}`)"
 
+def _role_diff(before_roles: List[discord.Role], after_roles: List[discord.Role]) -> Tuple[List[discord.Role], List[discord.Role]]:
+    """Return (added, removed) roles, ignoring @everyone."""
+    b = {r.id: r for r in before_roles if r.name != "@everyone"}
+    a = {r.id: r for r in after_roles if r.name != "@everyone"}
+    added_ids = set(a.keys()) - set(b.keys())
+    removed_ids = set(b.keys()) - set(a.keys())
+    added = [a[i] for i in added_ids]
+    removed = [b[i] for i in removed_ids]
+    added.sort(key=lambda r: (-r.position, r.name.lower()))
+    removed.sort(key=lambda r: (-r.position, r.name.lower()))
+    return added, removed
+
+def _role_mentions(roles: List[discord.Role]) -> str:
+    return ", ".join(r.mention for r in roles) if roles else "*none*"
 
 @dataclass
 class Case:
@@ -136,16 +145,16 @@ class Case:
 
 # ------------------ Cog ------------------
 class ModLogX(commands.Cog):
-    """Next-gen modlog with webhook output, detailed embeds, cases, and audit correlation."""
+    """Modlog with webhook output, detailed embeds, cases, and audit correlation."""
 
-    __author__ = "Pat"
-    __version__ = "3.1.0"
+    __author__ = "you"
+    __version__ = "3.2.0"
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=0xA51D0ECAFE2025, force_registration=True)
         self.config.register_guild(**DEFAULTS_GUILD)
-        self._audit_fetch_lock: dict[int, asyncio.Lock] = {}
+        self._audit_fetch_lock: Dict[int, asyncio.Lock] = {}
 
     # ---------- Config util ----------
     async def _gdata(self, guild: discord.Guild) -> Dict[str, Any]:
@@ -171,6 +180,7 @@ class ModLogX(commands.Cog):
         url: Optional[str] = None,
         footer: Optional[str] = None,
         force_plain: bool = False,
+        thumbnail_url: Optional[str] = None,  # supports user avatar etc
     ):
         data = await self._gdata(guild)
         if not (data["enabled"] and data["webhook_url"]):
@@ -180,6 +190,8 @@ class ModLogX(commands.Cog):
         embed.timestamp = now_utc()
         for name, value, inline in fields:
             embed.add_field(name=name, value=limit(value, 1024), inline=inline)
+        if thumbnail_url:
+            embed.set_thumbnail(url=thumbnail_url)
         embed.set_footer(text=footer or f"{guild.name} • v{self.__version__}")
 
         identity_mode = data.get("webhook_identity", "bot")
@@ -235,7 +247,7 @@ class ModLogX(commands.Cog):
         )
         await self.config.guild(guild).cases.set_raw(str(cid), value=case.to_dict())
 
-        if (await self._cat(guild, "moderation_cases")):
+        if await self._cat(guild, "moderation_cases"):
             desc = (
                 f"**{action.title()}**\n"
                 f"Target: {u(target)}\n"
@@ -273,7 +285,7 @@ class ModLogX(commands.Cog):
             f"**ModLogX** v{self.__version__}\n"
             f"Enabled: `{d['enabled']}` • Embeds: `{d['use_embeds']}` • Identity: `{d.get('webhook_identity','bot')}` • Destination: `{dest}`\n"
             f"Use `[p]modlogx setup #channel` to set the webhook.\n"
-            f"Toggles: `[p]modlogx enable on/off`, `[p]modlogx embeds on/off`, `[p]modlogx identity bot|event`,\n"
+            f"Toggles: `[p]modlogx enable on/off`, `[p]modlogx embeds on/off`, `[p]modlogx identity bot|event`, "
             f"Sub-events: `[p]modlogx sub <category> <event> <on/off>`"
         )
 
@@ -324,12 +336,13 @@ class ModLogX(commands.Cog):
     async def case(self, ctx: commands.Context, case_id: int):
         """Show a case."""
         c = await self.config.guild(ctx.guild).cases.get_raw(str(case_id), default=None)
-        mod_str = f"<@{c['mod_id']}>" if c.get('mod_id') else 'Unknown'
         if not c:
             return await ctx.send("Case not found.")
+        mod_str = f"<@{c['mod_id']}>" if c.get("mod_id") else "Unknown"
+        target_mention = f"<@{c['target_id']}>"
         desc = (
             f"**Action**: {c['action']}\n"
-            f"**Target**: <@{c['target_id']}> (`{c['target_id']}`)\n"
+            f"**Target**: {target_mention} (`{c['target_id']}`)\n"
             f"**Moderator**: {mod_str}\n"
             f"**Reason**: {c.get('reason') or '*none*'}\n"
             f"**When**: {c.get('created_at')}"
@@ -347,7 +360,7 @@ class ModLogX(commands.Cog):
         await ctx.send(embed=discord.Embed(title="Snipe", description=desc, color=discord.Color.red()))
 
     # ================= Listeners =================
-    # ----- Messages (no create) -----
+    # ----- Messages (no create spam) -----
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
         if not (message.guild and await self._enabled(message.guild)):
@@ -499,7 +512,7 @@ class ModLogX(commands.Cog):
             description=f"In {chn(after.channel)} by {u(after.author)}",
             fields=[
                 ("Before", limit(before.content, 1000), False),
-                ("After", limit(after.content, 1000), False),
+                ("After",  limit(after.content, 1000), False),
                 ("Message ID", f"`{after.id}`", True),
             ],
             color=discord.Color.orange(),
@@ -546,7 +559,14 @@ class ModLogX(commands.Cog):
         cats = await self._cat(g, "members")
         if not cats or not cats.get("join", True):
             return
-        await self._send_embed(g, event_key="member_join", title="Member Joined", description=member.mention, fields=[("User", u(member), True)])
+        await self._send_embed(
+            g,
+            event_key="member_join",
+            title="Member Joined",
+            description=member.mention,
+            fields=[("User", u(member), True)],
+            thumbnail_url=member.display_avatar.url,
+        )
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
@@ -556,7 +576,14 @@ class ModLogX(commands.Cog):
         cats = await self._cat(g, "members")
         if not cats or not cats.get("leave", True):
             return
-        await self._send_embed(g, event_key="member_leave", title="Member Left", description=member.mention, fields=[("User", u(member), True)])
+        await self._send_embed(
+            g,
+            event_key="member_leave",
+            title="Member Left",
+            description=member.mention,
+            fields=[("User", u(member), True)],
+            thumbnail_url=member.display_avatar.url,
+        )
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
@@ -567,35 +594,56 @@ class ModLogX(commands.Cog):
         if not cats or not cats.get("update", True):
             return
 
-        def _role_names(roles: List[discord.Role]) -> set[str]:
-            return {r.name for r in roles if r.name != "@everyone"}
+        added, removed = _role_diff(before.roles, after.roles)
+        nick_changed = before.nick != after.nick
+        timeout_changed = getattr(before, "timed_out_until", None) != getattr(after, "timed_out_until", None)
 
-        changes = []
-        if before.nick != after.nick:
-            changes.append(f"**Nickname**: `{before.nick}` → `{after.nick}`")
-
-        if before.roles != after.roles:
-            b = _role_names(before.roles)
-            a = _role_names(after.roles)
-            added = a - b
-            removed = b - a
-            if added:
-                changes.append(f"**Roles Added**: {', '.join(sorted(added))}")
-            if removed:
-                changes.append(f"**Roles Removed**: {', '.join(sorted(removed))}")
-
-        if getattr(before, "timed_out_until", None) != getattr(after, "timed_out_until", None):
-            changes.append(f"**Timeout**: `{before.timed_out_until}` → `{after.timed_out_until}`")
-
-        if not changes:
+        if not (added or removed or nick_changed or timeout_changed):
             return
+
+        actor = None
+        if added or removed:
+            with contextlib.suppress(Exception):
+                async for e in g.audit_logs(limit=5, action=discord.AuditLogAction.member_role_update):
+                    if e.target and e.target.id == after.id:
+                        actor = e.user
+                        break
+
+        if added and not removed:
+            title = "User roles added"
+            color = discord.Color.green()
+        elif removed and not added:
+            title = "User roles removed"
+            color = discord.Color.red()
+        elif added and removed:
+            title = "User roles updated"
+            color = discord.Color.yellow()
+        else:
+            title = "Member updated"
+            color = discord.Color.blurple()
+
+        fields: List[Tuple[str, str, bool]] = []
+        fields.append(("User", f"{after.mention} ({after})", False))
+        if added:
+            fields.append(("Added", _role_mentions(added), False))
+        if removed:
+            fields.append(("Removed", _role_mentions(removed), False))
+        if nick_changed:
+            fields.append(("Nickname", f"`{before.nick}` → `{after.nick}`", False))
+        if timeout_changed:
+            fields.append(("Timeout", f"`{before.timed_out_until}` → `{after.timed_out_until}`", False))
+
+        footer = f"by {actor}" if actor else None
 
         await self._send_embed(
             g,
             event_key="member_update",
-            title="Member Updated",
-            description=after.mention,
-            fields=[("Changes", "\n".join(changes), False), ("User", f"{after.mention} • `{after.id}`", True)],
+            title=title,
+            description="",
+            fields=fields,
+            color=color,
+            footer=footer,
+            thumbnail_url=after.display_avatar.url,
         )
 
     @commands.Cog.listener()
@@ -621,6 +669,7 @@ class ModLogX(commands.Cog):
             description=u(user),
             fields=[("By", u(actor) if actor else "Unknown", True), ("Reason", reason or "*none*", False)],
             color=discord.Color.red(),
+            thumbnail_url=user.display_avatar.url if isinstance(user, (discord.Member, discord.User)) else None,
         )
 
     @commands.Cog.listener()
@@ -645,6 +694,7 @@ class ModLogX(commands.Cog):
             title="Member Unbanned",
             description=u(user),
             fields=[("By", u(actor) if actor else "Unknown", True), ("Reason", reason or "*none*", False)],
+            thumbnail_url=user.display_avatar.url if isinstance(user, (discord.Member, discord.User)) else None,
         )
 
     # ----- Roles -----
@@ -810,7 +860,7 @@ class ModLogX(commands.Cog):
             return
         await self._send_embed(guild, event_key="integration", title="Integrations Updated", description=guild.name)
 
-    # ----- Scheduled / Stage / Guild -----
+    # ----- Scheduled / Stage -----
     @commands.Cog.listener()
     async def on_guild_scheduled_event_create(self, event: discord.GuildScheduledEvent):
         g = event.guild
@@ -862,7 +912,7 @@ class ModLogX(commands.Cog):
         if before.channel == after.channel and before.self_stream == after.self_stream and before.self_video == after.self_video:
             return
         desc = f"{u(member)}\n{chn(before.channel)} → {chn(after.channel)}"
-        await self._send_embed(g, event_key="voice", title="Voice State Changed", description=desc)
+        await self._send_embed(g, event_key="voice", title="Voice State Changed", description=desc, thumbnail_url=member.display_avatar.url)
 
     @commands.Cog.listener()
     async def on_presence_update(self, before: discord.Member, after: discord.Member):
@@ -871,7 +921,13 @@ class ModLogX(commands.Cog):
             return
         if str(before.status) == str(after.status):
             return
-        await self._send_embed(g, event_key="presence", title="Presence Updated", description=f"{u(after)}: {before.status} → {after.status}")
+        await self._send_embed(
+            g,
+            event_key="presence",
+            title="Presence Updated",
+            description=f"{u(after)}: {before.status} → {after.status}",
+            thumbnail_url=after.display_avatar.url,
+        )
 
     @commands.Cog.listener()
     async def on_guild_update(self, before: discord.Guild, after: discord.Guild):
@@ -931,3 +987,4 @@ class ModLogX(commands.Cog):
     def cog_unload(self):
         with contextlib.suppress(Exception):
             self.bot.remove_listener(self._on_automod_action_execution, "on_automod_action_execution")
+
