@@ -654,7 +654,7 @@ class ModLogX(commands.Cog):
             return
         await self._send_embed(g, event_key="role", title="Role Created", description=role.mention, fields=[("Role ID", f"`{role.id}`", True)])
 
-    @commands.Cog.listener())
+    @commands.Cog.listener()
     async def on_guild_role_delete(self, role: discord.Role):
         g = role.guild
         if not (await self._guild_enabled(g)) or not await self._category(g, "roles"):
