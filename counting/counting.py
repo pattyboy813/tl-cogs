@@ -156,7 +156,7 @@ class Counting(commands.Cog):
             # print(players)
             winpay = await data.payout()
             record = await data.record()
-            await message.add_reaction(emoji='✅')
+            await message.add_reaction('✅')
             await data.user.set(author)
             if players.get(author) is None:
                 players[author] = 1
@@ -175,7 +175,7 @@ class Counting(commands.Cog):
             # check record
             if int(expected) > record:
                 await data.record.set(int(expected))
-                await message.add_reaction(emoji='🎉')
+                await message.add_reaction('🎉')
 
             # check win
             if winpay.get(expected) is not None:
@@ -196,7 +196,7 @@ class Counting(commands.Cog):
 
 
         else:
-            await message.add_reaction(emoji='❌')
+            await message.add_reaction('❌')
             await message.channel.send("Reset back to 1.")
             await data.user.set(None)
             await data.expected.set('1')
