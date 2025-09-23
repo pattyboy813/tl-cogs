@@ -760,7 +760,7 @@ class ModLogX(commands.Cog):
         await self._send_embed(g, event_key="thread", title="Thread Deleted", description=thread.name)
 
     # ----- Emojis / Stickers -----
-    @commands.Cog.listener())
+    @commands.Cog.listener()
     async def on_guild_emojis_update(self, guild: discord.Guild, before, after):
         if not (await self._enabled(guild)) or not await self._cat(guild, "emojis"):
             return
