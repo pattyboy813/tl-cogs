@@ -1,13 +1,12 @@
-# revamp_sync.py
-# Red-DiscordBot Cog — Revamp -> Main Sync (fast/minimal logging + UI + rollback)
-# - Single command: !revamp (hybrid). Source = current guild.
-# - Control panel with dropdowns/toggles to choose target & options, then Apply/Cancel/Rollback.
-# - Modes: auto | clone | update | sync (sync preserves target overwrites).
-# - Empty-target detection => clone on first run when mode=auto.
-# - Only changes what’s needed; ADMIN never moved (only ensured).
-# - Minimal logging; progress embed updates occasionally.
+# revamp_sync_sync_only.py
+# Red-DiscordBot Cog — Revamp -> Main Mirror (sync-only, non-destructive, nice UI, fail-fast + auto-rollback)
+# - Single command: !revamp (hybrid). Source = current guild; Target = another mutual guild.
+# - Control panel with Apply/Cancel/Rollback.
+# - Mode fixed to SYNC (non-destructive). No deletes. Preserves target overwrites.
+# - Only creates/updates what’s needed; ADMIN never moved (only ensured).
+# - Progress embed with rolling "Recent" ops + "Skipped" counter.
 # - Rollback of last apply per-target (roles, channels, role-overwrites, positions, lockdown).
-# - Auto-rollback on failure (toggle).
+# - Auto-rollback on ANY failure (fail-fast). Toggle removed.
 #
 # This cog stores no personal user data.
 
@@ -24,6 +23,8 @@ __red_end_user_data_statement__ = "This cog stores no personal user data."
 
 # ---------- config ----------
 ADMIN_ANCHOR_NAME = "ADMIN"  # anchor role; never moved by this cog
+# Optional: only mirror these category names from the source guild. Empty => all categories.
+CATEGORY_SCOPE: List[str] = []  # e.g., ["Revamp • Announcements", "Revamp • Community"]
 
 # ---------- helpers ----------
 def _norm(s: str) -> str: return (s or "").strip().lower()
@@ -35,11 +36,14 @@ def _icon(step: str) -> str:
         "threads": "🧵", "unlock": "🔓", "done": "✅", "rollback": "↩️"
     }.get(step, "🔧")
 
+# Minimal role shape for diffs
+
 def _strip_role(r: discord.Role) -> dict:
     return {
         "name": r.name, "key": _norm(r.name), "color": r.color.value,
         "hoist": r.hoist, "mentionable": r.mentionable, "permissions": r.permissions.value
     }
+
 
 def _role_diff(tgt_like: dict, src_like: dict) -> Tuple[bool, dict]:
     ch, diff = {}, False
@@ -49,76 +53,54 @@ def _role_diff(tgt_like: dict, src_like: dict) -> Tuple[bool, dict]:
             diff = True
     return diff, ch
 
+
+# Trimmed, version-tolerant channel change detector (preserve overwrites)
+
 def _chan_changed(tgt, src) -> bool:
     try:
-        if tgt.type != src.type: return True
-        t_topic = getattr(tgt, "topic", None); s_topic = getattr(src, "topic", None)
-        if (t_topic or "") != (s_topic or ""): return True
-        if bool(getattr(tgt, "nsfw", False)) != bool(getattr(src, "nsfw", False)): return True
-        trl=getattr(tgt, "slowmode_delay", 0) or getattr(tgt, "rate_limit_per_user", 0)
-        srl=getattr(src, "slowmode_delay", 0) or getattr(src, "rate_limit_per_user", 0)
-        if int(trl or 0) != int(srl or 0): return True
-        t_parent = tgt.category.name if tgt.category else None
-        s_parent = src.category.name if src.category else None
-        if t_parent != s_parent: return True
-        for a in ("bitrate", "user_limit"):
-            if getattr(tgt, a, None) != getattr(src, a, None): return True
-        if isinstance(tgt, discord.ForumChannel) and isinstance(src, discord.ForumChannel):
-            if getattr(tgt, "default_thread_slowmode_delay", 0) != getattr(src, "default_thread_slowmode_delay", 0): return True
-            if getattr(tgt, "default_sort_order", None) != getattr(src, "default_sort_order", None): return True
-            if getattr(tgt, "default_layout", None) != getattr(src, "default_layout", None): return True
-            if (getattr(getattr(tgt, "default_reaction_emoji", None), "name", None)
-                != getattr(getattr(src, "default_reaction_emoji", None), "name", None)): return True
-            t_tags = {_norm(t.name) for t in getattr(tgt, "available_tags", [])}
-            s_tags = {_norm(t.name) for t in getattr(src, "available_tags", [])}
-            if t_tags != s_tags: return True
-    except:
+        if tgt.type != src.type:
+            return True
+        def parent_name(c):
+            return c.category.name if getattr(c, "category", None) else None
+        def slowmode(c):
+            return getattr(c, "slowmode_delay", 0) or getattr(c, "rate_limit_per_user", 0) or 0
+        cur = {
+            "parent": parent_name(tgt),
+            "topic": (getattr(tgt, "topic", None) or ""),
+            "nsfw": bool(getattr(tgt, "nsfw", False)),
+            "slow": int(slowmode(tgt)),
+        }
+        des = {
+            "parent": parent_name(src),
+            "topic": (getattr(src, "topic", None) or ""),
+            "nsfw": bool(getattr(src, "nsfw", False)),
+            "slow": int(slowmode(src)),
+        }
+        return cur != des
+    except Exception:
         return True
-    return False
 
-def _diff_overwrites_roles(src_overwrites, tgt_overwrites, role_map) -> Optional[Dict[discord.Role, discord.PermissionOverwrite]]:
-    def to_pair(po: discord.PermissionOverwrite):
-        a, d = po.pair()
-        return (a.value, d.value)
-    want: Dict[discord.Role, discord.PermissionOverwrite] = {}
-    changed = False
-    for obj, po in src_overwrites.items():
-        if not isinstance(obj, discord.Role):
-            continue
-        tgt_role = role_map.get(obj.id)
-        if not tgt_role:
-            continue
-        a, d = po.pair()
-        want[tgt_role] = discord.PermissionOverwrite.from_pair(discord.Permissions(a.value), discord.Permissions(d.value))
-    for role, desired_po in want.items():
-        current_po = tgt_overwrites.get(role)
-        if current_po is None or to_pair(current_po) != to_pair(desired_po):
-            changed = True
-            break
-    src_role_targets = set(want.keys())
-    tgt_role_targets = {r for r in tgt_overwrites if isinstance(r, discord.Role)}
-    if tgt_role_targets - src_role_targets:
-        changed = True
-    return want if changed else None
 
 # ---------- plan / changelog ----------
 @dataclass
 class RoleAction:
-    kind: str  # create|update|delete
+    kind: str  # create|update
     name: str
-    id: Optional[int]=None
-    data: Optional[dict]=None
-    changes: Optional[dict]=None
+    id: Optional[int] = None
+    data: Optional[dict] = None
+    changes: Optional[dict] = None
+
 
 @dataclass
 class ChannelAction:
     kind: str  # category|channel
-    op: str    # create|update|delete
-    id: Optional[int]=None
-    name: Optional[str]=None
-    type: Optional[discord.ChannelType]=None
-    parent_name: Optional[str]=None
-    what: Optional[str]=None
+    op: str    # create|update
+    id: Optional[int] = None
+    name: Optional[str] = None
+    type: Optional[discord.ChannelType] = None
+    parent_name: Optional[str] = None
+    what: Optional[str] = None
+
 
 @dataclass
 class Plan:
@@ -127,24 +109,26 @@ class Plan:
     target: discord.Guild
     requested_by: discord.abc.User
     include_deletes: bool
-    lockdown: bool=False
-    sync_threads: bool=False
-    mode: str="auto"                      # auto|clone|update|sync
-    mirror_overwrites: bool=True          # False => preserve target perms (SYNC)
-    auto_rollback: bool=True              # NEW: attempt rollback if apply fails
-    role_actions: List[RoleAction]=field(default_factory=list)
-    channel_actions: List[ChannelAction]=field(default_factory=list)
-    role_id_map: Dict[int,int]=field(default_factory=dict)
-    cat_id_map: Dict[int,int]=field(default_factory=dict)
-    chan_id_map: Dict[int,int]=field(default_factory=dict)
-    warnings: List[str]=field(default_factory=list)
-    control_msg: Optional[discord.Message]=None
+    lockdown: bool = False
+    sync_threads: bool = False
+    mode: str = "sync"                # fixed: sync-only (preserve target overwrites)
+    mirror_overwrites: bool = False    # sync => preserve
+    auto_rollback: bool = True         # always on
+    role_actions: List[RoleAction] = field(default_factory=list)
+    channel_actions: List[ChannelAction] = field(default_factory=list)
+    role_id_map: Dict[int, int] = field(default_factory=dict)
+    cat_id_map: Dict[int, int] = field(default_factory=dict)
+    chan_id_map: Dict[int, int] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+    control_msg: Optional[discord.Message] = None
+
 
 @dataclass
 class ChangeLogEntry:
-    kind: str                    # role|channel|overwrites|roles_reorder|lockdown
-    op: str                      # create|update|delete|reorder|set
-    payload: Dict[str, Any]      # enough to invert
+    kind: str               # role|channel|overwrites|roles_reorder|lockdown
+    op: str                 # create|update|reorder|set
+    payload: Dict[str, Any]
+
 
 # ---------- basic safe reply ----------
 async def _ireply(inter: discord.Interaction, content: Optional[str] = None,
@@ -156,39 +140,50 @@ async def _ireply(inter: discord.Interaction, content: Optional[str] = None,
             await inter.followup.send(content or None, embed=embed, ephemeral=ephemeral)
     except discord.NotFound:
         try:
-            await inter.channel.send(content or None, embed=embed)
+            if inter.channel:
+                await inter.channel.send(content or None, embed=embed)
         except Exception:
             pass
     except Exception:
         pass
 
+
 # ---------- the cog ----------
 class RevampSync(commands.Cog):
     """
-    Single-command control panel to clone/update/sync from the current (source) guild
-    into a target guild, with optional threads, minimal logging, and rollback.
+    Control panel to mirror (sync) from the current (source) guild into a target guild,
+    preserving target overwrites and only creating/updating what's needed.
+    Non-destructive. Fail-fast with auto-rollback.
     """
 
     def __init__(self, bot: commands.Bot):
-        self.bot=bot
-        self.pending: Dict[str, Plan]={}
-        self.rate_delay=0.20
-        self.progress_every=30
-        self.progress_min_secs=5.0
+        self.bot = bot
+        self.pending: Dict[str, Plan] = {}
+        self.rate_delay = 0.20
+        self.progress_min_secs = 5.0
         # rollback storage: last changelog per target guild id
         self.last_applied: Dict[int, List[ChangeLogEntry]] = {}
+        # UI additions
+        self.recent_ops: Dict[str, List[str]] = {}
+        self.skipped: Dict[str, int] = {}
+        # behavior switches
+        self.fail_fast = True  # any op failure => rollback
 
-    # ---------- pretty panel/progress embeds ----------
-    def _panel_embed(self, p: Plan, step: str="Ready", note: Optional[str]=None) -> discord.Embed:
-        rc=sum(1 for a in p.role_actions if a.kind=="create")
-        ru=sum(1 for a in p.role_actions if a.kind=="update")
-        rd=sum(1 for a in p.role_actions if a.kind=="delete")
-        cc=sum(1 for c in p.channel_actions if c.op=="create")
-        cu=sum(1 for c in p.channel_actions if c.op=="update")
-        cd=sum(1 for c in p.channel_actions if c.op=="delete")
+    # ---------- UI helpers ----------
+    def _push_recent(self, p: Plan, text: str):
+        q = self.recent_ops.setdefault(p.key, [])
+        q.append(text)
+        if len(q) > 5:
+            q.pop(0)
 
-        emb=discord.Embed(
-            title="✨ Revamp Control Panel",
+    def _panel_embed(self, p: Plan, step: str = "Ready", note: Optional[str] = None) -> discord.Embed:
+        rc = sum(1 for a in p.role_actions if a.kind == "create")
+        ru = sum(1 for a in p.role_actions if a.kind == "update")
+        cc = sum(1 for c in p.channel_actions if c.op == "create")
+        cu = sum(1 for c in p.channel_actions if c.op == "update")
+
+        emb = discord.Embed(
+            title="✨ Revamp Mirror Panel",
             color=discord.Color.blurple(),
             description=(
                 f"**Source:** `{discord.utils.escape_markdown(p.source.name)}`\n"
@@ -202,35 +197,21 @@ class RevampSync(commands.Cog):
             try: emb.set_image(url=p.target.icon.url)
             except Exception: pass
 
-        mode_label = p.mode.upper()
-        emb.add_field(name="Mode", value=f"`{mode_label}`", inline=True)
-        emb.add_field(name="Deletes", value=("`Yes`" if p.include_deletes else "`No`"), inline=True)
+        emb.add_field(name="Mode", value="`SYNC` (non-destructive)", inline=True)
+        emb.add_field(name="Overwrites", value="`Preserve`", inline=True)
         emb.add_field(name="Lockdown", value=("`Yes`" if p.lockdown else "`No`"), inline=True)
         emb.add_field(name="Threads", value=("`Yes`" if p.sync_threads else "`No`"), inline=True)
-        emb.add_field(name="Perms Strategy", value=("`Mirror`" if p.mirror_overwrites else "`Preserve`"), inline=True)
-        emb.add_field(name="Auto-Rollback", value=("`On`" if p.auto_rollback else "`Off`"), inline=True)
 
-        emb.add_field(name="👤 Roles", value=f"Create **{rc}** • Update **{ru}** • Delete **{rd}**", inline=False)
-        emb.add_field(name="📺 Channels", value=f"Create **{cc}** • Update **{cu}** • Delete **{cd}**", inline=False)
+        emb.add_field(name="👤 Roles", value=f"Create **{rc}** • Update **{ru}**", inline=False)
+        emb.add_field(name="📺 Channels", value=f"Create **{cc}** • Update **{cu}**", inline=False)
 
-        bullets = []
-        if p.mode=="clone":
-            bullets += [
-                "Copy **all roles** (ordered under ADMIN) and **all categories/channels**.",
-                "Apply **role overwrites** to channels.",
-            ]
-        elif p.mode=="sync":
-            bullets += [
-                "Apply new/changed **roles/channels** from Source.",
-                "**Preserve** target channel permissions (no overwrite edits).",
-                "Optional deletes if enabled.",
-            ]
-        else:
-            bullets += [
-                "Create/Update roles & channels to match Source.",
-                "Optional deletes if enabled.",
-                "Mirror role overwrites.",
-            ]
+        bullets = [
+            "Mirror **roles** and **categories/channels** from Source.",
+            "**Preserve** target channel permissions (no overwrite edits).",
+            "No deletes; target-only items remain.",
+        ]
+        if CATEGORY_SCOPE:
+            bullets.append(f"Scope: only {len(CATEGORY_SCOPE)} category(ies) from Source")
         emb.add_field(name="Plan Summary", value="• " + "\n• ".join(bullets), inline=False)
 
         emb.add_field(name="Status", value=f"{_icon(step.lower())} **{step}**", inline=False)
@@ -238,8 +219,8 @@ class RevampSync(commands.Cog):
             emb.add_field(name="Hint", value=note, inline=False)
 
         if p.warnings:
-            preview="\n".join(f"• {w}" for w in p.warnings[:5])
-            if len(p.warnings)>5: preview+=f"\n… +{len(p.warnings)-5} more"
+            preview = "\n".join(f"• {w}" for w in p.warnings[:5])
+            if len(p.warnings) > 5: preview += f"\n… +{len(p.warnings)-5} more"
             emb.add_field(name="Notes", value=preview, inline=False)
 
         footer = f"ADMIN is never moved • Requested by {p.requested_by}"
@@ -247,25 +228,30 @@ class RevampSync(commands.Cog):
             emb.set_footer(text=footer, icon_url=(p.requested_by.display_avatar.url if hasattr(p.requested_by,'display_avatar') else discord.Embed.Empty))
         except Exception:
             emb.set_footer(text=footer)
-        emb.timestamp=discord.utils.utcnow()
+        emb.timestamp = discord.utils.utcnow()
         return emb
 
-    def _progress_embed(self, p: Plan, mode: str, results: dict, step: str) -> discord.Embed:
-        emb=self._panel_embed(p, step)
+    def _progress_embed(self, p: Plan, results: dict, step: str) -> discord.Embed:
+        emb = self._panel_embed(p, step)
         done = sum(results.values())
-        target = max(done, len(p.role_actions)+len(p.channel_actions))
+        target = max(done, len(p.role_actions) + len(p.channel_actions))
         slots = 16
-        filled = int((done/target)*slots) if target else 0
-        bar = "█"*filled + "░"*(slots-filled)
+        filled = int((done / target) * slots) if target else 0
+        bar = "█" * filled + "░" * (slots - filled)
         emb.add_field(
             name="Progress",
             value=(
                 f"`{bar}`  {done}/{target}\n"
-                f"Roles — C:{results['role_create']} U:{results['role_update']} D:{results['role_delete']}\n"
-                f"Chans — C:{results['chan_create']} U:{results['chan_update']} D:{results['chan_delete']}"
+                f"Roles — C:{results['role_create']} U:{results['role_update']}\n"
+                f"Chans — C:{results['chan_create']} U:{results['chan_update']}"
             ),
-            inline=False
+            inline=False,
         )
+        recent = "\n".join(f"• {t}" for t in self.recent_ops.get(p.key, [])) or "—"
+        emb.add_field(name="Recent", value=recent, inline=False)
+        skipped = self.skipped.get(p.key, 0)
+        if skipped:
+            emb.add_field(name="Skipped", value=f"{skipped} (insufficient role position/permissions)", inline=True)
         return emb
 
     # ---------- public command (source = ctx.guild) ----------
@@ -276,7 +262,7 @@ class RevampSync(commands.Cog):
         source = ctx.guild
         mutual_targets = [g for g in self.bot.guilds if g.id != source.id]
 
-        if not source.me.guild_permissions.administrator:
+        if not source.me or not source.me.guild_permissions.administrator:
             return await ctx.send("I need **Administrator** in this (source) server.")
 
         await ctx.typing()
@@ -288,16 +274,16 @@ class RevampSync(commands.Cog):
             target=dummy_target,
             requested_by=ctx.author,
             include_deletes=False,
-            lockdown=True,
+            lockdown=False,
             sync_threads=False,
-            mode="auto",
-            mirror_overwrites=True,
+            mode="sync",
+            mirror_overwrites=False,
             auto_rollback=True,
         )
         self.pending[plan.key] = plan
 
         view = ControlView(self, plan_key=plan.key)
-        emb = self._panel_embed(plan, step="Ready", note="Pick a target server and options, then **Apply**.")
+        emb = self._panel_embed(plan, step="Ready", note="Pick a target server, then **Apply**.")
         msg = await ctx.send(embed=emb, view=view)
         plan.control_msg = msg
 
@@ -309,88 +295,79 @@ class RevampSync(commands.Cog):
         noncats = [c for c in chans if not isinstance(c, discord.CategoryChannel)]
         return (len(roles) == 0) and (len(cats) == 0) and (len(noncats) == 0)
 
-    async def _build_plan(self, source: discord.Guild, target: discord.Guild, include_deletes: bool,
-                          requested_by: discord.abc.User, lockdown: bool, sync_threads: bool,
-                          mode: str) -> Plan:
-        key=f"{source.id}:{target.id}:{int(time.time())}"
+    def _in_scope(self, ch) -> bool:
+        if not CATEGORY_SCOPE:
+            return True
+        cat = ch.category.name if getattr(ch, "category", None) else None
+        return cat in CATEGORY_SCOPE
 
-        mirror_overwrites = True
-        final_mode = (_norm(mode) or "auto")
-        if final_mode == "auto":
-            final_mode = "clone" if await self._is_empty_guild(target) else "update"
-        if final_mode == "sync":
-            mirror_overwrites = False
-
-        plan=Plan(key, source, target, requested_by, include_deletes, lockdown, sync_threads,
-                  mode=final_mode, mirror_overwrites=mirror_overwrites, auto_rollback=True)
+    async def _build_plan(self, source: discord.Guild, target: discord.Guild,
+                          requested_by: discord.abc.User, lockdown: bool,
+                          sync_threads: bool) -> Plan:
+        key = f"{source.id}:{target.id}:{int(time.time())}"
+        plan = Plan(key, source, target, requested_by, include_deletes=False,
+                    lockdown=lockdown, sync_threads=sync_threads,
+                    mode="sync", mirror_overwrites=False, auto_rollback=True)
 
         # roles
-        src_roles={r.id:r for r in (await source.fetch_roles())}
-        tgt_roles={r.id:r for r in (await target.fetch_roles())}
-        tgt_by_name={_norm(r.name):r for r in tgt_roles.values() if not r.managed}
+        src_roles = {r.id: r for r in (await source.fetch_roles())}
+        tgt_roles = {r.id: r for r in (await target.fetch_roles())}
+        tgt_by_name = {_norm(r.name): r for r in tgt_roles.values() if not r.managed}
 
         for r in sorted(src_roles.values(), key=lambda x: x.position):
-            if r.id==source.default_role.id or r.managed: continue
-            t=tgt_by_name.get(_norm(r.name))
+            if r.id == source.default_role.id or r.managed:
+                continue
+            if CATEGORY_SCOPE:
+                # roles are global; if scoping, still sync roles because channels may rely on them
+                pass
+            t = tgt_by_name.get(_norm(r.name))
             if not t:
                 plan.role_actions.append(RoleAction("create", r.name, data=_strip_role(r)))
             else:
-                diff, ch=_role_diff(_strip_role(t), _strip_role(r))
-                if diff: plan.role_actions.append(RoleAction("update", r.name, id=t.id, changes=ch))
-                plan.role_id_map[r.id]=t.id
-
-        if include_deletes and plan.mode in {"update","sync"}:
-            for r in tgt_roles.values():
-                if r.id==target.default_role.id or r.managed: continue
-                if not any(_norm(sr.name)==_norm(r.name) for sr in src_roles.values()):
-                    plan.role_actions.append(RoleAction("delete", r.name, id=r.id))
+                diff, ch = _role_diff(_strip_role(t), _strip_role(r))
+                if diff:
+                    plan.role_actions.append(RoleAction("update", r.name, id=t.id, changes=ch))
+                plan.role_id_map[r.id] = t.id
 
         # channels
-        src_all=await source.fetch_channels(); tgt_all=await target.fetch_channels()
-        src_cats=[c for c in src_all if isinstance(c, discord.CategoryChannel)]
-        tgt_cats=[c for c in tgt_all if isinstance(c, discord.CategoryChannel)]
-        tgt_cat_by={c.name:c for c in tgt_cats}
+        src_all = await source.fetch_channels(); tgt_all = await target.fetch_channels()
+        src_cats = [c for c in src_all if isinstance(c, discord.CategoryChannel)]
+        if CATEGORY_SCOPE:
+            src_cats = [c for c in src_cats if c.name in CATEGORY_SCOPE]
+        tgt_cats = [c for c in tgt_all if isinstance(c, discord.CategoryChannel)]
+        tgt_cat_by = {c.name: c for c in tgt_cats}
 
-        for c in sorted(src_cats, key=lambda c:c.position):
-            ex=tgt_cat_by.get(c.name)
-            if not ex: plan.channel_actions.append(ChannelAction("category","create", name=c.name))
+        for c in sorted(src_cats, key=lambda c: c.position):
+            ex = tgt_cat_by.get(c.name)
+            if not ex:
+                plan.channel_actions.append(ChannelAction("category", "create", name=c.name))
             else:
-                plan.cat_id_map[c.id]=ex.id
-                if ex.position!=c.position:
-                    plan.channel_actions.append(ChannelAction("category","update", id=ex.id, name=c.name, what="position"))
-
-        if include_deletes and plan.mode in {"update","sync"}:
-            for tc in tgt_cats:
-                if tc.name not in {c.name for c in src_cats}:
-                    plan.channel_actions.append(ChannelAction("category","delete", id=tc.id, name=tc.name))
+                plan.cat_id_map[c.id] = ex.id
+                if ex.position != c.position:
+                    plan.channel_actions.append(ChannelAction("category", "update", id=ex.id, name=c.name, what="position"))
 
         def key_of(ch):
-            parent=ch.category.name if ch.category else "__ROOT__"
+            parent = ch.category.name if ch.category else "__ROOT__"
             return f"{parent}|{ch.type}|{ch.name}"
 
-        tgt_non=[c for c in tgt_all if not isinstance(c, discord.CategoryChannel)]
-        tgt_by_key={key_of(c):c for c in tgt_non}
-        src_non=[c for c in src_all if not isinstance(c, discord.CategoryChannel)]
+        tgt_non = [c for c in tgt_all if not isinstance(c, discord.CategoryChannel)]
+        tgt_by_key = {key_of(c): c for c in tgt_non}
+        src_non = [c for c in src_all if not isinstance(c, discord.CategoryChannel)]
+        # scope filter for non-category channels
+        src_non = [c for c in src_non if self._in_scope(c)]
 
-        for s in sorted(src_non, key=lambda c:c.position):
-            k=key_of(s); ex=tgt_by_key.get(k)
+        for s in sorted(src_non, key=lambda c: c.position):
+            k = key_of(s)
+            ex = tgt_by_key.get(k)
             if not ex:
-                plan.channel_actions.append(ChannelAction("channel","create", name=s.name, type=s.type,
+                plan.channel_actions.append(ChannelAction("channel", "create", name=s.name, type=s.type,
                                                           parent_name=(s.category.name if s.category else None)))
             else:
-                plan.chan_id_map[s.id]=ex.id
+                plan.chan_id_map[s.id] = ex.id
                 if _chan_changed(ex, s):
-                    plan.channel_actions.append(ChannelAction("channel","update", id=ex.id, name=s.name, type=s.type,
+                    plan.channel_actions.append(ChannelAction("channel", "update", id=ex.id, name=s.name, type=s.type,
                                                               parent_name=(s.category.name if s.category else None),
-                                                              what="config/position/overwrites"))
-
-        if include_deletes and plan.mode in {"update","sync"}:
-            for tc in tgt_non:
-                parent=tc.category.name if tc.category else "__ROOT__"
-                kk=f"{parent}|{tc.type}|{tc.name}"
-                if not any(kk==key_of(s) for s in src_non):
-                    plan.channel_actions.append(ChannelAction("channel","delete", id=tc.id, name=tc.name, type=tc.type))
-
+                                                              what="config/position"))
         return plan
 
     # ---------- ADMIN anchor (never moved) ----------
@@ -425,63 +402,58 @@ class RevampSync(commands.Cog):
         top_pos = len(guild.roles) - 1
         if admin_role.position != top_pos:
             plan.warnings.append(
-                f"ADMIN not at very top (pos {admin_role.position} < {top_pos}). "
-                f"This cog will NOT move it."
+                f"ADMIN not at very top (pos {admin_role.position} < {top_pos}). This cog will NOT move it."
             )
         return admin_role
 
-    # ---------- apply (with auto-rollback) ----------
+    # ---------- apply (fail-fast + auto-rollback) ----------
     async def apply_plan(self, p: Plan) -> discord.Embed:
         s, t = p.source, p.target
-        results={"role_create":0,"role_update":0,"role_delete":0,"chan_create":0,"chan_update":0,"chan_delete":0}
+        results = {"role_create": 0, "role_update": 0, "chan_create": 0, "chan_update": 0}
         changelog: List[ChangeLogEntry] = []
+        self.last_applied[t.id] = changelog  # expose live changelog for rollback
+        self.recent_ops[p.key] = []
+        self.skipped[p.key] = 0
 
-        # expose live changelog for rollback even on partial progress
-        self.last_applied[t.id] = changelog
-
-        last_edit=time.monotonic(); ops=0
-        async def progress(step_text:str):
-            nonlocal last_edit, ops
-            now=time.monotonic()
-            if (ops >= self.progress_every) or ((now - last_edit) >= self.progress_min_secs):
+        last_edit = time.monotonic()
+        async def progress(step_text: str):
+            now = time.monotonic()
+            if (now - last_edit) >= self.progress_min_secs:
                 if p.control_msg:
-                    try: await p.control_msg.edit(embed=self._progress_embed(p, p.mode, results, step_text))
-                    except: pass
-                last_edit=now; ops=0
+                    try: await p.control_msg.edit(embed=self._progress_embed(p, results, step_text))
+                    except Exception: pass
+                nonlocal last_edit
+                last_edit = now
 
-        async def do(coro, note:str, critical:bool=False):
-            nonlocal ops
-            retries, delay=3, 0.8
+        async def do(coro, note: str):
+            retries, delay = 3, 0.8
             while True:
                 try:
-                    out=await coro
-                    await asyncio.sleep(self.rate_delay); ops+=1
+                    out = await coro
+                    await asyncio.sleep(self.rate_delay)
                     return out
                 except discord.Forbidden as e:
-                    msg=f"{note}: Forbidden ({e})"; p.warnings.append(msg)
-                    if critical: raise
-                    return None
+                    p.warnings.append(f"{note}: Forbidden ({e})");
+                    raise
                 except discord.HTTPException as e:
-                    if retries<=0:
-                        msg=f"{note}: {e}"; p.warnings.append(msg)
-                        if critical: raise
-                        return None
-                    await asyncio.sleep(delay); retries-=1; delay=min(delay*2, 4.0)
+                    if retries <= 0:
+                        p.warnings.append(f"{note}: {e}")
+                        raise
+                    await asyncio.sleep(delay); retries -= 1; delay = min(delay * 2, 4.0)
                 except Exception as e:
-                    msg=f"{note}: {e}"; p.warnings.append(msg)
-                    if critical: raise
-                    return None
+                    p.warnings.append(f"{note}: {e}")
+                    raise
 
         try:
             # start
             if p.control_msg:
                 try: await p.control_msg.edit(embed=self._panel_embed(p, "Starting"))
-                except: pass
+                except Exception: pass
 
-            # lockdown
+            # optional lockdown
             if p.lockdown:
                 snapshot = await self._snapshot_lockdown(t)
-                changelog.append(ChangeLogEntry("lockdown","set",{"snapshot":snapshot}))
+                changelog.append(ChangeLogEntry("lockdown", "set", {"snapshot": snapshot}))
                 await self._toggle_lock(t, enable=True, plan=p)
                 await progress("Locked")
 
@@ -491,246 +463,181 @@ class RevampSync(commands.Cog):
 
             # ---- roles ----
             for a in p.role_actions:
-                if a.kind=="create" and a.data:
-                    created=await do(t.create_role(
+                if a.kind == "create" and a.data:
+                    created = await do(t.create_role(
                         name=a.data["name"], colour=discord.Colour(a.data["color"]), hoist=a.data["hoist"],
                         mentionable=a.data["mentionable"], permissions=discord.Permissions(a.data["permissions"]),
                         reason="Revamp sync: create role"
-                    ), f"Create role {a.data.get('name')}", critical=True)
+                    ), f"Create role {a.data.get('name')}")
                     if created:
-                        changelog.append(ChangeLogEntry("role","create",{"role_id":created.id}))
-                        if created.position != 1:
-                            try:
+                        changelog.append(ChangeLogEntry("role", "create", {"role_id": created.id}))
+                        try:
+                            if created.position != 1:
                                 await created.edit(position=1, reason="Revamp sync: seed under ADMIN")
-                                await asyncio.sleep(self.rate_delay); ops+=1
-                            except Exception: pass
-                        results["role_create"]+=1
+                                await asyncio.sleep(self.rate_delay)
+                        except Exception:
+                            pass
+                        results["role_create"] += 1
+                        self._push_recent(p, f"Role + {created.name}")
                         await progress("Roles")
 
-                elif a.kind=="update" and a.id and a.changes:
-                    tgt=t.get_role(a.id)
-                    if not tgt: continue
+                elif a.kind == "update" and a.id and a.changes:
+                    tgt = t.get_role(a.id)
+                    if not tgt:
+                        continue
                     if tgt.position >= bot_top:
                         p.warnings.append(f"Skip update for {tgt.name!r}: at/above bot's highest role (pos {tgt.position} ≥ {bot_top})")
+                        self.skipped[p.key] = self.skipped.get(p.key, 0) + 1
                         continue
                     pre = {
                         "id": tgt.id, "color": tgt.colour.value, "hoist": tgt.hoist,
                         "mentionable": tgt.mentionable, "permissions": tgt.permissions.value
                     }
-                    kwargs={}
+                    kwargs = {}
                     if "color" in a.changes:
-                        newcol=a.changes["color"]["to"]
+                        newcol = a.changes["color"]["to"]
                         if tgt.colour.value != newcol:
-                            kwargs["colour"]=discord.Colour(newcol)
+                            kwargs["colour"] = discord.Colour(newcol)
                     if "hoist" in a.changes and tgt.hoist != a.changes["hoist"]["to"]:
-                        kwargs["hoist"]=a.changes["hoist"]["to"]
+                        kwargs["hoist"] = a.changes["hoist"]["to"]
                     if "mentionable" in a.changes and tgt.mentionable != a.changes["mentionable"]["to"]:
-                        kwargs["mentionable"]=a.changes["mentionable"]["to"]
+                        kwargs["mentionable"] = a.changes["mentionable"]["to"]
                     if "permissions" in a.changes and tgt.permissions.value != a.changes["permissions"]["to"]:
-                        kwargs["permissions"]=discord.Permissions(a.changes["permissions"]["to"])
+                        kwargs["permissions"] = discord.Permissions(a.changes["permissions"]["to"])
                     if kwargs:
-                        ok=await do(tgt.edit(reason="Revamp sync: update role", **kwargs), f"Update role {tgt.name}")
-                        if ok is not None:
-                            changelog.append(ChangeLogEntry("role","update",{"pre":pre}))
-                            results["role_update"]+=1
-                            await progress("Roles")
-
-                elif a.kind=="delete" and a.id:
-                    tgt=t.get_role(a.id)
-                    if tgt:
-                        if tgt.position >= bot_top:
-                            p.warnings.append(f"Skip delete for {tgt.name!r}: at/above bot's highest role (pos {tgt.position} ≥ {bot_top})")
-                            continue
-                        if any(_norm(sr.name)==_norm(tgt.name) for sr in (await s.fetch_roles())):
-                            continue
-                        snap = {
-                            "name": tgt.name, "color": tgt.colour.value, "hoist": tgt.hoist,
-                            "mentionable": tgt.mentionable, "permissions": tgt.permissions.value, "position": tgt.position
-                        }
-                        ok=await do(tgt.delete(reason="Revamp sync: remove role not in source"), f"Delete role {tgt.name}")
-                        if ok is not None:
-                            changelog.append(ChangeLogEntry("role","delete",{"snapshot":snap}))
-                            results["role_delete"]+=1
-                            await progress("Roles")
+                        await do(tgt.edit(reason="Revamp sync: update role", **kwargs), f"Update role {tgt.name}")
+                        changelog.append(ChangeLogEntry("role", "update", {"pre": pre}))
+                        results["role_update"] += 1
+                        self._push_recent(p, f"Role ~ {tgt.name}")
+                        await progress("Roles")
 
             # refresh mapping
-            fresh=await t.fetch_roles()
-            by_name={_norm(r.name):r for r in fresh if not r.managed}
+            fresh = await t.fetch_roles()
+            by_name = {_norm(r.name): r for r in fresh if not r.managed}
             for sr in (await s.fetch_roles()):
-                if sr.id==s.default_role.id or sr.managed: continue
-                tr=by_name.get(_norm(sr.name))
-                if tr: p.role_id_map[sr.id]=tr.id
+                if sr.id == s.default_role.id or sr.managed:
+                    continue
+                tr = by_name.get(_norm(sr.name))
+                if tr:
+                    p.role_id_map[sr.id] = tr.id
 
             # reorder roles under ADMIN (snapshot positions for rollback)
             try:
                 pos_snapshot = {r.id: r.position for r in t.roles}
                 await self._reorder_roles_like_source(p)
-                changelog.append(ChangeLogEntry("roles_reorder","reorder",{"positions":pos_snapshot}))
+                changelog.append(ChangeLogEntry("roles_reorder", "reorder", {"positions": pos_snapshot}))
                 await progress("Roles")
             except Exception as e:
                 p.warnings.append(f"Role reordering issue: {e}")
 
-            # ---- channel deletes first (optional) ----
-            if p.include_deletes and p.mode in {"update","sync"}:
-                all_t=await t.fetch_channels()
-                for ch in sorted([c for c in all_t if not isinstance(c, discord.CategoryChannel)], key=lambda c:c.position, reverse=True):
-                    if any(x.op=="delete" and x.id==ch.id for x in p.channel_actions):
-                        snap = await self._snapshot_channel(ch)
-                        ok = await ch.delete(reason="Revamp sync: cleanup channel")
-                        if ok is None:
-                            changelog.append(ChangeLogEntry("channel","delete",{"snapshot":snap}))
-                            results["chan_delete"]+=1; await progress("Channels")
-                for cat in sorted([c for c in all_t if isinstance(c, discord.CategoryChannel)], key=lambda c:c.position, reverse=True):
-                    if any(x.op=="delete" and x.id==cat.id for x in p.channel_actions):
-                        snap = await self._snapshot_channel(cat)
-                        ok = await cat.delete(reason="Revamp sync: cleanup category")
-                        if ok is None:
-                            changelog.append(ChangeLogEntry("channel","delete",{"snapshot":snap}))
-                            results["chan_delete"]+=1; await progress("Channels")
-
             # ensure categories exist/order
-            src_cats=[c for c in await s.fetch_channels() if isinstance(c, discord.CategoryChannel)]
-            tgt_cats=[c for c in await t.fetch_channels() if isinstance(c, discord.CategoryChannel)]
-            by_name_cat={c.name:c for c in tgt_cats}
-            for cat in sorted(src_cats, key=lambda c:c.position):
-                ex=by_name_cat.get(cat.name)
+            src_cats = [c for c in await s.fetch_channels() if isinstance(c, discord.CategoryChannel)]
+            if CATEGORY_SCOPE:
+                src_cats = [c for c in src_cats if c.name in CATEGORY_SCOPE]
+            tgt_cats = [c for c in await t.fetch_channels() if isinstance(c, discord.CategoryChannel)]
+            by_name_cat = {c.name: c for c in tgt_cats}
+            for cat in sorted(src_cats, key=lambda c: c.position):
+                ex = by_name_cat.get(cat.name)
                 if not ex:
-                    created=await t.create_category(name=cat.name, reason="Revamp sync: create category")
+                    created = await do(t.create_category(name=cat.name, reason="Revamp sync: create category"), f"Create category {cat.name}")
                     if created:
-                        changelog.append(ChangeLogEntry("channel","create",{"id":created.id}))
-                        p.cat_id_map[cat.id]=created.id; results["chan_create"]+=1; await progress("Categories")
+                        changelog.append(ChangeLogEntry("channel", "create", {"id": created.id}))
+                        p.cat_id_map[cat.id] = created.id
+                        results["chan_create"] += 1
+                        self._push_recent(p, f"Cat + {cat.name}")
+                        await progress("Categories")
                 else:
-                    p.cat_id_map[cat.id]=ex.id
-                    if ex.position!=cat.position:
+                    p.cat_id_map[cat.id] = ex.id
+                    if ex.position != cat.position:
                         prepos = ex.position
-                        await ex.edit(position=cat.position, reason="Revamp sync: reorder category")
-                        changelog.append(ChangeLogEntry("channel","update",{"id":ex.id,"pre":{"position":prepos}}))
+                        await do(ex.edit(position=cat.position, reason="Revamp sync: reorder category"), f"Reorder category {ex.name}")
+                        changelog.append(ChangeLogEntry("channel", "update", {"id": ex.id, "pre": {"position": prepos}}))
+                        self._push_recent(p, f"Cat ↕ {ex.name}")
                         await progress("Categories")
 
-            # create/update non-category channels + diffs
-            src_non=[c for c in await s.fetch_channels() if not isinstance(c, discord.CategoryChannel)]
-            tgt_non=[c for c in await t.fetch_channels() if not isinstance(c, discord.CategoryChannel)]
+            # create/update non-category channels + diffs (preserve overwrites)
+            src_non = [c for c in await s.fetch_channels() if not isinstance(c, discord.CategoryChannel)]
+            src_non = [c for c in src_non if self._in_scope(c)]
+            tgt_non = [c for c in await t.fetch_channels() if not isinstance(c, discord.CategoryChannel)]
 
             def find_match(src):
                 for c in tgt_non:
-                    if c.name==src.name and c.type==src.type and ((c.category.name if c.category else None)==(src.category.name if src.category else None)):
+                    if c.name == src.name and c.type == src.type and ((c.category.name if c.category else None) == (src.category.name if src.category else None)):
                         return c
 
-            created_map={}
-            for src_ch in sorted(src_non, key=lambda c:c.position):
-                ex=find_match(src_ch)
-                parent_id=p.cat_id_map.get(getattr(src_ch,"category_id",None)) if getattr(src_ch,"category_id",None) else None
-                parent_obj=t.get_channel(parent_id) if parent_id else None
+            created_map = {}
+            for src_ch in sorted(src_non, key=lambda c: c.position):
+                ex = find_match(src_ch)
+                parent_id = p.cat_id_map.get(getattr(src_ch, "category_id", None)) if getattr(src_ch, "category_id", None) else None
+                parent_obj = t.get_channel(parent_id) if parent_id else None
 
                 if not ex:
-                    ch=None
+                    ch = None
                     if src_ch.type is discord.ChannelType.text:
-                        ch=await t.create_text_channel(
+                        ch = await do(t.create_text_channel(
                             name=src_ch.name, category=parent_obj,
-                            topic=getattr(src_ch,"topic",None), nsfw=getattr(src_ch,"nsfw",False),
-                            slowmode_delay=getattr(src_ch,"slowmode_delay",0) or getattr(src_ch,"rate_limit_per_user",0),
+                            topic=getattr(src_ch, "topic", None), nsfw=getattr(src_ch, "nsfw", False),
+                            slowmode_delay=getattr(src_ch, "slowmode_delay", 0) or getattr(src_ch, "rate_limit_per_user", 0),
                             reason="Revamp sync: create channel"
-                        )
+                        ), f"Create channel #{src_ch.name}")
                     elif src_ch.type in (discord.ChannelType.voice, discord.ChannelType.stage_voice):
-                        ch=await t.create_voice_channel(
+                        ch = await do(t.create_voice_channel(
                             name=src_ch.name, category=parent_obj,
-                            bitrate=getattr(src_ch,"bitrate",None), user_limit=getattr(src_ch,"user_limit",None),
+                            bitrate=getattr(src_ch, "bitrate", None), user_limit=getattr(src_ch, "user_limit", None),
                             reason="Revamp sync: create channel"
-                        )
+                        ), f"Create channel #{src_ch.name}")
                     elif src_ch.type is discord.ChannelType.forum:
-                        fkw = {
-                            "category": parent_obj,
-                            "nsfw": getattr(src_ch,"nsfw",False),
-                            "default_layout": getattr(src_ch,"default_layout", None),
-                            "default_sort_order": getattr(src_ch,"default_sort_order", None),
-                            "default_reaction_emoji": getattr(src_ch,"default_reaction_emoji", None),
-                            "default_thread_slowmode_delay": getattr(src_ch,"default_thread_slowmode_delay", 0),
-                            "reason": "Revamp sync: create forum",
-                        }
-                        src_tags = getattr(src_ch, "available_tags", [])
-                        if src_tags:
-                            fkw["available_tags"] = [discord.ForumTag(name=tag.name) for tag in src_tags]
-                        kwargs = {k:v for k,v in fkw.items() if v is not None}
-                        ch=await t.create_forum(name=src_ch.name, **kwargs)
+                        ch = await do(t.create_forum(
+                            name=src_ch.name, category=parent_obj,
+                            reason="Revamp sync: create forum"
+                        ), f"Create forum #{src_ch.name}")
                     else:
-                        ch=await t.create_text_channel(name=src_ch.name, category=parent_obj,
-                                                       reason="Revamp sync: create channel (fallback)")
+                        ch = await do(t.create_text_channel(name=src_ch.name, category=parent_obj,
+                                                            reason="Revamp sync: create channel"), f"Create channel #{src_ch.name}")
                     if ch:
-                        changelog.append(ChangeLogEntry("channel","create",{"id":ch.id}))
-                        created_map[src_ch.id]=ch; results["chan_create"]+=1; await progress("Channels")
+                        changelog.append(ChangeLogEntry("channel", "create", {"id": ch.id}))
+                        created_map[src_ch.id] = ch
+                        results["chan_create"] += 1
+                        self._push_recent(p, f"Chan + #{src_ch.name}")
+                        await progress("Channels")
                 else:
                     pre = await self._snapshot_channel(ex)
-
-                    kwargs={"reason":"Revamp sync: update channel"}
-                    if hasattr(ex,"category"):
+                    kwargs = {"reason": "Revamp sync: update channel"}
+                    if hasattr(ex, "category"):
                         if (ex.category.id if ex.category else None) != (parent_obj.id if parent_obj else None):
-                            kwargs["category"]=parent_obj
-                    if hasattr(ex,"topic"):
-                        src_topic=getattr(src_ch,"topic",None);
+                            kwargs["category"] = parent_obj
+                    if hasattr(ex, "topic"):
+                        src_topic = getattr(src_ch, "topic", None)
                         if (ex.topic or None) != (src_topic or None):
-                            kwargs["topic"]=src_topic
-                    if hasattr(ex,"nsfw"):
-                        src_nsfw=bool(getattr(src_ch,"nsfw",False))
-                        if bool(getattr(ex,"nsfw",False)) != src_nsfw:
-                            kwargs["nsfw"]=src_nsfw
-                    if hasattr(ex,"slowmode_delay"):
-                        src_sd=getattr(src_ch,"slowmode_delay",0) or getattr(src_ch,"rate_limit_per_user",0)
-                        if int(getattr(ex,"slowmode_delay",0) or getattr(ex,"rate_limit_per_user",0)) != int(src_sd or 0):
-                            kwargs["slowmode_delay"]=src_sd
-                    if hasattr(ex,"bitrate"):
-                        if getattr(ex,"bitrate",None) != getattr(src_ch,"bitrate",None):
-                            kwargs["bitrate"]=getattr(src_ch,"bitrate",None)
-                    if hasattr(ex,"user_limit"):
-                        if getattr(ex,"user_limit",None) != getattr(src_ch,"user_limit",None):
-                            kwargs["user_limit"]=getattr(src_ch,"user_limit",None)
-                    if isinstance(ex, discord.ForumChannel) and isinstance(src_ch, discord.ForumChannel):
-                        dl = getattr(src_ch,"default_layout", None)
-                        if getattr(ex,"default_layout", None) != dl:
-                            kwargs["default_layout"]=dl
-                        ds = getattr(src_ch,"default_sort_order", None)
-                        if getattr(ex,"default_sort_order", None) != ds:
-                            kwargs["default_sort_order"]=ds
-                        dre = getattr(src_ch,"default_reaction_emoji", None)
-                        if getattr(ex,"default_reaction_emoji", None) != dre:
-                            kwargs["default_reaction_emoji"] = dre
-                        dts = getattr(src_ch,"default_thread_slowmode_delay", 0)
-                        if getattr(ex,"default_thread_slowmode_delay", 0) != dts:
-                            kwargs["default_thread_slowmode_delay"]=dts
-                        src_tags = getattr(src_ch, "available_tags", [])
-                        tgt_tags = getattr(ex, "available_tags", [])
-                        if { _norm(t.name) for t in src_tags } != { _norm(t.name) for t in tgt_tags }:
-                            kwargs["available_tags"] = [discord.ForumTag(name=tag.name) for tag in src_tags]
+                            kwargs["topic"] = src_topic
+                    if hasattr(ex, "nsfw"):
+                        src_nsfw = bool(getattr(src_ch, "nsfw", False))
+                        if bool(getattr(ex, "nsfw", False)) != src_nsfw:
+                            kwargs["nsfw"] = src_nsfw
+                    if hasattr(ex, "slowmode_delay"):
+                        src_sd = getattr(src_ch, "slowmode_delay", 0) or getattr(src_ch, "rate_limit_per_user", 0)
+                        if int(getattr(ex, "slowmode_delay", 0) or getattr(ex, "rate_limit_per_user", 0)) != int(src_sd or 0):
+                            kwargs["slowmode_delay"] = src_sd
 
-                    edit_payload = {k:v for k,v in kwargs.items() if k!="reason"}
+                    edit_payload = {k: v for k, v in kwargs.items() if k != "reason"}
                     if any(k for k in edit_payload):
-                        await ex.edit(**edit_payload, reason=kwargs.get("reason"))
-                        changelog.append(ChangeLogEntry("channel","update",{"id":ex.id,"pre":pre}))
-                        results["chan_update"]+=1; await progress("Channels")
+                        await do(ex.edit(**edit_payload, reason=kwargs.get("reason")), f"Update channel #{ex.name}")
+                        changelog.append(ChangeLogEntry("channel", "update", {"id": ex.id, "pre": pre}))
+                        results["chan_update"] += 1
+                        self._push_recent(p, f"Chan ~ #{ex.name}")
+                        await progress("Channels")
 
                     if getattr(ex, "position", None) is not None and ex.position != src_ch.position:
                         prepos = ex.position
-                        await ex.edit(position=src_ch.position, reason="Revamp sync: reorder channel")
-                        changelog.append(ChangeLogEntry("channel","update",{"id":ex.id,"pre":{"position":prepos}}))
-                        results["chan_update"]+=1; await progress("Channels")
+                        await do(ex.edit(position=src_ch.position, reason="Revamp sync: reorder channel"), f"Reorder channel #{ex.name}")
+                        changelog.append(ChangeLogEntry("channel", "update", {"id": ex.id, "pre": {"position": prepos}}))
+                        self._push_recent(p, f"Chan ↕ #{ex.name}")
+                        await progress("Channels")
 
-                    p.chan_id_map[src_ch.id]=ex.id
-                    created_map[src_ch.id]=ex
+                    p.chan_id_map[src_ch.id] = ex.id
+                    created_map[src_ch.id] = ex
 
-            # overwrites (roles only) — skip in SYNC (preserve)
-            if p.mirror_overwrites:
-                role_map_full: Dict[int, discord.Role] = {sid: t.get_role(tid) for sid, tid in p.role_id_map.items() if t.get_role(tid)}
-                for src_ch in src_non:
-                    tgt_ch = created_map.get(src_ch.id)
-                    if not tgt_ch:
-                        continue
-                    desired = _diff_overwrites_roles(src_ch.overwrites, tgt_ch.overwrites, role_map_full)
-                    if desired is not None:
-                        pre_ov = await self._snapshot_role_overwrites(tgt_ch)
-                        await tgt_ch.edit(overwrites=desired, reason="Revamp sync: mirror role overwrites")
-                        changelog.append(ChangeLogEntry("overwrites","set",{"channel_id":tgt_ch.id,"pre":pre_ov}))
-                        results["chan_update"]+=1; await progress("Permissions")
-
-            # threads
+            # threads (optional, default off)
             if p.sync_threads:
                 await self._sync_threads(p, src_non, created_map)
                 await progress("Threads")
@@ -741,36 +648,32 @@ class RevampSync(commands.Cog):
                 await progress("Unlocked")
 
             # done
-            final=discord.Embed(title="✅ Revamp — Completed", color=discord.Color.green())
+            final = discord.Embed(title="✅ Revamp — Completed", color=discord.Color.green())
             final.add_field(name="Mode", value=p.mode.upper(), inline=True)
-            final.add_field(name="Perms", value=("Mirror" if p.mirror_overwrites else "Preserve"), inline=True)
-            final.add_field(name="Deletes", value=("Yes" if p.include_deletes else "No"), inline=True)
-            final.add_field(name="👤 Roles", value=f"C **{results['role_create']}** • U **{results['role_update']}** • D **{results['role_delete']}**", inline=False)
-            final.add_field(name="📺 Channels", value=f"C **{results['chan_create']}** • U **{results['chan_update']}** • D **{results['chan_delete']}**", inline=False)
+            final.add_field(name="Overwrites", value="Preserve", inline=True)
+            final.add_field(name="👤 Roles", value=f"C **{results['role_create']}** • U **{results['role_update']}**", inline=False)
+            final.add_field(name="📺 Channels", value=f"C **{results['chan_create']}** • U **{results['chan_update']}**", inline=False)
             if p.warnings:
-                preview="\n".join(f"• {w}" for w in p.warnings[:8])
-                if len(p.warnings)>8: preview+=f"\n… +{len(p.warnings)-8} more"
+                preview = "\n".join(f"• {w}" for w in p.warnings[:8])
+                if len(p.warnings) > 8: preview += f"\n… +{len(p.warnings)-8} more"
                 final.add_field(name="Notes", value=preview, inline=False)
-            final.timestamp=discord.utils.utcnow()
+            final.timestamp = discord.utils.utcnow()
             return final
 
         except Exception as e:
             p.warnings.append(f"Fatal error during apply: {e}")
             rollback_embed = None
-            if p.auto_rollback:
-                try:
+            try:
+                if p.auto_rollback:
                     rollback_embed = await self._rollback(t)
-                except Exception as re:
-                    p.warnings.append(f"Auto-rollback also failed: {re}")
+            except Exception as re:
+                p.warnings.append(f"Auto-rollback also failed: {re}")
             err = discord.Embed(title="❌ Revamp — Failed", color=discord.Color.red())
-            err.add_field(name="Error", value=f"```\n{e}\n```", inline=False)
-            if rollback_embed:
-                err.add_field(name="Auto-Rollback", value="Attempted and completed.", inline=False)
-            else:
-                err.add_field(name="Auto-Rollback", value=("Attempted but failed — see Notes." if p.auto_rollback else "Disabled."), inline=False)
+            err.add_field(name="Error", value=f"```{e}```", inline=False)
+            err.add_field(name="Auto-Rollback", value=("Completed." if rollback_embed else "Attempted but failed — see Notes."), inline=False)
             if p.warnings:
-                preview="\n".join(f"• {w}" for w in p.warnings[:8])
-                if len(p.warnings)>8: preview+=f"\n… +{len(p.warnings)-8} more"
+                preview = "\n".join(f"• {w}" for w in p.warnings[:8])
+                if len(p.warnings) > 8: preview += f"\n… +{len(p.warnings)-8} more"
                 err.add_field(name="Notes", value=preview, inline=False)
             err.timestamp = discord.utils.utcnow()
             return err
@@ -779,18 +682,19 @@ class RevampSync(commands.Cog):
     async def _rollback(self, target: discord.Guild) -> discord.Embed:
         log = self.last_applied.get(target.id)
         if not log:
-            return discord.Embed(title="↩️ Rollback", description="Nothing to rollback.", color=discord.Color.orange())
+            return discord.Embed(title=f"{_icon('rollback')} Rollback", description="Nothing to rollback.", color=discord.Color.orange())
 
         reversed_log = list(reversed(log))
-        restored = {"role":0,"channel":0,"overwrites":0,"reorder":0,"lockdown":0}
+        restored = {"role": 0, "channel": 0, "overwrites": 0, "reorder": 0, "lockdown": 0}
         for entry in reversed_log:
             try:
-                if entry.kind=="role":
-                    if entry.op=="create":
+                if entry.kind == "role":
+                    if entry.op == "create":
                         r = target.get_role(entry.payload["role_id"])
-                        if r: await r.delete(reason="Revamp rollback: remove created role"); restored["role"]+=1
-                    elif entry.op=="update":
-                        pre=entry.payload["pre"]; r=target.get_role(pre["id"])
+                        if r:
+                            await r.delete(reason="Revamp rollback: remove created role"); restored["role"] += 1
+                    elif entry.op == "update":
+                        pre = entry.payload["pre"]; r = target.get_role(pre["id"])
                         if r:
                             await r.edit(
                                 colour=discord.Colour(pre["color"]),
@@ -798,71 +702,56 @@ class RevampSync(commands.Cog):
                                 mentionable=pre["mentionable"],
                                 permissions=discord.Permissions(pre["permissions"]),
                                 reason="Revamp rollback: role update revert"
-                            ); restored["role"]+=1
-                    elif entry.op=="delete":
-                        snap=entry.payload["snapshot"]
-                        r=await target.create_role(
-                            name=snap["name"],
-                            colour=discord.Colour(snap["color"]),
-                            hoist=snap["hoist"],
-                            mentionable=snap["mentionable"],
-                            permissions=discord.Permissions(snap["permissions"]),
-                            reason="Revamp rollback: recreate deleted role"
-                        )
-                        try:
-                            await r.edit(position=max(1, snap.get("position",1)))
-                        except Exception:
-                            pass
-                        restored["role"]+=1
+                            ); restored["role"] += 1
 
-                elif entry.kind=="channel":
-                    if entry.op=="create":
+                elif entry.kind == "channel":
+                    if entry.op == "create":
                         ch = target.get_channel(entry.payload["id"])
-                        if ch: await ch.delete(reason="Revamp rollback: remove created channel"); restored["channel"]+=1
-                    elif entry.op=="update":
-                        pre=entry.payload["pre"]; ch=target.get_channel(entry.payload["id"])
                         if ch:
-                            await self._restore_channel_partial(ch, pre); restored["channel"]+=1
-                    elif entry.op=="delete":
-                        snap=entry.payload["snapshot"]
-                        await self._restore_channel_from_snapshot(target, snap); restored["channel"]+=1
+                            await ch.delete(reason="Revamp rollback: remove created channel"); restored["channel"] += 1
+                    elif entry.op == "update":
+                        pre = entry.payload["pre"]; ch = target.get_channel(entry.payload["id"])
+                        if ch:
+                            await self._restore_channel_partial(ch, pre); restored["channel"] += 1
 
-                elif entry.kind=="overwrites" and entry.op=="set":
+                elif entry.kind == "overwrites" and entry.op == "set":
+                    # not used in sync mode (we preserve), but keep for safety
                     ch = target.get_channel(entry.payload["channel_id"])
                     pre = entry.payload["pre"]
                     if ch:
                         ov = {}
-                        for rid, (a_val,d_val) in pre.items():
+                        for rid, (a_val, d_val) in pre.items():
                             role = target.get_role(int(rid))
                             if role:
                                 ov[role] = discord.PermissionOverwrite.from_pair(
                                     discord.Permissions(a_val), discord.Permissions(d_val)
                                 )
                         await ch.edit(overwrites=ov, reason="Revamp rollback: restore role overwrites")
-                        restored["overwrites"]+=1
+                        restored["overwrites"] += 1
 
-                elif entry.kind=="roles_reorder" and entry.op=="reorder":
+                elif entry.kind == "roles_reorder" and entry.op == "reorder":
                     pos = entry.payload["positions"]  # {role_id: position}
                     for rid, rpos in pos.items():
                         role = target.get_role(int(rid))
                         if role:
                             try: await role.edit(position=rpos, reason="Revamp rollback: restore role positions")
                             except Exception: pass
-                    restored["reorder"]+=1
+                    restored["reorder"] += 1
 
-                elif entry.kind=="lockdown" and entry.op=="set":
+                elif entry.kind == "lockdown" and entry.op == "set":
                     snap = entry.payload["snapshot"]  # {channel_id: (allow,deny)}
                     everyone = target.default_role
                     for cid, pair in snap.items():
                         ch = target.get_channel(int(cid))
-                        if not ch or not isinstance(ch, discord.TextChannel): continue
+                        if not ch or not isinstance(ch, discord.TextChannel):
+                            continue
                         a_val, d_val = pair
                         po = discord.PermissionOverwrite.from_pair(discord.Permissions(a_val), discord.Permissions(d_val))
                         try:
                             await ch.set_permissions(everyone, overwrite=po, reason="Revamp rollback: restore lockdown state")
                         except Exception:
                             pass
-                    restored["lockdown"]+=1
+                    restored["lockdown"] += 1
 
                 await asyncio.sleep(self.rate_delay)
             except Exception:
@@ -880,71 +769,62 @@ class RevampSync(commands.Cog):
         return emb
 
     # ---------- snapshots / restore helpers ----------
-    async def _snapshot_lockdown(self, guild: discord.Guild) -> Dict[int, Tuple[int,int]]:
-        out={}
-        everyone=guild.default_role
+    async def _snapshot_lockdown(self, guild: discord.Guild) -> Dict[int, Tuple[int, int]]:
+        out = {}
+        everyone = guild.default_role
         for ch in [c for c in await guild.fetch_channels() if isinstance(c, discord.TextChannel)]:
             po = ch.overwrites_for(everyone) or discord.PermissionOverwrite()
-            a,d = po.pair()
-            out[ch.id]=(a.value, d.value)
+            a, d = po.pair()
+            out[ch.id] = (a.value, d.value)
         return out
 
-    async def _snapshot_role_overwrites(self, ch: discord.abc.GuildChannel) -> Dict[int, Tuple[int,int]]:
-        out={}
+    async def _snapshot_role_overwrites(self, ch: discord.abc.GuildChannel) -> Dict[int, Tuple[int, int]]:
+        out = {}
         for obj, po in getattr(ch, "overwrites", {}).items():
             if isinstance(obj, discord.Role):
-                a,d = po.pair()
+                a, d = po.pair()
                 out[obj.id] = (a.value, d.value)
         return out
 
     async def _snapshot_channel(self, ch: discord.abc.GuildChannel) -> dict:
-        # Robust to enum types across discord.py versions
         type_value = getattr(getattr(ch, "type", None), "value", None)
         snap = {
-            "type": type_value,  # store numeric value
+            "type": type_value,
             "name": ch.name,
             "id": ch.id,
-            "category": (ch.category.id if getattr(ch,"category",None) else None),
-            "position": getattr(ch,"position",0),
-            "topic": getattr(ch,"topic",None),
-            "nsfw": getattr(ch,"nsfw",False),
-            "slowmode": getattr(ch,"slowmode_delay",0) or getattr(ch,"rate_limit_per_user",0),
-            "bitrate": getattr(ch,"bitrate",None),
-            "user_limit": getattr(ch,"user_limit",None),
+            "category": (ch.category.id if getattr(ch, "category", None) else None),
+            "position": getattr(ch, "position", 0),
+            "topic": getattr(ch, "topic", None),
+            "nsfw": getattr(ch, "nsfw", False),
+            "slowmode": getattr(ch, "slowmode_delay", 0) or getattr(ch, "rate_limit_per_user", 0),
+            "bitrate": getattr(ch, "bitrate", None),
+            "user_limit": getattr(ch, "user_limit", None),
         }
-        if isinstance(ch, discord.ForumChannel):
-            snap.update({
-                "default_layout": getattr(ch,"default_layout", None),
-                "default_sort_order": getattr(ch,"default_sort_order", None),
-                "default_reaction_emoji": getattr(getattr(ch,"default_reaction_emoji", None), "name", None),
-                "default_thread_slowmode_delay": getattr(ch,"default_thread_slowmode_delay", 0),
-                "tags": [t.name for t in getattr(ch,"available_tags", [])],
-            })
         snap["role_overwrites"] = await self._snapshot_role_overwrites(ch)
         return snap
 
     async def _restore_channel_partial(self, ch: discord.abc.GuildChannel, pre: dict):
-        kwargs={}
+        kwargs = {}
         if "category" in pre:
             cat = ch.guild.get_channel(pre["category"]) if pre["category"] else None
             kwargs["category"] = cat
         if "name" in pre and ch.name != pre["name"]:
-            kwargs["name"]=pre["name"]
-        if "topic" in pre and hasattr(ch,"topic") and (ch.topic or None) != (pre["topic"] or None):
-            kwargs["topic"]=pre["topic"]
-        if "nsfw" in pre and hasattr(ch,"nsfw") and bool(getattr(ch,"nsfw",False)) != bool(pre["nsfw"]):
-            kwargs["nsfw"]=pre["nsfw"]
-        if "slowmode" in pre and hasattr(ch,"slowmode_delay"):
-            cur = getattr(ch,"slowmode_delay",0) or getattr(ch,"rate_limit_per_user",0)
+            kwargs["name"] = pre["name"]
+        if "topic" in pre and hasattr(ch, "topic") and (ch.topic or None) != (pre["topic"] or None):
+            kwargs["topic"] = pre["topic"]
+        if "nsfw" in pre and hasattr(ch, "nsfw") and bool(getattr(ch, "nsfw", False)) != bool(pre["nsfw"]):
+            kwargs["nsfw"] = pre["nsfw"]
+        if "slowmode" in pre and hasattr(ch, "slowmode_delay"):
+            cur = getattr(ch, "slowmode_delay", 0) or getattr(ch, "rate_limit_per_user", 0)
             if int(cur or 0) != int(pre["slowmode"] or 0):
-                kwargs["slowmode_delay"]=pre["slowmode"]
-        if "bitrate" in pre and hasattr(ch,"bitrate") and getattr(ch,"bitrate",None) != pre["bitrate"]:
-            kwargs["bitrate"]=pre["bitrate"]
-        if "user_limit" in pre and hasattr(ch,"user_limit") and getattr(ch,"user_limit",None) != pre["user_limit"]:
-            kwargs["user_limit"]=pre["user_limit"]
+                kwargs["slowmode_delay"] = pre["slowmode"]
+        if "bitrate" in pre and hasattr(ch, "bitrate") and getattr(ch, "bitrate", None) != pre["bitrate"]:
+            kwargs["bitrate"] = pre["bitrate"]
+        if "user_limit" in pre and hasattr(ch, "user_limit") and getattr(ch, "user_limit", None) != pre["user_limit"]:
+            kwargs["user_limit"] = pre["user_limit"]
         if kwargs:
             await ch.edit(**kwargs, reason="Revamp rollback: channel revert")
-        if "position" in pre and getattr(ch,"position",None) is not None and ch.position != pre["position"]:
+        if "position" in pre and getattr(ch, "position", None) is not None and ch.position != pre["position"]:
             try:
                 await ch.edit(position=pre["position"], reason="Revamp rollback: channel position")
             except Exception:
@@ -962,67 +842,7 @@ class RevampSync(commands.Cog):
             except Exception:
                 pass
 
-    async def _restore_channel_from_snapshot(self, guild: discord.Guild, snap: dict):
-        cat = guild.get_channel(snap.get("category")) if snap.get("category") else None
-
-        # Accept int value, Enum, or string name
-        raw_type = snap.get("type")
-        if hasattr(raw_type, "value"):
-            raw_type = raw_type.value
-        if isinstance(raw_type, str):
-            raw_type = getattr(discord.ChannelType, raw_type, discord.ChannelType.text).value
-        try:
-            typ = discord.ChannelType(int(raw_type))
-        except Exception:
-            typ = discord.ChannelType.text
-
-        ch=None
-        if typ is discord.ChannelType.text:
-            ch=await guild.create_text_channel(
-                name=snap["name"], category=cat, topic=snap.get("topic"),
-                nsfw=snap.get("nsfw", False), slowmode_delay=snap.get("slowmode", 0),
-                reason="Revamp rollback: recreate channel"
-            )
-        elif typ in (discord.ChannelType.voice, discord.ChannelType.stage_voice):
-            ch=await guild.create_voice_channel(
-                name=snap["name"], category=cat, bitrate=snap.get("bitrate"),
-                user_limit=snap.get("user_limit"), reason="Revamp rollback: recreate channel"
-            )
-        elif typ is discord.ChannelType.forum:
-            fkw = {
-                "category": cat,
-                "nsfw": snap.get("nsfw", False),
-                "default_layout": snap.get("default_layout"),
-                "default_sort_order": snap.get("default_sort_order"),
-                "default_reaction_emoji": (discord.PartialEmoji(name=snap.get("default_reaction_emoji"))
-                                           if snap.get("default_reaction_emoji") else None),
-                "default_thread_slowmode_delay": snap.get("default_thread_slowmode_delay", 0),
-                "reason": "Revamp rollback: recreate forum",
-            }
-            tags = snap.get("tags") or []
-            if tags:
-                fkw["available_tags"] = [discord.ForumTag(name=n) for n in tags]
-            kwargs = {k: v for k, v in fkw.items() if v is not None}
-            ch=await guild.create_forum(name=snap["name"], **kwargs)
-        else:
-            ch=await guild.create_text_channel(name=snap["name"], category=cat, reason="Revamp rollback: recreate channel")
-
-        if ch:
-            try: await ch.edit(position=snap.get("position", 0))
-            except Exception: pass
-            ov = {}
-            for rid, (a_val, d_val) in (snap.get("role_overwrites") or {}).items():
-                role = guild.get_role(int(rid))
-                if role:
-                    ov[role] = discord.PermissionOverwrite.from_pair(
-                        discord.Permissions(a_val), discord.Permissions(d_val)
-                    )
-            try:
-                await ch.edit(overwrites=ov, reason="Revamp rollback: overwrites")
-            except Exception:
-                pass
-
-    # ---- threads helper (optional) ----
+    # ---------- threads helper (optional) ----------
     async def _gather_threads(self, parent) -> List[discord.Thread]:
         threads: List[discord.Thread] = []
         try:
@@ -1039,7 +859,7 @@ class RevampSync(commands.Cog):
                 threads.append(th)
         except Exception:
             pass
-        seen=set(); uniq=[]
+        seen = set(); uniq = []
         for th in threads:
             if th.id in seen: continue
             seen.add(th.id); uniq.append(th)
@@ -1052,11 +872,11 @@ class RevampSync(commands.Cog):
                 continue
             tgt_parent = created_map.get(src_parent.id)
             if not tgt_parent:
-                parent_id = p.cat_id_map.get(getattr(src_parent,"category_id",None)) if getattr(src_parent,"category_id",None) else None
+                parent_id = p.cat_id_map.get(getattr(src_parent, "category_id", None)) if getattr(src_parent, "category_id", None) else None
                 for c in (await t.fetch_channels()):
                     if not isinstance(c, (discord.TextChannel, discord.ForumChannel)): continue
-                    if c.name==src_parent.name and c.type==src_parent.type and ((c.category.id if c.category else None)==parent_id or parent_id is None):
-                        tgt_parent=c; break
+                    if c.name == src_parent.name and c.type == src_parent.type and ((c.category.id if c.category else None) == parent_id or parent_id is None):
+                        tgt_parent = c; break
                 else:
                     continue
 
@@ -1082,13 +902,13 @@ class RevampSync(commands.Cog):
 
     # ---------- lockdown ----------
     async def _toggle_lock(self, guild: discord.Guild, enable: bool, plan: Plan):
-        everyone=guild.default_role
+        everyone = guild.default_role
         for ch in [c for c in await guild.fetch_channels() if isinstance(c, discord.TextChannel)]:
             try:
-                current=ch.overwrites_for(everyone)
-                new=copy.copy(current)
+                current = ch.overwrites_for(everyone)
+                new = copy.copy(current)
                 if enable:
-                    new.send_messages=False; new.add_reactions=False
+                    new.send_messages = False; new.add_reactions = False
                 await ch.set_permissions(everyone, overwrite=new, reason="Revamp sync: lockdown" if enable else "Revamp sync: unlock")
                 await asyncio.sleep(self.rate_delay)
             except discord.Forbidden as e:
@@ -1106,13 +926,12 @@ class RevampSync(commands.Cog):
 
         src_sorted = [r for r in await source.fetch_roles()
                       if not r.managed and r.id != source.default_role.id]
-        src_sorted.sort(key=lambda r:r.position)  # bottom→top
+        src_sorted.sort(key=lambda r: r.position)  # bottom→top
 
         desired: List[discord.Role] = []
         for sr in src_sorted:
             tr = target.get_role(p.role_id_map.get(sr.id, 0))
-            if not tr:
-                continue
+            if not tr: continue
             if tr.managed or tr.id == target.default_role.id or tr.id == admin.id:
                 continue
             if tr.position >= admin_pos:
@@ -1128,24 +947,23 @@ class RevampSync(commands.Cog):
                     await asyncio.sleep(self.rate_delay)
                 except discord.Forbidden:
                     p.warnings.append(f"Forbidden moving role {role.name}")
+                    self.skipped[p.key] = self.skipped.get(p.key, 0) + 1
                 except discord.HTTPException as e:
                     p.warnings.append(f"Failed moving role {role.name}: {e}")
             pos += 1
 
-# ---------- UI view & components (top-level classes) ----------
+
+# ---------- UI view & components ----------
 class ControlView(ui.View):
-    def __init__(self, cog:"RevampSync", plan_key:str, timeout:float=900):
+    def __init__(self, cog: "RevampSync", plan_key: str, timeout: float = 900):
         super().__init__(timeout=timeout)
-        self.cog=cog
-        self.plan_key=plan_key
-        # full-width selects on rows 0 and 1
-        self.add_item(TargetSelect(cog, plan_key))  # row=0
-        self.add_item(ModeSelect(cog, plan_key))    # row=1
-        # toggles on row=2
-        self.add_item(ToggleDeletes(cog, plan_key))
+        self.cog = cog
+        self.plan_key = plan_key
+        # row 0: target selector
+        self.add_item(TargetSelect(cog, plan_key))
+        # row 2: optional toggles (lockdown/threads)
         self.add_item(ToggleLockdown(cog, plan_key))
         self.add_item(ToggleThreads(cog, plan_key))
-        self.add_item(ToggleAutoRollback(cog, plan_key))  # NEW
 
     async def interaction_check(self, inter: discord.Interaction) -> bool:
         if not inter.user.guild_permissions.administrator:
@@ -1163,11 +981,8 @@ class ControlView(ui.View):
         if not (t and t.me and t.me.guild_permissions.administrator):
             return await _ireply(inter, "I need **Administrator** in the target server.", ephemeral=True)
 
-        full = await self.cog._build_plan(
-            plan.source, plan.target, plan.include_deletes, inter.user,
-            plan.lockdown, plan.sync_threads, plan.mode
-        )
-        full.auto_rollback = plan.auto_rollback
+        full = await self.cog._build_plan(plan.source, plan.target, inter.user, plan.lockdown, plan.sync_threads)
+        full.auto_rollback = True
         full.control_msg = plan.control_msg
         self.cog.pending[self.plan_key] = full
 
@@ -1210,10 +1025,11 @@ class ControlView(ui.View):
             pass
         await _ireply(inter, embed=emb, ephemeral=True)
 
+
 class TargetSelect(ui.Select):
-    def __init__(self, cog:"RevampSync", plan_key:str):
-        self.cog=cog; self.plan_key=plan_key
-        options=[]
+    def __init__(self, cog: "RevampSync", plan_key: str):
+        self.cog = cog; self.plan_key = plan_key
+        options = []
         plan = self.cog.pending.get(plan_key)
         src = plan.source if plan else None
         for g in cog.bot.guilds:
@@ -1229,7 +1045,7 @@ class TargetSelect(ui.Select):
         plan = self.cog.pending.get(self.plan_key)
         if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
         gid = int(self.values[0])
-        tgt = next((g for g in self.cog.bot.guilds if g.id==gid), None)
+        tgt = next((g for g in self.cog.bot.guilds if g.id == gid), None)
         if not tgt:
             return await _ireply(inter, "Target not found.", ephemeral=True)
         plan.target = tgt
@@ -1239,50 +1055,11 @@ class TargetSelect(ui.Select):
             pass
         await _ireply(inter, f"Target set to **{tgt.name}**.", ephemeral=True)
 
-class ModeSelect(ui.Select):
-    def __init__(self, cog:"RevampSync", plan_key:str):
-        self.cog=cog; self.plan_key=plan_key
-        opts = [
-            ("Auto", "auto", "Clone if empty, else Update"),
-            ("Clone", "clone", "Copy everything; mirror overwrites"),
-            ("Update", "update", "Create/Update/Delete; mirror overwrites"),
-            ("Sync", "sync", "Only propagate changes; preserve overwrites"),
-        ]
-        options=[discord.SelectOption(label=l, value=v, description=d) for (l,v,d) in opts]
-        super().__init__(placeholder="Mode…", options=options, min_values=1, max_values=1, row=1)
-
-    async def callback(self, inter: discord.Interaction):
-        plan = self.cog.pending.get(self.plan_key)
-        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
-        mode = self.values[0]
-        plan.mode = mode
-        plan.mirror_overwrites = (mode != "sync")
-        try:
-            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step=f"Mode: {mode.upper()}"))
-        except Exception:
-            pass
-        await _ireply(inter, f"Mode set to **{mode.upper()}**.", ephemeral=True)
-
-class ToggleDeletes(ui.Button):
-    def __init__(self, cog:"RevampSync", plan_key:str):
-        self.cog=cog; self.plan_key=plan_key
-        super().__init__(style=discord.ButtonStyle.secondary, label="Deletes: Off", row=2)
-
-    async def callback(self, inter: discord.Interaction):
-        plan = self.cog.pending.get(self.plan_key)
-        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
-        plan.include_deletes = not plan.include_deletes
-        self.label = f"Deletes: {'On' if plan.include_deletes else 'Off'}"
-        try:
-            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step="Toggled Deletes"))
-        except Exception:
-            pass
-        await _ireply(inter, f"Deletes set to **{'On' if plan.include_deletes else 'Off'}**.", ephemeral=True)
 
 class ToggleLockdown(ui.Button):
-    def __init__(self, cog:"RevampSync", plan_key:str):
-        self.cog=cog; self.plan_key=plan_key
-        super().__init__(style=discord.ButtonStyle.secondary, label="Lockdown: On", row=2)
+    def __init__(self, cog: "RevampSync", plan_key: str):
+        self.cog = cog; self.plan_key = plan_key
+        super().__init__(style=discord.ButtonStyle.secondary, label="Lockdown: Off", row=2)
 
     async def callback(self, inter: discord.Interaction):
         plan = self.cog.pending.get(self.plan_key)
@@ -1295,9 +1072,10 @@ class ToggleLockdown(ui.Button):
             pass
         await _ireply(inter, f"Lockdown set to **{'On' if plan.lockdown else 'Off'}**.", ephemeral=True)
 
+
 class ToggleThreads(ui.Button):
-    def __init__(self, cog:"RevampSync", plan_key:str):
-        self.cog=cog; self.plan_key=plan_key
+    def __init__(self, cog: "RevampSync", plan_key: str):
+        self.cog = cog; self.plan_key = plan_key
         super().__init__(style=discord.ButtonStyle.secondary, label="Threads: Off", row=2)
 
     async def callback(self, inter: discord.Interaction):
@@ -1311,25 +1089,10 @@ class ToggleThreads(ui.Button):
             pass
         await _ireply(inter, f"Threads set to **{'On' if plan.sync_threads else 'Off'}**.", ephemeral=True)
 
-class ToggleAutoRollback(ui.Button):
-    def __init__(self, cog:"RevampSync", plan_key:str):
-        self.cog=cog; self.plan_key=plan_key
-        super().__init__(style=discord.ButtonStyle.secondary, label="Auto-Rollback: On", row=2)
-
-    async def callback(self, inter: discord.Interaction):
-        plan = self.cog.pending.get(self.plan_key)
-        if not plan: return await _ireply(inter, "Expired.", ephemeral=True)
-        plan.auto_rollback = not plan.auto_rollback
-        self.label = f"Auto-Rollback: {'On' if plan.auto_rollback else 'Off'}"
-        try:
-            await plan.control_msg.edit(embed=self.cog._panel_embed(plan, step="Toggled Auto-Rollback"))
-        except Exception:
-            pass
-        await _ireply(inter, f"Auto-Rollback set to **{'On' if plan.auto_rollback else 'Off'}**.", ephemeral=True)
 
 class ConfirmApplyView(ui.View):
-    def __init__(self, cog:"RevampSync", plan_key:str, timeout:float=900):
-        super().__init__(timeout=timeout); self.cog=cog; self.plan_key=plan_key
+    def __init__(self, cog: "RevampSync", plan_key: str, timeout: float = 900):
+        super().__init__(timeout=timeout); self.cog = cog; self.plan_key = plan_key
 
     async def interaction_check(self, inter: discord.Interaction) -> bool:
         if not inter.user.guild_permissions.administrator:
@@ -1337,7 +1100,7 @@ class ConfirmApplyView(ui.View):
             return False
         return True
 
-    @ui.button(label="Confirm Apply", style=discord.ButtonStyle.danger, row=3)
+    @ui.button(label="Confirm Mirror", style=discord.ButtonStyle.danger, row=3)
     async def confirm(self, inter: discord.Interaction, btn: ui.Button):
         plan = self.cog.pending.get(self.plan_key)
         if not plan: return await _ireply(inter, "Expired.", ephemeral=True)

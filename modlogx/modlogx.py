@@ -27,6 +27,9 @@ EVENT_ICONS = {
     "member_update": "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/26a1.png",
     "ban": "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/1f528.png",
     "unban": "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/1f513.png",
+    "kick": "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/26d4.png",       # ⛔
+    "timeout": "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/23f0.png",    # ⏰
+    "untimeout": "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/2705.png",  # ✅
     # roles/channels/server
     "role": "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/1f3f7.png",
     "channel": "https://raw.githubusercontent.com/twitter/twemoji/master/assets/72x72/1f4e3.png",
@@ -142,7 +145,6 @@ class SetupView(discord.ui.View):
 
     async def on_start(self, ctx: commands.Context):
         d = await self.cog._gdata(self.guild)
-        # Try to infer a channel id from existing webhook by asking user to re-pick; we keep state simple.
         self.state = {
             "enabled": d["enabled"],
             "use_embeds": d["use_embeds"],
@@ -152,13 +154,10 @@ class SetupView(discord.ui.View):
         }
 
         self.clear_items()
-        # Row 1: Channel select
         self.add_item(_ChannelSelect(self))
-        # Row 2: Toggles
         self.add_item(_ToggleEnabled(self))
         self.add_item(_ToggleEmbeds(self))
         self.add_item(_ToggleIdentity(self))
-        # Row 3: Actions
         self.add_item(_CreateWebhook(self))
         self.add_item(_TestLog(self))
         self.add_item(_Save(self))
@@ -281,7 +280,7 @@ class ModLogX(commands.Cog):
     """Modlog with webhook output, detailed embeds, cases, and audit correlation."""
 
     __author__ = "you"
-    __version__ = "3.3.0"
+    __version__ = "3.4.0"
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -330,7 +329,7 @@ class ModLogX(commands.Cog):
         url: Optional[str] = None,
         footer: Optional[str] = None,
         force_plain: bool = False,
-        thumbnail_url: Optional[str] = None,  # supports user avatar etc
+        thumbnail_url: Optional[str] = None,
     ):
         data = await self._gdata(guild)
         if not (data["enabled"] and data["webhook_url"]):
@@ -435,6 +434,43 @@ class ModLogX(commands.Cog):
                     return entry.user
         return None
 
+    async def _recent_kick_for(self, guild: discord.Guild, user_id: int):
+        """Return (moderator, reason) if the user was kicked very recently; else (None, None)."""
+        try:
+            async for entry in guild.audit_logs(limit=6, action=discord.AuditLogAction.kick):
+                if not entry.target or entry.target.id != user_id:
+                    continue
+                age = (now_utc() - entry.created_at.replace(tzinfo=dt.timezone.utc)).total_seconds()
+                if age <= 30:
+                    return entry.user, entry.reason
+        except Exception:
+            pass
+        return None, None
+
+    async def _recent_timeout_for(self, guild: discord.Guild, user_id: int):
+        """Return (moderator, reason, expires_dt) for a very recent timeout change; else (None, None, None)."""
+        try:
+            async for entry in guild.audit_logs(limit=8, action=discord.AuditLogAction.member_update):
+                tgt = getattr(entry, "target", None)
+                if not tgt or tgt.id != user_id:
+                    continue
+                changes = getattr(entry, "changes", None)
+                expires = None
+                if changes:
+                    with contextlib.suppress(Exception):
+                        after = getattr(changes, "after", None) or {}
+                        expires = (
+                            after.get("communication_disabled_until")
+                            or after.get("timed_out_until")
+                            or after.get("timeout_until")
+                        )
+                age = (now_utc() - entry.created_at.replace(tzinfo=dt.timezone.utc)).total_seconds()
+                if age <= 30:
+                    return entry.user, entry.reason, expires
+        except Exception:
+            pass
+        return None, None, None
+
     # ================= Commands =================
     @commands.group(name="modlogx", invoke_without_command=True)
     @commands.guild_only()
@@ -518,7 +554,7 @@ class ModLogX(commands.Cog):
         await ctx.send(embed=discord.Embed(title="Snipe", description=desc, color=discord.Color.red()))
 
     # ================= Listeners =================
-    # ----- Messages (no create spam) -----
+    # ----- Messages -----
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
         if not (message.guild and await self._enabled(message.guild)):
@@ -734,12 +770,58 @@ class ModLogX(commands.Cog):
         cats = await self._cat(g, "members")
         if not cats or not cats.get("leave", True):
             return
+
+        # Detect kick
+        mod, reason = await self._recent_kick_for(g, member.id)
+        kicked = mod is not None
+
+        # Times
+        joined = getattr(member, "joined_at", None)
+        created = getattr(member, "created_at", None)
+        fmt_joined_abs = discord.utils.format_dt(joined, style="f") if joined else "*unknown*"
+        fmt_joined_rel = discord.utils.format_dt(joined, style="R") if joined else ""
+        fmt_created_abs = discord.utils.format_dt(created, style="f") if created else "*unknown*"
+        fmt_created_rel = discord.utils.format_dt(created, style="R") if created else ""
+
+        tenure = ""
+        if joined:
+            delta = (now_utc() - (joined if joined.tzinfo else joined.replace(tzinfo=dt.timezone.utc)))
+            tenure = f"{max(0, delta.days)} days"
+
+        # Role snapshot
+        roles = [r for r in getattr(member, "roles", []) if r.name != "@everyone"]
+        roles.sort(key=lambda r: (-r.position, r.name.lower()))
+        role_count = len(roles)
+        if role_count == 0:
+            roles_value = "*none*"
+        elif role_count <= 15:
+            roles_value = ", ".join(r.mention for r in roles)
+        else:
+            roles_value = ", ".join(r.mention for r in roles[:15]) + f" … (+{role_count - 15} more)"
+
+        title = "Member Kicked" if kicked else "Member Left"
+        color = discord.Color.red() if kicked else discord.Color.blurple()
+        icon_key = "kick" if kicked else "member_leave"
+
+        fields = [
+            ("User", f"{member.mention} ({member})", False),
+            ("Joined", f"{fmt_joined_abs} {f'({fmt_joined_rel})' if fmt_joined_rel else ''}", True),
+            ("Account Created", f"{fmt_created_abs} {f'({fmt_created_rel})' if fmt_created_rel else ''}", True),
+            ("Server Tenure", tenure or "*n/a*", True),
+            (f"Roles ({role_count})", roles_value, False),
+        ]
+        if kicked:
+            fields.insert(1, ("Kicked By", f"{mod.mention} • `{mod.id}`" if isinstance(mod, discord.User) else "Unknown", True))
+            fields.insert(2, ("Reason", reason or "*none provided*", False))
+            await self._new_case(g, action="kick", target=member, moderator=mod, reason=reason)
+
         await self._send_embed(
             g,
-            event_key="member_leave",
-            title="Member Left",
+            event_key=icon_key,
+            title=title,
             description=member.mention,
-            fields=[("User", u(member), True)],
+            fields=fields,
+            color=color,
             thumbnail_url=member.display_avatar.url,
         )
 
@@ -752,57 +834,135 @@ class ModLogX(commands.Cog):
         if not cats or not cats.get("update", True):
             return
 
+        # Role/nick
         added, removed = _role_diff(before.roles, after.roles)
         nick_changed = before.nick != after.nick
-        timeout_changed = getattr(before, "timed_out_until", None) != getattr(after, "timed_out_until", None)
 
-        if not (added or removed or nick_changed or timeout_changed):
-            return
+        # Timeout change
+        b_to = getattr(before, "timed_out_until", None)
+        a_to = getattr(after, "timed_out_until", None)
+        timeout_changed = b_to != a_to
 
-        actor = None
-        if added or removed:
-            with contextlib.suppress(Exception):
-                async for e in g.audit_logs(limit=5, action=discord.AuditLogAction.member_role_update):
-                    if e.target and e.target.id == after.id:
-                        actor = e.user
-                        break
-
-        if added and not removed:
-            title = "User roles added"
-            color = discord.Color.green()
-        elif removed and not added:
-            title = "User roles removed"
-            color = discord.Color.red()
-        elif added and removed:
-            title = "User roles updated"
-            color = discord.Color.yellow()
-        else:
-            title = "Member updated"
-            color = discord.Color.blurple()
-
-        fields: List[Tuple[str, str, bool]] = []
-        fields.append(("User", f"{after.mention} ({after})", False))
-        if added:
-            fields.append(("Added", _role_mentions(added), False))
-        if removed:
-            fields.append(("Removed", _role_mentions(removed), False))
-        if nick_changed:
-            fields.append(("Nickname", f"`{before.nick}` → `{after.nick}`", False))
         if timeout_changed:
-            fields.append(("Timeout", f"`{before.timed_out_until}` → `{after.timed_out_until}`", False))
+            mod, reason, audit_expires = await self._recent_timeout_for(g, after.id)
+            expires_at = a_to or audit_expires
+            expires_str_abs = discord.utils.format_dt(expires_at, style="f") if expires_at else "*unknown*"
+            expires_str_rel = f" ({discord.utils.format_dt(expires_at, style='R')})" if expires_at else ""
+            dur_str = "*n/a*"
+            if expires_at:
+                try:
+                    rem = (expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=dt.timezone.utc)) - now_utc()
+                    secs = max(0, int(rem.total_seconds()))
+                    days, rem2 = divmod(secs, 86400)
+                    hours, rem2 = divmod(rem2, 3600)
+                    minutes, _ = divmod(rem2, 60)
+                    parts = []
+                    if days: parts.append(f"{days}d")
+                    if hours: parts.append(f"{hours}h")
+                    if minutes or not parts: parts.append(f"{minutes}m")
+                    dur_str = " ".join(parts)
+                except Exception:
+                    pass
 
-        footer = f"by {actor}" if actor else None
+            if a_to and not b_to:
+                # set
+                fields = [
+                    ("User", f"{after.mention} ({after})", False),
+                    ("Moderator", f"{mod.mention} • `{mod.id}`" if mod else "Unknown", True),
+                    ("Reason", reason or "*none*", False),
+                    ("Expires", f"{expires_str_abs}{expires_str_rel}", True),
+                    ("Duration (remaining)", dur_str, True),
+                ]
+                await self._send_embed(
+                    g,
+                    event_key="timeout",
+                    title="Member Timed Out",
+                    description=after.mention,
+                    fields=fields,
+                    color=discord.Color.red(),
+                    thumbnail_url=after.display_avatar.url,
+                )
+                remaining_secs = None
+                if expires_at:
+                    try:
+                        remaining_secs = max(0, int(((expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=dt.timezone.utc)) - now_utc()).total_seconds()))
+                    except Exception:
+                        pass
+                await self._new_case(g, action="timeout", target=after, moderator=mod, reason=reason, duration=remaining_secs)
 
-        await self._send_embed(
-            g,
-            event_key="member_update",
-            title=title,
-            description="",
-            fields=fields,
-            color=color,
-            footer=footer,
-            thumbnail_url=after.display_avatar.url,
-        )
+            elif (not a_to) and b_to:
+                # cleared
+                fields = [
+                    ("User", f"{after.mention} ({after})", False),
+                    ("Moderator", f"{mod.mention} • `{mod.id}`" if mod else "Unknown", True),
+                    ("Reason", reason or "*none*", False),
+                ]
+                await self._send_embed(
+                    g,
+                    event_key="untimeout",
+                    title="Timeout Cleared",
+                    description=after.mention,
+                    fields=fields,
+                    color=discord.Color.green(),
+                    thumbnail_url=after.display_avatar.url,
+                )
+                await self._new_case(g, action="untimeout", target=after, moderator=mod, reason=reason)
+
+            else:
+                # updated
+                fields = [
+                    ("User", f"{after.mention} ({after})", False),
+                    ("Moderator", f"{mod.mention} • `{mod.id}`" if mod else "Unknown", True),
+                    ("Reason", reason or "*none*", False),
+                    ("New Expiry", f"{expires_str_abs}{expires_str_rel}", True),
+                    ("Duration (remaining)", dur_str, True),
+                ]
+                await self._send_embed(
+                    g,
+                    event_key="timeout",
+                    title="Timeout Updated",
+                    description=after.mention,
+                    fields=fields,
+                    color=discord.Color.orange(),
+                    thumbnail_url=after.display_avatar.url,
+                )
+                await self._new_case(g, action="timeout_update", target=after, moderator=mod, reason=reason)
+
+        # role/nick embed (skip if we just sent a timeout embed to avoid spam)
+        if (added or removed or nick_changed) and not timeout_changed:
+            if added and not removed:
+                title = "User roles added"; color = discord.Color.green()
+            elif removed and not added:
+                title = "User roles removed"; color = discord.Color.red()
+            elif added and removed:
+                title = "User roles updated"; color = discord.Color.yellow()
+            else:
+                title = "Member updated"; color = discord.Color.blurple()
+
+            actor = None
+            if added or removed:
+                with contextlib.suppress(Exception):
+                    async for e in g.audit_logs(limit=5, action=discord.AuditLogAction.member_role_update):
+                        if e.target and e.target.id == after.id:
+                            actor = e.user
+                            break
+
+            fields: List[Tuple[str, str, bool]] = [("User", f"{after.mention} ({after})", False)]
+            if added:   fields.append(("Added", _role_mentions(added), False))
+            if removed: fields.append(("Removed", _role_mentions(removed), False))
+            if nick_changed: fields.append(("Nickname", f"`{before.nick}` → `{after.nick}`", False))
+            footer = f"by {actor}" if actor else None
+
+            await self._send_embed(
+                g,
+                event_key="member_update",
+                title=title,
+                description="",
+                fields=fields,
+                color=color,
+                footer=footer,
+                thumbnail_url=after.display_avatar.url,
+            )
 
     @commands.Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user: Union[discord.User, discord.Member]):
@@ -814,18 +974,27 @@ class ModLogX(commands.Cog):
         actor = None
         reason = None
         with contextlib.suppress(Exception):
-            async for entry in guild.audit_logs(limit=3, action=discord.AuditLogAction.ban):
+            async for entry in guild.audit_logs(limit=4, action=discord.AuditLogAction.ban):
                 if entry.target.id == user.id:
                     actor = entry.user
                     reason = entry.reason
                     break
+
+        created = getattr(user, "created_at", None)
+        created_abs = discord.utils.format_dt(created, style="f") if created else "*unknown*"
+        created_rel = f" ({discord.utils.format_dt(created,'R')})" if created else ""
+
         await self._new_case(guild, action="ban", target=user, moderator=actor, reason=reason)
         await self._send_embed(
             guild,
             event_key="ban",
             title="Member Banned",
-            description=u(user),
-            fields=[("By", u(actor) if actor else "Unknown", True), ("Reason", reason or "*none*", False)],
+            description=f"{getattr(user,'mention',str(user))}",
+            fields=[
+                ("By", u(actor) if actor else "Unknown", True),
+                ("Reason", reason or "*none*", False),
+                ("Account Created", f"{created_abs}{created_rel}", True),
+            ],
             color=discord.Color.red(),
             thumbnail_url=user.display_avatar.url if isinstance(user, (discord.Member, discord.User)) else None,
         )
@@ -1145,5 +1314,3 @@ class ModLogX(commands.Cog):
     def cog_unload(self):
         with contextlib.suppress(Exception):
             self.bot.remove_listener(self._on_automod_action_execution, "on_automod_action_execution")
-
-
