@@ -1,4 +1,3 @@
-# modlogx/__init__.py
 from __future__ import annotations
 
 import asyncio
@@ -898,4 +897,5 @@ class ModLogX(commands.Cog):
     def cog_unload(self):
         with contextlib.suppress(Exception):
             self.bot.remove_listener(self._on_automod_action_execution, "on_automod_action_execution")
+
 
