@@ -200,19 +200,25 @@ class ModLogV2(commands.Cog):
     async def _save_settings(self, guild_id: int, data: Dict[str, Any]):
         await self.config.guild_from_id(guild_id).set(data)
 
-    async def _resolve_log_channel(self, guild: discord.Guild, preferred_id: int | None) -> discord.TextChannel | None:
+    async def _resolve_log_channel(
+        self,
+        guild: discord.Guild,
+        preferred_id: int | None,
+        *,
+        require_embed: bool = True,
+    ) -> discord.TextChannel | None:
         """Return a channel we can actually send to. Prefer configured; else fall back to first viable."""
         # Preferred first
         if preferred_id:
             ch = guild.get_channel(preferred_id)
             if isinstance(ch, discord.TextChannel):
                 perms = ch.permissions_for(guild.me)
-                if perms.send_messages and perms.embed_links:
+                if perms.send_messages and (perms.embed_links or not require_embed):
                     return ch
         # Fallback
         for ch in guild.text_channels:
             perms = ch.permissions_for(guild.me)
-            if perms.send_messages and perms.embed_links:
+            if perms.send_messages and (perms.embed_links or not require_embed):
                 return ch
         return None
 
@@ -231,10 +237,15 @@ class ModLogV2(commands.Cog):
             return
 
         preferred_id = settings.get("log_channel_id")
-        dest = await self._resolve_log_channel(guild, preferred_id)
+        use_embed = bool(embed) and (force_embed or settings["use_embeds"])
+        require_embed = use_embed
+        dest = await self._resolve_log_channel(
+            guild,
+            preferred_id,
+            require_embed=require_embed,
+        )
 
         send_kwargs: Dict[str, Any] = {}
-        use_embed = bool(embed) and (force_embed or settings["use_embeds"])
 
         if content:
             send_kwargs["content"] = content
@@ -255,31 +266,75 @@ class ModLogV2(commands.Cog):
                 await dest.send(**send_kwargs)
             except discord.Forbidden:
                 # If preferred channel failed, try a fallback and warn
-                alt = await self._resolve_log_channel(guild, None)
-                if alt and (dest.id != alt.id):
+                sent_to_dest = False
+                fallback_kwargs = send_kwargs
+                fallback_require_embed = require_embed
+                if embed is not None and "embed" in send_kwargs:
+                    plaintext_kwargs = {k: v for k, v in send_kwargs.items() if k != "embed"}
+                    fallback_title = f"{event.replace('_', ' ').title()}"
+                    embed_text = _embed_to_plaintext(embed, fallback=fallback_title)
+                    existing_content = plaintext_kwargs.get("content")
+                    if existing_content:
+                        plaintext_kwargs["content"] = f"{existing_content}\n\n{embed_text}"
+                    else:
+                        plaintext_kwargs["content"] = embed_text
                     try:
-                        warn = build_embed(
-                            guild=guild,
-                            event="guild_update",
-                            title="ModLogV2: configured log channel not writable",
-                            description=(
-                                f"Tried to send to <#{preferred_id}> but lack permissions or channel is missing.\n"
-                                f"Posting here instead."
-                            ),
-                        )
-                        await alt.send(embed=warn)
-                        if force_embed and embed is not None and "embed" not in send_kwargs:
-                            await alt.send(embed=embed)
-                        else:
-                            await alt.send(**send_kwargs)
+                        await dest.send(**plaintext_kwargs)
+                    except discord.Forbidden:
+                        fallback_kwargs = plaintext_kwargs
+                        fallback_require_embed = False
                     except Exception:
-                        log.exception("Fallback channel also failed")
-                else:
-                    log.warning("No channel available to send log message", extra={"guild_id": guild.id})
+                        log.exception("Unexpected error sending plaintext log after embed failure")
+                        fallback_kwargs = plaintext_kwargs
+                        fallback_require_embed = False
+                    else:
+                        sent_to_dest = True
+
+                if not sent_to_dest:
+                    alt = await self._resolve_log_channel(
+                        guild,
+                        None,
+                        require_embed=fallback_require_embed,
+                    )
+                    if alt and (dest.id != alt.id):
+                        try:
+                            warn = build_embed(
+                                guild=guild,
+                                event="guild_update",
+                                title="ModLogV2: configured log channel not writable",
+                                description=(
+                                    f"Tried to send to <#{preferred_id}> but lack permissions or channel is missing.\n"
+                                    f"Posting here instead."
+                                ),
+                            )
+                            if fallback_require_embed:
+                                await alt.send(embed=warn)
+                            else:
+                                warn_content = _embed_to_plaintext(
+                                    warn,
+                                    fallback="ModLogV2: configured log channel not writable",
+                                )
+                                await alt.send(content=warn_content)
+                            if (
+                                force_embed
+                                and embed is not None
+                                and "embed" not in fallback_kwargs
+                                and fallback_require_embed
+                            ):
+                                await alt.send(embed=embed)
+                            else:
+                                await alt.send(**fallback_kwargs)
+                        except Exception:
+                            log.exception("Fallback channel also failed")
+                    else:
+                        log.warning("No channel available to send log message", extra={"guild_id": guild.id})
             except Exception:
                 log.exception("Unexpected error sending log")
         else:
-            log.warning("No text channel with send/embed perms found; cannot post log", extra={"guild_id": guild.id})
+            log.warning(
+                "No text channel with required permissions found; cannot post log",
+                extra={"guild_id": guild.id},
+            )
 
         # Persist event row via Config custom group (goes to Red’s backend)
         if payload is not None:
