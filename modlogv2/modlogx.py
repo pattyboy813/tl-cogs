@@ -899,6 +899,3 @@ class ModLogX(commands.Cog):
         with contextlib.suppress(Exception):
             self.bot.remove_listener(self._on_automod_action_execution, "on_automod_action_execution")
 
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(ModLogX(bot))
