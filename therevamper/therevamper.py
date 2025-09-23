@@ -2,11 +2,11 @@
 # Red-DiscordBot Cog — Revamp -> Main Mirror (sync-only, non-destructive, nice UI, fail-fast + auto-rollback)
 # - Single command: !revamp (hybrid). Source = current guild; Target = another mutual guild.
 # - Control panel with Apply/Cancel/Rollback.
-# - Mode fixed to SYNC (non-destructive). No deletes. Preserves target overwrites.
+# - Mode fixed to SYNC (non-destructive). No deletes. **Always mirrors role overwrites**.
 # - Only creates/updates what’s needed; ADMIN never moved (only ensured).
 # - Progress embed with rolling "Recent" ops + "Skipped" counter.
 # - Rollback of last apply per-target (roles, channels, role-overwrites, positions, lockdown).
-# - Auto-rollback on ANY failure (fail-fast). Toggle removed.
+# - Auto-rollback on ANY failure (fail-fast).
 #
 # This cog stores no personal user data.
 
@@ -37,13 +37,11 @@ def _icon(step: str) -> str:
     }.get(step, "🔧")
 
 # Minimal role shape for diffs
-
 def _strip_role(r: discord.Role) -> dict:
     return {
         "name": r.name, "key": _norm(r.name), "color": r.color.value,
         "hoist": r.hoist, "mentionable": r.mentionable, "permissions": r.permissions.value
     }
-
 
 def _role_diff(tgt_like: dict, src_like: dict) -> Tuple[bool, dict]:
     ch, diff = {}, False
@@ -53,9 +51,7 @@ def _role_diff(tgt_like: dict, src_like: dict) -> Tuple[bool, dict]:
             diff = True
     return diff, ch
 
-
-# Trimmed, version-tolerant channel change detector (preserve overwrites)
-
+# Trimmed, version-tolerant channel change detector (ignores overwrites; perms mirrored later)
 def _chan_changed(tgt, src) -> bool:
     try:
         if tgt.type != src.type:
@@ -80,6 +76,31 @@ def _chan_changed(tgt, src) -> bool:
     except Exception:
         return True
 
+# Compute desired role overwrites from source to target (roles only); return None if no change
+def _diff_overwrites_roles(src_overwrites, tgt_overwrites, role_map) -> Optional[Dict[discord.Role, discord.PermissionOverwrite]]:
+    def to_pair(po: discord.PermissionOverwrite):
+        a, d = po.pair()
+        return (a.value, d.value)
+    want: Dict[discord.Role, discord.PermissionOverwrite] = {}
+    changed = False
+    for obj, po in src_overwrites.items():
+        if not isinstance(obj, discord.Role):
+            continue
+        tgt_role = role_map.get(obj.id)
+        if not tgt_role:
+            continue
+        a, d = po.pair()
+        want[tgt_role] = discord.PermissionOverwrite.from_pair(discord.Permissions(a.value), discord.Permissions(d.value))
+    for role, desired_po in want.items():
+        current_po = tgt_overwrites.get(role)
+        if current_po is None or to_pair(current_po) != to_pair(desired_po):
+            changed = True
+            break
+    src_role_targets = set(want.keys())
+    tgt_role_targets = {r for r in tgt_overwrites if isinstance(r, discord.Role)}
+    if tgt_role_targets - src_role_targets:
+        changed = True
+    return want if changed else None
 
 # ---------- plan / changelog ----------
 @dataclass
@@ -89,7 +110,6 @@ class RoleAction:
     id: Optional[int] = None
     data: Optional[dict] = None
     changes: Optional[dict] = None
-
 
 @dataclass
 class ChannelAction:
@@ -101,7 +121,6 @@ class ChannelAction:
     parent_name: Optional[str] = None
     what: Optional[str] = None
 
-
 @dataclass
 class Plan:
     key: str
@@ -111,8 +130,8 @@ class Plan:
     include_deletes: bool
     lockdown: bool = False
     sync_threads: bool = False
-    mode: str = "sync"                # fixed: sync-only (preserve target overwrites)
-    mirror_overwrites: bool = False    # sync => preserve
+    mode: str = "sync"                # fixed: sync-only (non-destructive)
+    mirror_overwrites: bool = True     # ALWAYS mirror role overwrites
     auto_rollback: bool = True         # always on
     role_actions: List[RoleAction] = field(default_factory=list)
     channel_actions: List[ChannelAction] = field(default_factory=list)
@@ -122,13 +141,11 @@ class Plan:
     warnings: List[str] = field(default_factory=list)
     control_msg: Optional[discord.Message] = None
 
-
 @dataclass
 class ChangeLogEntry:
     kind: str               # role|channel|overwrites|roles_reorder|lockdown
     op: str                 # create|update|reorder|set
     payload: Dict[str, Any]
-
 
 # ---------- basic safe reply ----------
 async def _ireply(inter: discord.Interaction, content: Optional[str] = None,
@@ -147,13 +164,12 @@ async def _ireply(inter: discord.Interaction, content: Optional[str] = None,
     except Exception:
         pass
 
-
 # ---------- the cog ----------
 class RevampSync(commands.Cog):
     """
     Control panel to mirror (sync) from the current (source) guild into a target guild,
-    preserving target overwrites and only creating/updating what's needed.
-    Non-destructive. Fail-fast with auto-rollback.
+    non-destructively, creating/updating what's needed, and **always mirroring role overwrites**.
+    Fail-fast with auto-rollback.
     """
 
     def __init__(self, bot: commands.Bot):
@@ -198,7 +214,7 @@ class RevampSync(commands.Cog):
             except Exception: pass
 
         emb.add_field(name="Mode", value="`SYNC` (non-destructive)", inline=True)
-        emb.add_field(name="Overwrites", value="`Preserve`", inline=True)
+        emb.add_field(name="Overwrites", value="`Mirror (roles)`", inline=True)
         emb.add_field(name="Lockdown", value=("`Yes`" if p.lockdown else "`No`"), inline=True)
         emb.add_field(name="Threads", value=("`Yes`" if p.sync_threads else "`No`"), inline=True)
 
@@ -207,7 +223,7 @@ class RevampSync(commands.Cog):
 
         bullets = [
             "Mirror **roles** and **categories/channels** from Source.",
-            "**Preserve** target channel permissions (no overwrite edits).",
+            "**Mirror role overwrites** to target channels (member/role perms via role targets).",
             "No deletes; target-only items remain.",
         ]
         if CATEGORY_SCOPE:
@@ -277,7 +293,7 @@ class RevampSync(commands.Cog):
             lockdown=False,
             sync_threads=False,
             mode="sync",
-            mirror_overwrites=False,
+            mirror_overwrites=True,   # always mirror
             auto_rollback=True,
         )
         self.pending[plan.key] = plan
@@ -307,7 +323,7 @@ class RevampSync(commands.Cog):
         key = f"{source.id}:{target.id}:{int(time.time())}"
         plan = Plan(key, source, target, requested_by, include_deletes=False,
                     lockdown=lockdown, sync_threads=sync_threads,
-                    mode="sync", mirror_overwrites=False, auto_rollback=True)
+                    mode="sync", mirror_overwrites=True, auto_rollback=True)
 
         # roles
         src_roles = {r.id: r for r in (await source.fetch_roles())}
@@ -317,9 +333,6 @@ class RevampSync(commands.Cog):
         for r in sorted(src_roles.values(), key=lambda x: x.position):
             if r.id == source.default_role.id or r.managed:
                 continue
-            if CATEGORY_SCOPE:
-                # roles are global; if scoping, still sync roles because channels may rely on them
-                pass
             t = tgt_by_name.get(_norm(r.name))
             if not t:
                 plan.role_actions.append(RoleAction("create", r.name, data=_strip_role(r)))
@@ -353,7 +366,6 @@ class RevampSync(commands.Cog):
         tgt_non = [c for c in tgt_all if not isinstance(c, discord.CategoryChannel)]
         tgt_by_key = {key_of(c): c for c in tgt_non}
         src_non = [c for c in src_all if not isinstance(c, discord.CategoryChannel)]
-        # scope filter for non-category channels
         src_non = [c for c in src_non if self._in_scope(c)]
 
         for s in sorted(src_non, key=lambda c: c.position):
@@ -555,7 +567,7 @@ class RevampSync(commands.Cog):
                         self._push_recent(p, f"Cat ↕ {ex.name}")
                         await progress("Categories")
 
-            # create/update non-category channels + diffs (preserve overwrites)
+            # create/update non-category channels + diffs
             src_non = [c for c in await s.fetch_channels() if not isinstance(c, discord.CategoryChannel)]
             src_non = [c for c in src_non if self._in_scope(c)]
             tgt_non = [c for c in await t.fetch_channels() if not isinstance(c, discord.CategoryChannel)]
@@ -637,6 +649,21 @@ class RevampSync(commands.Cog):
                     p.chan_id_map[src_ch.id] = ex.id
                     created_map[src_ch.id] = ex
 
+            # overwrites (roles only) — ALWAYS mirror
+            role_map_full: Dict[int, discord.Role] = {sid: t.get_role(tid) for sid, tid in p.role_id_map.items() if t.get_role(tid)}
+            for src_ch in src_non:
+                tgt_ch = created_map.get(src_ch.id)
+                if not tgt_ch:
+                    continue
+                desired = _diff_overwrites_roles(src_ch.overwrites, tgt_ch.overwrites, role_map_full)
+                if desired is not None:
+                    pre_ov = await self._snapshot_role_overwrites(tgt_ch)
+                    await do(tgt_ch.edit(overwrites=desired, reason="Revamp sync: mirror role overwrites"), f"Set overwrites #{tgt_ch.name}")
+                    changelog.append(ChangeLogEntry("overwrites", "set", {"channel_id": tgt_ch.id, "pre": pre_ov}))
+                    results["chan_update"] += 1
+                    self._push_recent(p, f"Perms ↷ #{tgt_ch.name}")
+                    await progress("Permissions")
+
             # threads (optional, default off)
             if p.sync_threads:
                 await self._sync_threads(p, src_non, created_map)
@@ -650,7 +677,7 @@ class RevampSync(commands.Cog):
             # done
             final = discord.Embed(title="✅ Revamp — Completed", color=discord.Color.green())
             final.add_field(name="Mode", value=p.mode.upper(), inline=True)
-            final.add_field(name="Overwrites", value="Preserve", inline=True)
+            final.add_field(name="Overwrites", value="Mirror (roles)", inline=True)
             final.add_field(name="👤 Roles", value=f"C **{results['role_create']}** • U **{results['role_update']}**", inline=False)
             final.add_field(name="📺 Channels", value=f"C **{results['chan_create']}** • U **{results['chan_update']}**", inline=False)
             if p.warnings:
@@ -669,7 +696,7 @@ class RevampSync(commands.Cog):
             except Exception as re:
                 p.warnings.append(f"Auto-rollback also failed: {re}")
             err = discord.Embed(title="❌ Revamp — Failed", color=discord.Color.red())
-            err.add_field(name="Error", value=f"```{e}```", inline=False)
+            err.add_field(name="Error", value=f"```\n{e}\n```", inline=False)
             err.add_field(name="Auto-Rollback", value=("Completed." if rollback_embed else "Attempted but failed — see Notes."), inline=False)
             if p.warnings:
                 preview = "\n".join(f"• {w}" for w in p.warnings[:8])
@@ -715,7 +742,6 @@ class RevampSync(commands.Cog):
                             await self._restore_channel_partial(ch, pre); restored["channel"] += 1
 
                 elif entry.kind == "overwrites" and entry.op == "set":
-                    # not used in sync mode (we preserve), but keep for safety
                     ch = target.get_channel(entry.payload["channel_id"])
                     pre = entry.payload["pre"]
                     if ch:
@@ -952,7 +978,6 @@ class RevampSync(commands.Cog):
                     p.warnings.append(f"Failed moving role {role.name}: {e}")
             pos += 1
 
-
 # ---------- UI view & components ----------
 class ControlView(ui.View):
     def __init__(self, cog: "RevampSync", plan_key: str, timeout: float = 900):
@@ -983,6 +1008,7 @@ class ControlView(ui.View):
 
         full = await self.cog._build_plan(plan.source, plan.target, inter.user, plan.lockdown, plan.sync_threads)
         full.auto_rollback = True
+        full.mirror_overwrites = True
         full.control_msg = plan.control_msg
         self.cog.pending[self.plan_key] = full
 
@@ -1025,7 +1051,6 @@ class ControlView(ui.View):
             pass
         await _ireply(inter, embed=emb, ephemeral=True)
 
-
 class TargetSelect(ui.Select):
     def __init__(self, cog: "RevampSync", plan_key: str):
         self.cog = cog; self.plan_key = plan_key
@@ -1055,7 +1080,6 @@ class TargetSelect(ui.Select):
             pass
         await _ireply(inter, f"Target set to **{tgt.name}**.", ephemeral=True)
 
-
 class ToggleLockdown(ui.Button):
     def __init__(self, cog: "RevampSync", plan_key: str):
         self.cog = cog; self.plan_key = plan_key
@@ -1072,7 +1096,6 @@ class ToggleLockdown(ui.Button):
             pass
         await _ireply(inter, f"Lockdown set to **{'On' if plan.lockdown else 'Off'}**.", ephemeral=True)
 
-
 class ToggleThreads(ui.Button):
     def __init__(self, cog: "RevampSync", plan_key: str):
         self.cog = cog; self.plan_key = plan_key
@@ -1088,7 +1111,6 @@ class ToggleThreads(ui.Button):
         except Exception:
             pass
         await _ireply(inter, f"Threads set to **{'On' if plan.sync_threads else 'Off'}**.", ephemeral=True)
-
 
 class ConfirmApplyView(ui.View):
     def __init__(self, cog: "RevampSync", plan_key: str, timeout: float = 900):
