@@ -1,9 +1,13 @@
 from __future__ import annotations
-import logging, traceback
-from typing import Any, Dict, Optional
+
+import logging
+import traceback
+from typing import Any, Dict, Optional, Sequence
 
 import discord
 from redbot.core import commands, checks, Config
+
+from discord.utils import escape_markdown
 
 from .embeds import build_embed
 from .ui import SetupView
@@ -86,6 +90,79 @@ def _diff_dict(old: dict, new: dict, keys: list[str]):
     return changes
 
 
+def _human_size(size: int | None) -> str | None:
+    if size is None:
+        return None
+    step = 1024.0
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    for unit in units:
+        if value < step or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)}{unit}"
+            return f"{value:.1f}{unit}"
+        value /= step
+    return None
+
+
+def _format_attachments(attachments: Sequence[discord.Attachment] | None) -> str | None:
+    if not attachments:
+        return None
+    lines: list[str] = []
+    for idx, attachment in enumerate(attachments, start=1):
+        name = escape_markdown(getattr(attachment, "filename", "attachment"))
+        size = _human_size(getattr(attachment, "size", None))
+        display = name
+        if size:
+            display = f"{display} ({size})"
+        url = getattr(attachment, "url", None)
+        if url:
+            display = f"[{display}]({url})"
+        lines.append(f"{idx}. {display}")
+    return "\n".join(lines) if lines else None
+
+
+def _embed_to_plaintext(embed: discord.Embed, *, fallback: str) -> str:
+    """Convert an embed into a plain text representation (for non-embed channels)."""
+
+    def _is_value(value: Any) -> bool:
+        return value not in (None, discord.Embed.Empty)
+
+    parts: list[str] = []
+
+    author = getattr(embed, "author", None)
+    author_name = getattr(author, "name", None)
+    if _is_value(author_name):
+        parts.append(str(author_name))
+
+    if _is_value(embed.title):
+        parts.append(str(embed.title))
+    if _is_value(embed.description):
+        parts.append(str(embed.description))
+
+    for field in embed.fields:
+        name = (field.name or "").strip()
+        value = (field.value or "").strip()
+        if name and value:
+            parts.append(f"{name}:\n{value}")
+        elif value:
+            parts.append(value)
+        elif name:
+            parts.append(name)
+
+    footer = getattr(embed, "footer", None)
+    footer_text = getattr(footer, "text", None)
+    if _is_value(footer_text):
+        parts.append(str(footer_text))
+
+    text = "\n\n".join(part for part in parts if part).strip()
+    if not text:
+        text = fallback
+    if len(text) > 2000:
+        text = text[:1997] + "..."
+    return text
+
+
 class ModLogV2(commands.Cog):
     """Modern moderation logging with a one-command UI, AutoMod support, and Red Config-backed storage."""
 
@@ -95,6 +172,8 @@ class ModLogV2(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=CONF_IDENT, force_registration=True)
+
+        self._automod_listener_registered = False
 
         # Defaults
         default_global = {"event_counter": 0}  # global monotonic id for custom-group rows
@@ -114,9 +193,19 @@ class ModLogV2(commands.Cog):
         # AutoMod action execution (discord.py 2.6.2 exposes this)
         try:
             self.bot.add_listener(self._on_automod_action_execution, "on_automod_action_execution")
+            self._automod_listener_registered = True
             log.info("Registered on_automod_action_execution.")
         except Exception:
             log.debug("AutoMod action exec not available:\n%s", traceback.format_exc())
+
+    def cog_unload(self):
+        if self._automod_listener_registered:
+            try:
+                self.bot.remove_listener(self._on_automod_action_execution, "on_automod_action_execution")
+            except Exception:
+                log.debug("Failed to remove AutoMod listener:\n%s", traceback.format_exc())
+            finally:
+                self._automod_listener_registered = False
 
     # ---------------- Public Commands ----------------
     @commands.group(name="modlog", invoke_without_command=True)
@@ -180,13 +269,26 @@ class ModLogV2(commands.Cog):
         preferred_id = settings.get("log_channel_id")
         dest = await self._resolve_log_channel(guild, preferred_id)
 
+        send_kwargs: Dict[str, Any] = {}
+        use_embed = bool(embed) and (force_embed or settings["use_embeds"])
+
+        if content:
+            send_kwargs["content"] = content
+
+        if embed is not None and use_embed:
+            send_kwargs["embed"] = embed
+
+        if not send_kwargs:
+            if embed is not None:
+                fallback = f"{event.replace('_', ' ').title()}"
+                send_kwargs["content"] = _embed_to_plaintext(embed, fallback=fallback)
+            else:
+                send_kwargs["content"] = f"{event.replace('_', ' ').title()}"
+
         # Post to channel (embed preferred/forced)
         if dest:
             try:
-                if force_embed and embed is not None:
-                    await dest.send(embed=embed)
-                else:
-                    await dest.send(content=content, embed=(embed if settings["use_embeds"] else None))
+                await dest.send(**send_kwargs)
             except discord.Forbidden:
                 # If preferred channel failed, try a fallback and warn
                 alt = await self._resolve_log_channel(guild, None)
@@ -202,10 +304,10 @@ class ModLogV2(commands.Cog):
                             ),
                         )
                         await alt.send(embed=warn)
-                        if force_embed and embed is not None:
+                        if force_embed and embed is not None and "embed" not in send_kwargs:
                             await alt.send(embed=embed)
                         else:
-                            await alt.send(content=content, embed=(embed if settings["use_embeds"] else None))
+                            await alt.send(**send_kwargs)
                     except Exception:
                         log.exception("Fallback channel also failed")
                 else:
@@ -231,6 +333,20 @@ class ModLogV2(commands.Cog):
         events = (await self._get_settings(message.guild.id))["events"]
         if not events.get("message_create", False):
             return
+        channel_field = getattr(message.channel, "mention", f"<#{message.channel.id}>")
+        fields = [("Channel", channel_field, True), ("Message ID", f"`{message.id}`", True)]
+        attachment_text = _format_attachments(message.attachments)
+        if attachment_text:
+            fields.append(("Attachments", attachment_text, False))
+        emb = build_embed(
+            guild=message.guild,
+            event="message_create",
+            title="Message sent",
+            description=(message.content or "*no content*")[:4000],
+            author=message.author,
+            jump_url=message.jump_url,
+            fields=fields,
+        )
         payload = {
             "channel_id": message.channel.id,
             "author": _u(message.author),
@@ -239,7 +355,7 @@ class ModLogV2(commands.Cog):
             "attachments": [a.to_dict() for a in message.attachments],
             "embeds": [e.to_dict() for e in message.embeds] if message.embeds else [],
         }
-        await self._send_and_store(message.guild, "message_create", payload=payload)
+        await self._send_and_store(message.guild, "message_create", embed=emb, payload=payload, force_embed=True)
 
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
@@ -248,17 +364,25 @@ class ModLogV2(commands.Cog):
         events = (await self._get_settings(after.guild.id))["events"]
         if not events.get("message_edit", True) or before.content == after.content:
             return
+        channel_field = getattr(after.channel, "mention", f"<#{getattr(after.channel, 'id', '?')}>")
+        fields = [("Channel", channel_field, True), ("Message ID", f"`{after.id}`", True)]
+        attachment_text = _format_attachments(after.attachments)
+        if attachment_text:
+            fields.append(("Attachments", attachment_text, False))
         emb = build_embed(
             guild=after.guild, event="message_edit", title="Message edited",
             author=after.author,
             description=f"**Before**\n{(before.content or '*none*')[:1024]}\n\n**After**\n{(after.content or '*none*')[:3000]}",
             jump_url=after.jump_url,
+            fields=fields,
         )
         payload = {
             "channel_id": getattr(after.channel, "id", None),
             "author_id": getattr(after.author, "id", None),
             "before": before.content, "after": after.content,
             "message_id": after.id,
+            "attachments_before": [a.to_dict() for a in getattr(before, "attachments", [])],
+            "attachments_after": [a.to_dict() for a in after.attachments],
         }
         # Force embed for visibility
         await self._send_and_store(after.guild, "message_edit", embed=emb, payload=payload, force_embed=True)
@@ -271,15 +395,26 @@ class ModLogV2(commands.Cog):
         events = (await self._get_settings(message.guild.id))["events"]
         if not events.get("message_delete", True):
             return
+        channel_field = getattr(message.channel, "mention", f"<#{getattr(message.channel, 'id', '?')}>")
+        fields = [("Channel", channel_field, True), ("Message ID", f"`{message.id}`", True)]
+        attachment_text = _format_attachments(message.attachments)
+        if attachment_text:
+            fields.append(("Attachments", attachment_text, False))
         emb = build_embed(
-            guild=message.guild, event="message_delete", title="Message deleted",
-            author=message.author, description=(message.content or "*no content*")[:4000]
+            guild=message.guild,
+            event="message_delete",
+            title="Message deleted",
+            author=message.author,
+            description=(message.content or "*no content*")[:4000],
+            jump_url=message.jump_url,
+            fields=fields,
         )
         payload = {
             "channel_id": getattr(message.channel, "id", None),
             "author_id": getattr(message.author, "id", None),
             "content": message.content,
             "attachments": [a.to_dict() for a in message.attachments],
+            "embeds": [e.to_dict() for e in message.embeds] if message.embeds else [],
             "message_id": message.id,
             "cached": True,
         }
@@ -325,6 +460,20 @@ class ModLogV2(commands.Cog):
         author = getattr(cached, "author", None)
         content = getattr(cached, "content", None)
 
+        channel_text = None
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            channel_text = channel.mention
+        elif channel is not None:
+            channel_text = f"{getattr(channel, 'name', 'Unknown')} (`{channel.id}`)"
+        else:
+            channel_text = f"<#{payload.channel_id}>"
+        fields = [
+            ("Channel", channel_text, True),
+            ("Message ID", f"`{payload.message_id}`", True),
+        ]
+        attachment_text = _format_attachments(getattr(cached, "attachments", None))
+        if attachment_text:
+            fields.append(("Attachments", attachment_text, False))
         emb = build_embed(
             guild=guild,
             event="message_delete",
@@ -332,10 +481,7 @@ class ModLogV2(commands.Cog):
             description=(content or "*content unknown (not cached)*")[:4000],
             author=author,
             jump_url=getattr(cached, "jump_url", None),
-            fields=[
-                ("Message ID", f"`{payload.message_id}`", True),
-                ("Channel", channel.mention if isinstance(channel, discord.TextChannel) else f"<#{payload.channel_id}>", True),
-            ],
+            fields=fields,
         )
 
         pl = {
@@ -344,6 +490,7 @@ class ModLogV2(commands.Cog):
             "author_id": getattr(author, "id", None),
             "cached": bool(cached),
             "content": content,
+            "attachments": [a.to_dict() for a in getattr(cached, "attachments", [])],
         }
         await self._send_and_store(guild, "message_delete", embed=emb, payload=pl, force_embed=True)
 

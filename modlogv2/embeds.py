@@ -1,6 +1,7 @@
 import discord
 
 COLOURS = {
+    "message_create": discord.Colour.blurple(),
     "message_delete": discord.Colour.red(),
     "message_edit": discord.Colour.orange(),
     "message_bulk_delete": discord.Colour.dark_orange(),
