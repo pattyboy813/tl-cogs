@@ -329,7 +329,7 @@ class ModLogX(commands.Cog):
         desc = (
             f"**Action**: {c['action']}\n"
             f"**Target**: <@{c['target_id']}> (`{c['target_id']}`)\n"
-            f"**Moderator**: {(f'<@{c['mod_id']}>' if c.get('mod_id') else 'Unknown')}\n"
+            f"**Moderator**: {(f'<@{c["mod_id"]}>' if c.get('mod_id') else 'Unknown')}\n"
             f"**Reason**: {c.get('reason') or '*none*'}\n"
             f"**When**: {c.get('created_at')}"
         )
