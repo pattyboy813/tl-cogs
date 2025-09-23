@@ -224,7 +224,7 @@ class Counting(commands.Cog):
         else:
             leaderboard = "—"
         fields = [
-            ("New Record!", f"Reached **{record}**", False),
+            ("New F*cking Record!", f"Reached **{record}**", False),
             ("Top Contributors (this run)", leaderboard, False),
         ]
         embed = _make_embed(
