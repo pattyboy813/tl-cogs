@@ -324,12 +324,13 @@ class ModLogX(commands.Cog):
     async def case(self, ctx: commands.Context, case_id: int):
         """Show a case."""
         c = await self.config.guild(ctx.guild).cases.get_raw(str(case_id), default=None)
+        mod_str = f"<@{c['mod_id']}>" if c.get('mod_id') else 'Unknown'
         if not c:
             return await ctx.send("Case not found.")
         desc = (
             f"**Action**: {c['action']}\n"
             f"**Target**: <@{c['target_id']}> (`{c['target_id']}`)\n"
-            f"**Moderator**: {(f"<@{c['mod_id']}>" if c.get('mod_id') else 'Unknown')}\n"
+            f"**Moderator**: {mod_str}\n"
             f"**Reason**: {c.get('reason') or '*none*'}\n"
             f"**When**: {c.get('created_at')}"
         )
