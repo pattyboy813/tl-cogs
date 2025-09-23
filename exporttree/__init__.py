@@ -1,1 +1,0 @@
-from .channeltree import setup
