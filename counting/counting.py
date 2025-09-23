@@ -106,7 +106,7 @@ def _make_embed(
 class Counting(commands.Cog):
     """Cooperative counting game — with embeds, gifs, and fun language (no payouts)."""
 
-    __author__ = "Legend Gaming | Generaleoley (fun-ified by Pat+GPT)"
+    __author__ = "BigPattyOG | Concept by Gen"
     __version__ = "3.0.0"
 
     def __init__(self, bot: commands.Bot):
