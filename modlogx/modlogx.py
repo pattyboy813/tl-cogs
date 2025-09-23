@@ -118,37 +118,170 @@ def _role_diff(before_roles: List[discord.Role], after_roles: List[discord.Role]
 def _role_mentions(roles: List[discord.Role]) -> str:
     return ", ".join(r.mention for r in roles) if roles else "*none*"
 
-@dataclass
-class Case:
-    id: int
-    action: str
-    target_id: int
-    target_name: str
-    mod_id: Optional[int]
-    mod_name: Optional[str]
-    reason: Optional[str]
-    duration: Optional[int]  # seconds
-    created_at: str
+def _bool_emoji(v: bool) -> str:
+    return "🟢" if v else "⚪"
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "action": self.action,
-            "target_id": self.target_id,
-            "target_name": self.target_name,
-            "mod_id": self.mod_id,
-            "mod_name": self.mod_name,
-            "reason": self.reason,
-            "duration": self.duration,
-            "created_at": self.created_at,
+def _identity_label(mode: str) -> str:
+    return "Bot identity" if mode == "bot" else "Per-event identity"
+
+# ------------------ Setup View (UI) ------------------
+class SetupView(discord.ui.View):
+    def __init__(self, cog: "ModLogX", guild: discord.Guild, *, timeout: int = 300):
+        super().__init__(timeout=timeout)
+        self.cog = cog
+        self.guild = guild
+        self.state: Dict[str, Any] = {}
+        self.message: Optional[discord.Message] = None
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            with contextlib.suppress(Exception):
+                await self.message.edit(view=self)
+
+    async def on_start(self, ctx: commands.Context):
+        d = await self.cog._gdata(self.guild)
+        # Try to infer a channel id from existing webhook by asking user to re-pick; we keep state simple.
+        self.state = {
+            "enabled": d["enabled"],
+            "use_embeds": d["use_embeds"],
+            "webhook_identity": d.get("webhook_identity", "bot"),
+            "webhook_url": d.get("webhook_url"),
+            "channel_id": None,
         }
+
+        self.clear_items()
+        # Row 1: Channel select
+        self.add_item(_ChannelSelect(self))
+        # Row 2: Toggles
+        self.add_item(_ToggleEnabled(self))
+        self.add_item(_ToggleEmbeds(self))
+        self.add_item(_ToggleIdentity(self))
+        # Row 3: Actions
+        self.add_item(_CreateWebhook(self))
+        self.add_item(_TestLog(self))
+        self.add_item(_Save(self))
+        self.add_item(_Close(self))
+
+        embed = self.cog._build_setup_embed(self.guild, self.state)
+        self.message = await ctx.send(embed=embed, view=self)
+
+    async def refresh(self):
+        if self.message:
+            embed = self.cog._build_setup_embed(self.guild, self.state)
+            with contextlib.suppress(Exception):
+                await self.message.edit(embed=embed, view=self)
+
+class _ChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, view: SetupView):
+        self._view = view
+        super().__init__(channel_types=[discord.ChannelType.text], min_values=0, max_values=1, placeholder="Select a log channel…")
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values:
+            ch: discord.TextChannel = self.values[0]  # type: ignore
+            self._view.state["channel_id"] = ch.id
+        else:
+            self._view.state["channel_id"] = None
+        await interaction.response.edit_message(embed=self._view.cog._build_setup_embed(self._view.guild, self._view.state), view=self._view)
+
+class _ToggleEnabled(discord.ui.Button):
+    def __init__(self, view: SetupView):
+        self._view = view
+        super().__init__(style=discord.ButtonStyle.secondary, label="Enable/Disable")
+
+    async def callback(self, interaction: discord.Interaction):
+        self._view.state["enabled"] = not self._view.state["enabled"]
+        await interaction.response.edit_message(embed=self._view.cog._build_setup_embed(self._view.guild, self._view.state), view=self._view)
+
+class _ToggleEmbeds(discord.ui.Button):
+    def __init__(self, view: SetupView):
+        self._view = view
+        super().__init__(style=discord.ButtonStyle.secondary, label="Toggle Embeds")
+
+    async def callback(self, interaction: discord.Interaction):
+        self._view.state["use_embeds"] = not self._view.state["use_embeds"]
+        await interaction.response.edit_message(embed=self._view.cog._build_setup_embed(self._view.guild, self._view.state), view=self._view)
+
+class _ToggleIdentity(discord.ui.Button):
+    def __init__(self, view: SetupView):
+        self._view = view
+        super().__init__(style=discord.ButtonStyle.secondary, label="Identity: bot/event")
+
+    async def callback(self, interaction: discord.Interaction):
+        cur = self._view.state.get("webhook_identity", "bot")
+        self._view.state["webhook_identity"] = "event" if cur == "bot" else "bot"
+        await interaction.response.edit_message(embed=self._view.cog._build_setup_embed(self._view.guild, self._view.state), view=self._view)
+
+class _CreateWebhook(discord.ui.Button):
+    def __init__(self, view: SetupView):
+        self._view = view
+        super().__init__(style=discord.ButtonStyle.primary, label="Create/Refresh Webhook")
+
+    async def callback(self, interaction: discord.Interaction):
+        ch_id = self._view.state.get("channel_id")
+        if not ch_id:
+            return await interaction.response.send_message("Pick a channel first.", ephemeral=True)
+        ch = interaction.client.get_channel(ch_id)  # type: ignore
+        if not isinstance(ch, discord.TextChannel):
+            return await interaction.response.send_message("Channel must be a text channel.", ephemeral=True)
+
+        try:
+            wh = await ch.create_webhook(name="ModLogX")
+        except discord.Forbidden:
+            return await interaction.response.send_message("I need **Manage Webhooks** in that channel.", ephemeral=True)
+        except Exception as e:
+            return await interaction.response.send_message(f"Couldn’t create webhook: `{e}`", ephemeral=True)
+
+        self._view.state["webhook_url"] = wh.url
+        await interaction.response.edit_message(embed=self._view.cog._build_setup_embed(self._view.guild, self._view.state), view=self._view)
+
+class _TestLog(discord.ui.Button):
+    def __init__(self, view: SetupView):
+        self._view = view
+        super().__init__(style=discord.ButtonStyle.success, label="Send Test")
+
+    async def callback(self, interaction: discord.Interaction):
+        if not self._view.state.get("webhook_url"):
+            return await interaction.response.send_message("Webhook isn’t set yet.", ephemeral=True)
+        await self._view.cog._send_embed(
+            self._view.guild,
+            event_key="default",
+            title="Test Log",
+            description="If you see this, your webhook works.",
+        )
+        await interaction.response.send_message("Sent a test log to the configured webhook.", ephemeral=True)
+
+class _Save(discord.ui.Button):
+    def __init__(self, view: SetupView):
+        self._view = view
+        super().__init__(style=discord.ButtonStyle.primary, label="Save")
+
+    async def callback(self, interaction: discord.Interaction):
+        await self._view.cog.config.guild(self._view.guild).enabled.set(bool(self._view.state["enabled"]))
+        await self._view.cog.config.guild(self._view.guild).use_embeds.set(bool(self._view.state["use_embeds"]))
+        await self._view.cog.config.guild(self._view.guild).webhook_identity.set(self._view.state.get("webhook_identity", "bot"))
+        await self._view.cog.config.guild(self._view.guild).webhook_url.set(self._view.state.get("webhook_url"))
+        await interaction.response.send_message("Saved.", ephemeral=True)
+        await self._view.refresh()
+
+class _Close(discord.ui.Button):
+    def __init__(self, view: SetupView):
+        self._view = view
+        super().__init__(style=discord.ButtonStyle.danger, label="Close")
+
+    async def callback(self, interaction: discord.Interaction):
+        for item in self._view.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self._view)
 
 # ------------------ Cog ------------------
 class ModLogX(commands.Cog):
     """Modlog with webhook output, detailed embeds, cases, and audit correlation."""
 
     __author__ = "you"
-    __version__ = "3.2.0"
+    __version__ = "3.3.0"
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -166,6 +299,23 @@ class ModLogX(commands.Cog):
 
     async def _cat(self, guild: discord.Guild, name: str) -> Any:
         return (await self._gdata(guild))["categories"].get(name)
+
+    # ---------- Setup UI embed ----------
+    def _build_setup_embed(self, guild: discord.Guild, state: Dict[str, Any]) -> discord.Embed:
+        ch_mention = f"<#{state.get('channel_id')}>" if state.get("channel_id") else "*not set*"
+        wh_state = "configured" if state.get("webhook_url") else "not set"
+        e = discord.Embed(
+            title="ModLogX • Setup",
+            description="Configure where logs go and how they look.",
+            color=discord.Color.blurple(),
+        )
+        e.add_field(name="Enabled", value=f"{_bool_emoji(state['enabled'])} `{state['enabled']}`", inline=True)
+        e.add_field(name="Embeds", value=f"{_bool_emoji(state['use_embeds'])} `{state['use_embeds']}`", inline=True)
+        e.add_field(name="Identity", value=f"`{state['webhook_identity']}`", inline=True)
+        e.add_field(name="Log channel", value=ch_mention, inline=True)
+        e.add_field(name="Webhook", value=wh_state, inline=True)
+        e.set_footer(text=f"{guild.name} • v{self.__version__}")
+        return e
 
     # ---------- Webhook send ----------
     async def _send_embed(
@@ -221,6 +371,18 @@ class ModLogX(commands.Cog):
             pass
 
     # ---------- Cases ----------
+    @dataclass
+    class Case:
+        id: int
+        action: str
+        target_id: int
+        target_name: str
+        mod_id: Optional[int]
+        mod_name: Optional[str]
+        reason: Optional[str]
+        duration: Optional[int]
+        created_at: str
+
     async def _new_case(
         self,
         guild: discord.Guild,
@@ -234,18 +396,18 @@ class ModLogX(commands.Cog):
         async with self.config.guild(guild).case_counter.get_lock():
             cid = await self.config.guild(guild).case_counter()
             await self.config.guild(guild).case_counter.set(cid + 1)
-        case = Case(
-            id=cid,
-            action=action,
-            target_id=target.id,
-            target_name=str(target),
-            mod_id=getattr(moderator, "id", None),
-            mod_name=str(moderator) if moderator else None,
-            reason=reason,
-            duration=duration,
-            created_at=now_utc().isoformat(),
-        )
-        await self.config.guild(guild).cases.set_raw(str(cid), value=case.to_dict())
+        case = {
+            "id": cid,
+            "action": action,
+            "target_id": target.id,
+            "target_name": str(target),
+            "mod_id": getattr(moderator, "id", None),
+            "mod_name": str(moderator) if moderator else None,
+            "reason": reason,
+            "duration": duration,
+            "created_at": now_utc().isoformat(),
+        }
+        await self.config.guild(guild).cases.set_raw(str(cid), value=case)
 
         if await self._cat(guild, "moderation_cases"):
             desc = (
@@ -258,7 +420,7 @@ class ModLogX(commands.Cog):
             if duration:
                 extra.append(("Duration", f"{duration}s", True))
             await self._send_embed(guild, event_key="default", title=f"Case {cid} • {action.title()}", description=desc, fields=extra)
-        return case
+        return self.Case(**case)  # type: ignore[arg-type]
 
     # ---------- Audit helpers ----------
     async def _who_deleted_message(self, guild: discord.Guild, message: discord.Message) -> Optional[discord.User]:
@@ -284,20 +446,16 @@ class ModLogX(commands.Cog):
         await ctx.send(
             f"**ModLogX** v{self.__version__}\n"
             f"Enabled: `{d['enabled']}` • Embeds: `{d['use_embeds']}` • Identity: `{d.get('webhook_identity','bot')}` • Destination: `{dest}`\n"
-            f"Use `[p]modlogx setup #channel` to set the webhook.\n"
+            f"Run `[p]modlogx setup` to open the interactive setup.\n"
             f"Toggles: `[p]modlogx enable on/off`, `[p]modlogx embeds on/off`, `[p]modlogx identity bot|event`, "
             f"Sub-events: `[p]modlogx sub <category> <event> <on/off>`"
         )
 
     @group.command()
-    async def setup(self, ctx: commands.Context, channel: discord.TextChannel):
-        """Create or refresh the log webhook in a channel."""
-        try:
-            wh = await channel.create_webhook(name="ModLogX")
-        except discord.Forbidden:
-            return await ctx.send("❌ I need **Manage Webhooks** in that channel.")
-        await self.config.guild(ctx.guild).webhook_url.set(wh.url)
-        await ctx.send(f"✅ Webhook set for {channel.mention}. You're ready!")
+    async def setup(self, ctx: commands.Context):
+        """Open the interactive setup."""
+        view = SetupView(self, ctx.guild)
+        await view.on_start(ctx)
 
     @group.command()
     async def enable(self, ctx: commands.Context, state: Optional[bool] = None):
@@ -987,4 +1145,5 @@ class ModLogX(commands.Cog):
     def cog_unload(self):
         with contextlib.suppress(Exception):
             self.bot.remove_listener(self._on_automod_action_execution, "on_automod_action_execution")
+
 
