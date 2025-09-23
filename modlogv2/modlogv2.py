@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 
 import discord
 from redbot.core import commands, checks, Config
+
 from .embeds import build_embed
 from .ui import SetupView
 
@@ -52,6 +53,7 @@ DEFAULT_EVENTS = {
     "automod_action_execution": True,   # gateway event (if surfaced)
 }
 
+# ----- compact serializers / diff helpers -----
 def _u(user: discord.abc.User | None):
     return {"id": user.id, "name": str(user), "bot": bool(getattr(user, "bot", False))} if user else None
 
@@ -83,20 +85,19 @@ def _diff_dict(old: dict, new: dict, keys: list[str]):
             changes.append({"field": k, "before": old.get(k), "after": new.get(k)})
     return changes
 
+
 class ModLogV2(commands.Cog):
     """Modern moderation logging with a one-command UI, AutoMod support, and Red Config-backed storage."""
 
     __author__ = "you"
-    __version__ = "2.1.0"
+    __version__ = "2.2.0"
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=CONF_IDENT, force_registration=True)
 
         # Defaults
-        default_global = {
-            "event_counter": 0,  # monotonically increasing id for custom-group keys
-        }
+        default_global = {"event_counter": 0}  # global monotonic id for custom-group rows
         default_guild = {
             "enabled": True,
             "log_channel_id": None,
@@ -107,18 +108,17 @@ class ModLogV2(commands.Cog):
         self.config.register_global(**default_global)
         self.config.register_guild(**default_guild)
 
-        # Initialize a custom group for events: primary key = (guild_id, event_id)
-        # We store each row under: self.config.custom("event", guild_id, event_id)
-        self.config.init_custom("event", 2)  # 2-key primary (guild_id, event_id)
+        # Custom group for events: key = (guild_id, event_id)
+        self.config.init_custom("event", 2)
 
-        # Try to register AutoMod action execution if d.py exposes it
+        # AutoMod action execution (discord.py 2.6.2 exposes this)
         try:
             self.bot.add_listener(self._on_automod_action_execution, "on_automod_action_execution")
-            log.info("Registered on_automod_action_execution (if supported by discord.py 2.6.2).")
+            log.info("Registered on_automod_action_execution.")
         except Exception:
             log.debug("AutoMod action exec not available:\n%s", traceback.format_exc())
 
-    # --------------- Commands ---------------
+    # ---------------- Public Commands ----------------
     @commands.group(name="modlog", invoke_without_command=True)
     @commands.guild_only()
     @checks.admin_or_permissions(manage_guild=True)
@@ -133,9 +133,8 @@ class ModLogV2(commands.Cog):
             view=SetupView(self, ctx.guild),
         )
 
-    # --------------- Internals ---------------
+    # ---------------- Internals ----------------
     async def _get_settings(self, guild_id: int) -> Dict[str, Any]:
-        # Merge-on-read to pick up new keys
         current = await self.config.guild_from_id(guild_id).all()
         merged = {
             "enabled": current.get("enabled", True),
@@ -148,32 +147,83 @@ class ModLogV2(commands.Cog):
     async def _save_settings(self, guild_id: int, data: Dict[str, Any]):
         await self.config.guild_from_id(guild_id).set(data)
 
-    async def _send_and_store(self, guild: discord.Guild, event: str, *,
-                              embed: Optional[discord.Embed] = None,
-                              content: Optional[str] = None,
-                              payload: Optional[Dict[str, Any]] = None):
+    async def _resolve_log_channel(self, guild: discord.Guild, preferred_id: int | None) -> discord.TextChannel | None:
+        """Return a channel we can actually send to. Prefer configured; else fall back to first viable."""
+        # Preferred first
+        if preferred_id:
+            ch = guild.get_channel(preferred_id)
+            if isinstance(ch, discord.TextChannel):
+                perms = ch.permissions_for(guild.me)
+                if perms.send_messages and perms.embed_links:
+                    return ch
+        # Fallback
+        for ch in guild.text_channels:
+            perms = ch.permissions_for(guild.me)
+            if perms.send_messages and perms.embed_links:
+                return ch
+        return None
+
+    async def _send_and_store(
+        self,
+        guild: discord.Guild,
+        event: str,
+        *,
+        embed: Optional[discord.Embed] = None,
+        content: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        force_embed: bool = False,  # set True at callsite for critical events
+    ):
         settings = await self._get_settings(guild.id)
         if not settings["enabled"]:
             return
-        # Channel log
-        ch = guild.get_channel(settings["log_channel_id"]) if settings["log_channel_id"] else None
-        if ch:
+
+        preferred_id = settings.get("log_channel_id")
+        dest = await self._resolve_log_channel(guild, preferred_id)
+
+        # Post to channel (embed preferred/forced)
+        if dest:
             try:
-                await ch.send(content=content, embed=(embed if settings["use_embeds"] else None))
+                if force_embed and embed is not None:
+                    await dest.send(embed=embed)
+                else:
+                    await dest.send(content=content, embed=(embed if settings["use_embeds"] else None))
             except discord.Forbidden:
-                log.warning("Forbidden sending to log channel", extra={"guild_id": guild.id, "channel_id": getattr(ch, 'id', None)})
+                # If preferred channel failed, try a fallback and warn
+                alt = await self._resolve_log_channel(guild, None)
+                if alt and (dest.id != alt.id):
+                    try:
+                        warn = build_embed(
+                            guild=guild,
+                            event="guild_update",
+                            title="ModLogV2: configured log channel not writable",
+                            description=(
+                                f"Tried to send to <#{preferred_id}> but lack permissions or channel is missing.\n"
+                                f"Posting here instead."
+                            ),
+                        )
+                        await alt.send(embed=warn)
+                        if force_embed and embed is not None:
+                            await alt.send(embed=embed)
+                        else:
+                            await alt.send(content=content, embed=(embed if settings["use_embeds"] else None))
+                    except Exception:
+                        log.exception("Fallback channel also failed")
+                else:
+                    log.warning("No channel available to send log message", extra={"guild_id": guild.id})
             except Exception:
                 log.exception("Unexpected error sending log")
-        # Persist event row via Config custom group (goes to Red’s DB backend)
+        else:
+            log.warning("No text channel with send/embed perms found; cannot post log", extra={"guild_id": guild.id})
+
+        # Persist event row via Config custom group (goes to Red’s backend)
         if payload is not None:
-            # atomically increment a global counter to create unique keys
             async with self.config.event_counter.get_lock():
                 eid = await self.config.event_counter()
                 await self.config.event_counter.set(eid + 1)
             row = {"event": event, "payload": payload}
             await self.config.custom("event", guild.id, eid).set(row)
 
-    # --------------- Messages ---------------
+    # ---------------- Messages ----------------
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if not message.guild or message.author.bot:
@@ -210,10 +260,12 @@ class ModLogV2(commands.Cog):
             "before": before.content, "after": after.content,
             "message_id": after.id,
         }
-        await self._send_and_store(after.guild, "message_edit", embed=emb, payload=payload)
+        # Force embed for visibility
+        await self._send_and_store(after.guild, "message_edit", embed=emb, payload=payload, force_embed=True)
 
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
+        # This fires only if the message was cached; raw handler below is the safety net
         if not message.guild or message.author.bot:
             return
         events = (await self._get_settings(message.guild.id))["events"]
@@ -229,8 +281,9 @@ class ModLogV2(commands.Cog):
             "content": message.content,
             "attachments": [a.to_dict() for a in message.attachments],
             "message_id": message.id,
+            "cached": True,
         }
-        await self._send_and_store(message.guild, "message_delete", embed=emb, payload=payload)
+        await self._send_and_store(message.guild, "message_delete", embed=emb, payload=payload, force_embed=True)
 
     @commands.Cog.listener()
     async def on_bulk_message_delete(self, messages: list[discord.Message]):
@@ -242,16 +295,94 @@ class ModLogV2(commands.Cog):
             return
         count = len(messages)
         channel = messages[0].channel
-        emb = build_embed(guild=guild, event="message_bulk_delete", title="Bulk delete", description=f"{count} messages purged in {channel.mention}")
+        emb = build_embed(
+            guild=guild, event="message_bulk_delete", title="Bulk delete",
+            description=f"{count} messages purged in {channel.mention}"
+        )
         payload = {
             "channel_id": channel.id,
             "count": count,
             "message_ids": [m.id for m in messages if m],
             "author_ids": [getattr(m.author, "id", None) for m in messages if m],
+            "cached": True,
         }
-        await self._send_and_store(guild, "message_bulk_delete", embed=emb, payload=payload)
+        await self._send_and_store(guild, "message_bulk_delete", embed=emb, payload=payload, force_embed=True)
 
-    # --------------- Reactions ---------------
+    # ---------------- RAW delete safety net ----------------
+    @commands.Cog.listener()
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        if not payload.guild_id:
+            return
+        guild = self.bot.get_guild(payload.guild_id)
+        if not guild:
+            return
+        events = (await self._get_settings(guild.id))["events"]
+        if not events.get("message_delete", True):
+            return
+
+        channel = guild.get_channel(payload.channel_id)
+        cached = payload.cached_message  # may be None
+        author = getattr(cached, "author", None)
+        content = getattr(cached, "content", None)
+
+        emb = build_embed(
+            guild=guild,
+            event="message_delete",
+            title="Message deleted",
+            description=(content or "*content unknown (not cached)*")[:4000],
+            author=author,
+            jump_url=getattr(cached, "jump_url", None),
+            fields=[
+                ("Message ID", f"`{payload.message_id}`", True),
+                ("Channel", channel.mention if isinstance(channel, discord.TextChannel) else f"<#{payload.channel_id}>", True),
+            ],
+        )
+
+        pl = {
+            "message_id": payload.message_id,
+            "channel_id": payload.channel_id,
+            "author_id": getattr(author, "id", None),
+            "cached": bool(cached),
+            "content": content,
+        }
+        await self._send_and_store(guild, "message_delete", embed=emb, payload=pl, force_embed=True)
+
+    @commands.Cog.listener()
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent):
+        if not payload.guild_id:
+            return
+        guild = self.bot.get_guild(payload.guild_id)
+        if not guild:
+            return
+        events = (await self._get_settings(guild.id))["events"]
+        if not events.get("message_bulk_delete", True):
+            return
+
+        channel = guild.get_channel(payload.channel_id)
+        count = len(payload.message_ids)
+
+        emb = build_embed(
+            guild=guild,
+            event="message_bulk_delete",
+            title="Bulk delete",
+            description=f"{count} messages purged in "
+                        f"{channel.mention if isinstance(channel, discord.TextChannel) else f'<#{payload.channel_id}>'}",
+            fields=[(
+                "Message IDs",
+                ", ".join(f"`{i}`" for i in list(payload.message_ids)[:20]) + (" …" if count > 20 else ""),
+                False
+            )],
+        )
+
+        pl = {
+            "channel_id": payload.channel_id,
+            "count": count,
+            "message_ids": list(payload.message_ids),
+            "cached": bool(payload.cached_messages),
+        }
+        await self._send_and_store(guild, "message_bulk_delete", embed=emb, payload=pl, force_embed=True)
+
+    # ---------------- Reactions ----------------
     @commands.Cog.listener()
     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.User | discord.Member):
         msg = reaction.message
@@ -278,7 +409,7 @@ class ModLogV2(commands.Cog):
         payload = {"message_id": message.id, "channel_id": message.channel.id, "reactions": [str(r.emoji) for r in reactions]}
         await self._send_and_store(message.guild, "reaction_clear", payload=payload)
 
-    # --------------- Members ---------------
+    # ---------------- Members ----------------
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         events = (await self._get_settings(member.guild.id))["events"]
@@ -305,7 +436,7 @@ class ModLogV2(commands.Cog):
                           fields=[("Changes", "\n".join(f"`{d['field']}`: {d['before']} → {d['after']}" for d in diffs)[:1024], False)])
         await self._send_and_store(after.guild, "member_update", embed=emb, payload={"user": _u(after), "diffs": diffs})
 
-    # --------------- Roles ---------------
+    # ---------------- Roles ----------------
     @commands.Cog.listener()
     async def on_guild_role_create(self, role: discord.Role):
         events = (await self._get_settings(role.guild.id))["events"]
@@ -332,7 +463,7 @@ class ModLogV2(commands.Cog):
                           fields=[("Changes", "\n".join(f"`{d['field']}`: {d['before']} → {d['after']}" for d in diffs)[:1024], False)])
         await self._send_and_store(after.guild, "role_update", embed=emb, payload={"role_id": after.id, "diffs": diffs})
 
-    # --------------- Channels ---------------
+    # ---------------- Channels ----------------
     @commands.Cog.listener()
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel):
         events = (await self._get_settings(channel.guild.id))["events"]
@@ -354,7 +485,6 @@ class ModLogV2(commands.Cog):
         b = {"name": getattr(before, "name", None), "nsfw": getattr(before, "nsfw", None), "topic": getattr(before, "topic", None), "slowmode": getattr(before, "slowmode_delay", None)}
         a = {"name": getattr(after, "name", None),  "nsfw": getattr(after, "nsfw", None),  "topic": getattr(after, "topic", None),  "slowmode": getattr(after, "slowmode_delay", None)}
         diffs = _diff_dict(b, a, ["name","nsfw","topic","slowmode"])
-        # overwrites coarse diff
         ow_b, ow_a = _overwrites(before), _overwrites(after)
         if ow_b != ow_a:
             diffs.append({"field":"overwrites","before":ow_b,"after":ow_a})
@@ -363,7 +493,7 @@ class ModLogV2(commands.Cog):
                           fields=[("Changes", "\n".join(f"`{d['field']}` changed" for d in diffs)[:1024], False)])
         await self._send_and_store(after.guild, "channel_update", embed=emb, payload={"channel_id": after.id, "diffs": diffs})
 
-    # --------------- Emojis / Stickers ---------------
+    # ---------------- Emojis / Stickers ----------------
     @commands.Cog.listener()
     async def on_guild_emojis_update(self, guild: discord.Guild, before, after):
         events = (await self._get_settings(guild.id))["events"]
@@ -378,7 +508,7 @@ class ModLogV2(commands.Cog):
         payload = {"before": [s.id for s in before], "after": [s.id for s in after]}
         await self._send_and_store(guild, "sticker_update", payload=payload)
 
-    # --------------- Invites / Webhooks / Integrations ---------------
+    # ---------------- Invites / Webhooks / Integrations ----------------
     @commands.Cog.listener()
     async def on_invite_create(self, invite: discord.Invite):
         if not invite.guild: return
@@ -407,7 +537,7 @@ class ModLogV2(commands.Cog):
         if not events.get("integrations", True): return
         await self._send_and_store(guild, "integration_update", payload={})
 
-    # --------------- Scheduled Events / Stage / Guild ---------------
+    # ---------------- Scheduled Events / Stage / Guild ----------------
     @commands.Cog.listener()
     async def on_guild_scheduled_event_create(self, event: discord.GuildScheduledEvent):
         ev = (await self._get_settings(event.guild.id))["events"]
@@ -502,6 +632,7 @@ class ModLogV2(commands.Cog):
         if diffs:
             await self._send_and_store(after, "guild_update", payload={"diffs": diffs})
 
+    # ---------------- Red Commands used ----------------
     @commands.Cog.listener()
     async def on_command(self, ctx: commands.Context):
         if not ctx.guild:
@@ -511,7 +642,7 @@ class ModLogV2(commands.Cog):
         payload = {"user": _u(ctx.author), "channel_id": getattr(ctx.channel, "id", None), "content": ctx.message.content, "qualified": ctx.command.qualified_name if ctx.command else None}
         await self._send_and_store(ctx.guild, "command_used", payload=payload)
 
-    # --------------- Audit Log: AutoMod rule changes ---------------
+    # ---------------- Audit Log: AutoMod rule changes ----------------
     @commands.Cog.listener()
     async def on_audit_log_entry_create(self, entry: discord.AuditLogEntry):
         if not entry.guild:
@@ -522,9 +653,9 @@ class ModLogV2(commands.Cog):
             desc = f"By: {entry.user.mention if entry.user else 'Unknown'}"
             emb = build_embed(guild=entry.guild, event="automod_rules", title=title, description=desc, author=entry.user)
             payload = {"action": entry.action.name, "user_id": getattr(entry.user, "id", None), "changes": [c.to_dict() for c in (entry.changes or [])]}
-            await self._send_and_store(entry.guild, "automod_rules", embed=emb, payload=payload)
+            await self._send_and_store(entry.guild, "automod_rules", embed=emb, payload=payload, force_embed=True)
 
-    # --------------- AutoMod execution (gateway) ---------------
+    # ---------------- AutoMod execution (gateway) ----------------
     async def _on_automod_action_execution(self, payload):  # type: ignore
         try:
             guild = getattr(payload, "guild", None) or self.bot.get_guild(getattr(payload, "guild_id", 0))
@@ -543,14 +674,15 @@ class ModLogV2(commands.Cog):
             emb = build_embed(guild=guild, event="automod_action_execution", title=title, description=desc, author=user)
             pl = {"user_id": getattr(user, "id", None) or getattr(payload, "user_id", None),
                   "rule_id": rule_id, "content": matched}
-            await self._send_and_store(guild, "automod_action_execution", embed=emb, payload=pl)
+            await self._send_and_store(guild, "automod_action_execution", embed=emb, payload=pl, force_embed=True)
         except Exception:
             log.exception("Failed handling automod execution")
 
-    # --------------- AutoMod preset (optional helper) ---------------
+    # ---------------- AutoMod preset (optional helper) ----------------
     async def _create_automod_preset(self, itx: discord.Interaction):
         try:
             guild = itx.guild
+            # create rules where supported (discord.py 2.6.x exposes AutoMod HTTP)
             try:
                 await guild.create_automod_rule(
                     name="ModLogV2 • Bad words",
