@@ -96,9 +96,18 @@ def u(user: Optional[Union[discord.Member, discord.User]]) -> str:
     return f"{user} (`{user.id}`)"
 
 def chn(o: Optional[Union[discord.abc.GuildChannel, discord.Thread]]) -> str:
+    """Format a channel/thread mention with its ID."""
     if not o:
         return "Unknown"
-    return f"{getattr(o, 'mention', f'#{getattr(o, 'name', '?')}')} (`{o.id}`)"
+    mention = getattr(o, "mention", None)
+    if mention:
+        pretty = mention
+    else:
+        # fall back to #name
+        name = getattr(o, "name", "?")
+        pretty = f"#{name}"
+    return f"{pretty} (`{o.id}`)"
+
 
 @dataclass
 class Case:
@@ -129,7 +138,7 @@ class Case:
 class ModLogX(commands.Cog):
     """Next-gen modlog with webhook output, detailed embeds, cases, and audit correlation."""
 
-    __author__ = "you"
+    __author__ = "Pat"
     __version__ = "3.1.0"
 
     def __init__(self, bot: commands.Bot):
