@@ -8,8 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import discord
 from discord import app_commands
-from discord.ext import commands
-from redbot.core import Config, checks
+from redbot.core import commands, Config, checks
 
 __red_end_user_data_statement__ = "This cog stores moderation case metadata and minimal log context (IDs and excerpts) per guild."
 
