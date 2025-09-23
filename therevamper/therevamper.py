@@ -417,12 +417,12 @@ class RevampSync(commands.Cog):
 
         last_edit = time.monotonic()
         async def progress(step_text: str):
+            nonlocal last_edit
             now = time.monotonic()
             if (now - last_edit) >= self.progress_min_secs:
                 if p.control_msg:
                     try: await p.control_msg.edit(embed=self._progress_embed(p, results, step_text))
                     except Exception: pass
-                nonlocal last_edit
                 last_edit = now
 
         async def do(coro, note: str):
