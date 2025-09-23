@@ -86,6 +86,47 @@ def _diff_dict(old: dict, new: dict, keys: list[str]):
     return changes
 
 
+def _embed_to_plaintext(embed: discord.Embed, *, fallback: str) -> str:
+    """Convert an embed into a plain text representation (for non-embed channels)."""
+
+    def _is_value(value: Any) -> bool:
+        return value not in (None, discord.Embed.Empty)
+
+    parts: list[str] = []
+
+    author = getattr(embed, "author", None)
+    author_name = getattr(author, "name", None)
+    if _is_value(author_name):
+        parts.append(str(author_name))
+
+    if _is_value(embed.title):
+        parts.append(str(embed.title))
+    if _is_value(embed.description):
+        parts.append(str(embed.description))
+
+    for field in embed.fields:
+        name = (field.name or "").strip()
+        value = (field.value or "").strip()
+        if name and value:
+            parts.append(f"{name}:\n{value}")
+        elif value:
+            parts.append(value)
+        elif name:
+            parts.append(name)
+
+    footer = getattr(embed, "footer", None)
+    footer_text = getattr(footer, "text", None)
+    if _is_value(footer_text):
+        parts.append(str(footer_text))
+
+    text = "\n\n".join(part for part in parts if part).strip()
+    if not text:
+        text = fallback
+    if len(text) > 2000:
+        text = text[:1997] + "..."
+    return text
+
+
 class ModLogV2(commands.Cog):
     """Modern moderation logging with a one-command UI, AutoMod support, and Red Config-backed storage."""
 
@@ -95,6 +136,8 @@ class ModLogV2(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=CONF_IDENT, force_registration=True)
+
+        self._automod_listener_registered = False
 
         # Defaults
         default_global = {"event_counter": 0}  # global monotonic id for custom-group rows
@@ -114,9 +157,19 @@ class ModLogV2(commands.Cog):
         # AutoMod action execution (discord.py 2.6.2 exposes this)
         try:
             self.bot.add_listener(self._on_automod_action_execution, "on_automod_action_execution")
+            self._automod_listener_registered = True
             log.info("Registered on_automod_action_execution.")
         except Exception:
             log.debug("AutoMod action exec not available:\n%s", traceback.format_exc())
+
+    def cog_unload(self):
+        if self._automod_listener_registered:
+            try:
+                self.bot.remove_listener(self._on_automod_action_execution, "on_automod_action_execution")
+            except Exception:
+                log.debug("Failed to remove AutoMod listener:\n%s", traceback.format_exc())
+            finally:
+                self._automod_listener_registered = False
 
     # ---------------- Public Commands ----------------
     @commands.group(name="modlog", invoke_without_command=True)
@@ -180,13 +233,26 @@ class ModLogV2(commands.Cog):
         preferred_id = settings.get("log_channel_id")
         dest = await self._resolve_log_channel(guild, preferred_id)
 
+        send_kwargs: Dict[str, Any] = {}
+        use_embed = bool(embed) and (force_embed or settings["use_embeds"])
+
+        if content:
+            send_kwargs["content"] = content
+
+        if embed is not None and use_embed:
+            send_kwargs["embed"] = embed
+
+        if not send_kwargs:
+            if embed is not None:
+                fallback = f"{event.replace('_', ' ').title()}"
+                send_kwargs["content"] = _embed_to_plaintext(embed, fallback=fallback)
+            else:
+                send_kwargs["content"] = f"{event.replace('_', ' ').title()}"
+
         # Post to channel (embed preferred/forced)
         if dest:
             try:
-                if force_embed and embed is not None:
-                    await dest.send(embed=embed)
-                else:
-                    await dest.send(content=content, embed=(embed if settings["use_embeds"] else None))
+                await dest.send(**send_kwargs)
             except discord.Forbidden:
                 # If preferred channel failed, try a fallback and warn
                 alt = await self._resolve_log_channel(guild, None)
@@ -202,10 +268,10 @@ class ModLogV2(commands.Cog):
                             ),
                         )
                         await alt.send(embed=warn)
-                        if force_embed and embed is not None:
+                        if force_embed and embed is not None and "embed" not in send_kwargs:
                             await alt.send(embed=embed)
                         else:
-                            await alt.send(content=content, embed=(embed if settings["use_embeds"] else None))
+                            await alt.send(**send_kwargs)
                     except Exception:
                         log.exception("Fallback channel also failed")
                 else:
