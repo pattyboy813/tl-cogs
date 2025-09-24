@@ -1,6 +1,3 @@
-# brawlstarsmanager.py
-# Red-DiscordBot cog: Brawl Stars self-service onboarding & club placement
-# v0.6.0 — API-req trophies, interactive club wizard, lobby guide, custom help, tag save, leadership handoff, roles & rename
 from __future__ import annotations
 
 import asyncio
