@@ -22,8 +22,8 @@ from redbot.core.utils.chat_formatting import box
 log = logging.getLogger("red.brawlstars_manager")
 
 API_BASE = "https://api.brawlstars.com/v1"
-MAX_CLUB_MEMBERS = 50
-THREAD_AUTO_ARCHIVE_M = 1440  # 24h
+MAX_CLUB_MEMBERS = 30
+THREAD_AUTO_ARCHIVE_M = 2880  # 48h
 # Strip a leading "TLG " (case-insensitive) from the club name when formatting nickname suffix
 NICK_PREFIX_STRIP = re.compile(r"^(TLG\s+)", re.IGNORECASE)
 
