@@ -276,7 +276,7 @@ class ChannelPicker(discord.ui.ChannelSelect):
 class ClubAddWizard(discord.ui.View):
     """Interactive stateful wizard for adding a club config."""
 
-    def __init.subclass__(cls, **kwargs):  # keep mypy quiet for View's metaclass
+    def __init__.subclass__(cls, **kwargs):  # keep mypy quiet for View's metaclass
         return super().__init_subclass__(**kwargs)
 
     def __init__(self, cog: "BrawlStarsManager", invoker: discord.Member):
