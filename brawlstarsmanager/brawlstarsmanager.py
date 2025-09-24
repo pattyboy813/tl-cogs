@@ -1,3 +1,6 @@
+# brawlstars_manager.py
+# Red-DiscordBot cog: Brawl Stars self-service onboarding & club placement
+# v0.5.0 — Interactive club add wizard + remove "Club Trophies" field
 from __future__ import annotations
 
 import asyncio
@@ -12,7 +15,8 @@ from typing import Any, Dict, Optional, Tuple, List
 
 import aiohttp
 import discord
-from redbot.core import commands, Config, checks
+from discord.ext import commands
+from redbot.core import Config, checks
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import box
 
@@ -53,7 +57,7 @@ class BSAPI:
         headers = {
             "Authorization": f"Bearer {key}",
             "Accept": "application/json",
-            "User-Agent": "Red-Cog-BS-Manager/0.4",
+            "User-Agent": "Red-Cog-BS-Manager/0.5",
         }
         url = f"{API_BASE}{path}"
         for attempt in range(3):
@@ -217,12 +221,182 @@ class JoinedView(discord.ui.View):
         await interaction.response.send_message(embed=emb("Cancelled", "You can close this thread."), ephemeral=True)
 
 
+# -------- Interactive "club add" wizard components --------
+class ClubAddTagModal(discord.ui.Modal, title="Club Tag"):
+    tag_input = discord.ui.TextInput(
+        label="Club Tag",
+        placeholder="#ABC123",
+        max_length=15,
+        required=True,
+    )
+    def __init__(self, wizard: "ClubAddWizard"):
+        super().__init__(timeout=300)
+        self.wizard = wizard
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.wizard.set_tag(interaction, str(self.tag_input.value))
+
+
+class ClubAddMinTrophiesModal(discord.ui.Modal, title="Minimum Trophies"):
+    min_input = discord.ui.TextInput(
+        label="Required Min Trophies",
+        placeholder="e.g. 20000",
+        max_length=6,
+        required=True,
+    )
+    def __init__(self, wizard: "ClubAddWizard"):
+        super().__init__(timeout=300)
+        self.wizard = wizard
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.wizard.set_min_trophies(interaction, str(self.min_input.value))
+
+
+class RolePicker(discord.ui.RoleSelect):
+    def __init__(self, wizard: "ClubAddWizard"):
+        super().__init__(placeholder="Pick club role", min_values=1, max_values=1)
+        self.wizard = wizard
+
+    async def callback(self, interaction: discord.Interaction):
+        role = self.values[0]
+        await self.wizard.set_role(interaction, role)
+
+
+class ChannelPicker(discord.ui.ChannelSelect):
+    def __init__(self, wizard: "ClubAddWizard"):
+        # Limit to text channels or threads
+        super().__init__(placeholder="Pick club chat channel", min_values=1, max_values=1, channel_types=[discord.ChannelType.text, discord.ChannelType.public_thread, discord.ChannelType.private_thread])
+        self.wizard = wizard
+
+    async def callback(self, interaction: discord.Interaction):
+        channel = self.values[0]
+        await self.wizard.set_channel(interaction, channel)
+
+
+class ClubAddWizard(discord.ui.View):
+    """Interactive stateful wizard for adding a club config."""
+
+    def __init.subclass__(cls, **kwargs):  # keep mypy quiet for View's metaclass
+        return super().__init_subclass__(**kwargs)
+
+    def __init__(self, cog: "BrawlStarsManager", invoker: discord.Member):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.invoker = invoker
+        self.guild = invoker.guild
+
+        self.club_tag: Optional[str] = None      # normalized "#TAG"
+        self.club_name: Optional[str] = None     # fetched from API
+        self.min_trophies: Optional[int] = None
+        self.role_id: Optional[int] = None
+        self.chat_channel_id: Optional[int] = None
+
+        # Dynamic pickers
+        self.role_picker = RolePicker(self)
+        self.channel_picker = ChannelPicker(self)
+        self.add_item(self.role_picker)
+        self.add_item(self.channel_picker)
+
+    # --- Buttons ---
+    @discord.ui.button(label="Set Club Tag", style=discord.ButtonStyle.primary, row=2)
+    async def btn_tag(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._is_invoker(interaction):
+            return
+        await interaction.response.send_modal(ClubAddTagModal(self))
+
+    @discord.ui.button(label="Set Min Trophies", style=discord.ButtonStyle.primary, row=2)
+    async def btn_min(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._is_invoker(interaction):
+            return
+        await interaction.response.send_modal(ClubAddMinTrophiesModal(self))
+
+    @discord.ui.button(label="Save", style=discord.ButtonStyle.success, row=3)
+    async def btn_save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._is_invoker(interaction):
+            return
+        if not (self.club_tag and self.min_trophies is not None and self.role_id and self.chat_channel_id):
+            await interaction.response.send_message(embed=emb("Missing info", "Please set **Club Tag**, **Min Trophies**, **Role**, and **Chat Channel**."), ephemeral=True)
+            return
+        # Persist
+        tag_key = self.club_tag.upper()
+        c = ClubConfig(tag=self.club_tag, min_trophies=self.min_trophies, role_id=self.role_id, chat_channel_id=self.chat_channel_id)
+        async with self.cog.config.guild(self.guild).clubs() as clubs:
+            clubs[tag_key] = c.to_dict()
+        # Ack
+        role = self.guild.get_role(self.role_id)
+        ch = self.guild.get_channel(self.chat_channel_id)
+        title = self.club_name or self.club_tag
+        await interaction.response.send_message(
+            embed=emb("Club Saved", f"**{title}** ({self.club_tag})\nMin trophies: **{self.min_trophies}**\nRole: {role.mention if role else self.role_id}\nChat: {ch.mention if ch else self.chat_channel_id}"),
+            ephemeral=True
+        )
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, row=3)
+    async def btn_cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._is_invoker(interaction):
+            return
+        await interaction.response.send_message(embed=emb("Cancelled", "No changes saved."), ephemeral=True)
+        self.stop()
+
+    # --- Setters (called from modals/selects) ---
+    async def set_tag(self, interaction: discord.Interaction, raw_tag: str):
+        if not self._is_invoker(interaction):
+            return
+        tag = f"#{norm_tag(raw_tag)}"
+        api = await self.cog._api(self.guild)
+        try:
+            info = await api.club(tag)
+        except Exception as ex:
+            await interaction.response.send_message(embed=emb("Invalid Club Tag", f"Could not fetch club: {ex}"), ephemeral=True)
+            return
+        self.club_tag = tag
+        self.club_name = info.get("name") or tag
+        await interaction.response.send_message(embed=emb("Tag Set", f"Club: **{self.club_name}** ({tag})"), ephemeral=True)
+
+    async def set_min_trophies(self, interaction: discord.Interaction, raw: str):
+        if not self._is_invoker(interaction):
+            return
+        try:
+            val = int(raw.replace(",", "").strip())
+            if val < 0:
+                raise ValueError
+        except Exception:
+            await interaction.response.send_message(embed=emb("Invalid number", "Please enter a positive integer."), ephemeral=True)
+            return
+        self.min_trophies = val
+        await interaction.response.send_message(embed=emb("Min Trophies Set", f"**{val}**"), ephemeral=True)
+
+    async def set_role(self, interaction: discord.Interaction, role: discord.Role):
+        if not self._is_invoker(interaction):
+            return
+        self.role_id = role.id
+        await interaction.response.send_message(embed=emb("Role Selected", f"{role.mention}"), ephemeral=True)
+
+    async def set_channel(self, interaction: discord.Interaction, channel: discord.abc.GuildChannel):
+        if not self._is_invoker(interaction):
+            return
+        # Accept text channels or threads
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            await interaction.response.send_message(embed=emb("Unsupported channel", "Please pick a text channel or thread."), ephemeral=True)
+            return
+        self.chat_channel_id = channel.id
+        await interaction.response.send_message(embed=emb("Chat Channel Selected", f"{getattr(channel, 'mention', channel.id)}"), ephemeral=True)
+
+    # --- helpers ---
+    def _is_invoker(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker.id:
+            asyncio.create_task(interaction.response.send_message(embed=emb("Not for you", "Only the command invoker can use this wizard."), ephemeral=True))
+            return False
+        return True
+
+
 # ----------------- Cog -----------------
 class BrawlStarsManager(commands.Cog):
     """Self-service Brawl Stars club placement."""
 
     __author__ = "Pat+Chat"
-    __version__ = "0.4.0"
+    __version__ = "0.5.0"
 
     def __init__(self, bot: Red):
         self.bot: Red = bot
@@ -386,7 +560,7 @@ class BrawlStarsManager(commands.Cog):
             view=view,
         )
 
-        # Detailed embeds (live info, not hardcoded)
+        # Detailed embeds (live info, not hardcoded) — removed "Club Trophies"
         for c, info in eligible:
             await thread.send(embed=self._club_embed(info))
 
@@ -397,14 +571,12 @@ class BrawlStarsManager(commands.Cog):
         req = info.get("requiredTrophies", 0)
         members = info.get("members", 0)
         ctype = str(info.get("type", "unknown")).title()
-        trophies = info.get("trophies", 0)
-        return (
-            discord.Embed(title=f"{name} ({tag})", description=desc, color=0x2B2D31)
-            .add_field(name="Type", value=str(ctype))
-            .add_field(name="Members", value=f"{members}/{MAX_CLUB_MEMBERS}")
-            .add_field(name="Req. Trophies", value=str(req))
-            .add_field(name="Club Trophies", value=str(trophies), inline=False)
-        )
+        # Removed: trophies = info.get("trophies", 0)
+        em = discord.Embed(title=f"{name} ({tag})", description=desc, color=0x2B2D31)
+        em.add_field(name="Type", value=str(ctype))
+        em.add_field(name="Members", value=f"{members}/{MAX_CLUB_MEMBERS}")
+        em.add_field(name="Req. Trophies", value=str(req))
+        return em
 
     async def on_club_selected(self, interaction: discord.Interaction, thread_id: int, applicant_id: int, chosen_tag: str):
         if not interaction.guild:
@@ -563,7 +735,6 @@ class BrawlStarsManager(commands.Cog):
         status = "configured" if key else ("using env var" if os.getenv("BRAWLSTARS_API_KEY") else "not set")
         await ctx.send(embed=emb("API Key", f"Status: **{status}**"))
 
-
     @bs_apikey.command(name="set")
     @checks.admin_or_permissions(manage_guild=True)
     async def bs_apikey_set(self, ctx: commands.Context, *, token: str):
@@ -578,7 +749,7 @@ class BrawlStarsManager(commands.Cog):
         await self.config.guild(ctx.guild).api_key.clear()
         await ctx.send(embed=emb("API Key Cleared", "I will try the BRAWLSTARS_API_KEY env var if present."))
 
-    # Lobby & leadership channels
+    # Lobby, leadership, family role
     @bs.command(name="setlobby")
     @checks.admin_or_permissions(manage_guild=True)
     async def bs_setlobby(self, ctx: commands.Context, channel: discord.TextChannel):
@@ -600,7 +771,7 @@ class BrawlStarsManager(commands.Cog):
         await self.config.guild(ctx.guild).family_role_id.set(role.id)
         await ctx.send(embed=emb("Family Role Set", f"Family role is now {role.mention}"))
 
-    # Clubs management
+    # --- Clubs management
     @bs.group(name="club", invoke_without_command=True)
     @checks.admin_or_permissions(manage_guild=True)
     async def bs_club(self, ctx: commands.Context):
@@ -609,20 +780,19 @@ class BrawlStarsManager(commands.Cog):
 
     @bs_club.command(name="add")
     @checks.admin_or_permissions(manage_guild=True)
-    async def bs_club_add(
-        self,
-        ctx: commands.Context,
-        tag: str,
-        min_trophies: int,
-        role: discord.Role,
-        chat_channel: discord.TextChannel | discord.Thread,
-    ):
-        """Add/update a club config."""
-        tag = f"#{norm_tag(tag)}"
-        c = ClubConfig(tag=tag, min_trophies=min_trophies, role_id=role.id, chat_channel_id=chat_channel.id)
-        async with self.config.guild(ctx.guild).clubs() as clubs:
-            clubs[tag.upper()] = c.to_dict()
-        await ctx.send(embed=emb("Club Saved", f"**{tag}**\nMin trophies: **{min_trophies}**\nRole: {role.mention}\nChat: {chat_channel.mention}"))
+    async def bs_club_add(self, ctx: commands.Context):
+        """Start the interactive wizard to add/update a club."""
+        if not ctx.guild:
+            await ctx.send(embed=emb("Use in a server"))
+            return
+        view = ClubAddWizard(self, ctx.author)
+        await ctx.send(
+            embed=emb(
+                "Add a Club (wizard)",
+                "Steps:\n1) **Set Club Tag** (validated via API)\n2) **Set Min Trophies**\n3) **Pick Role**\n4) **Pick Chat Channel**\nThen press **Save**."
+            ),
+            view=view,
+        )
 
     @bs_club.command(name="close")
     @checks.admin_or_permissions(manage_guild=True)
@@ -671,8 +841,8 @@ class BrawlStarsManager(commands.Cog):
         )
         await ctx.send(embed=emb("Posted", f"Start button posted in {ch.mention}"))
 
-    # User tag management
-    @commands.group(name="bstag", invoke_without_command=True)
+    # --- User tag management
+    @bs.group(name="tag", invoke_without_command=True)
     async def bs_tag(self, ctx: commands.Context):
         """Manage your saved Brawl Stars tag."""
         await ctx.send_help()
@@ -732,3 +902,4 @@ class BrawlStarsManager(commands.Cog):
         """Admin: clear a member’s saved tag."""
         await self.config.user(member).tag.clear()
         await ctx.send(embed=emb("Cleared", f"Removed saved tag for {member.mention}"))
+
