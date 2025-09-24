@@ -59,7 +59,7 @@ DEFAULTS_GUILD = {
     "webhook_identity": "bot",  # "bot" -> use bot name/avatar, "event" -> per-event identity
     "categories": {
         "messages": {"edit": True, "delete": True, "purge": True, "snipe": True},
-        "reactions": True,
+        "reactions": False,
         "members": {"join": True, "leave": True, "update": True, "ban": True, "unban": True},
         "roles": True,
         "channels": True,
