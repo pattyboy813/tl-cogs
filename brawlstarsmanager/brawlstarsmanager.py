@@ -789,6 +789,36 @@ class BrawlStarsManager(commands.Cog):
             view=view,
         )
 
+    @bs_club.command(name="remove", aliases=["del", "delete", "rm"])
+    @checks.admin_or_permissions(manage_guild=True)
+    async def bs_club_remove(self, ctx: commands.Context, tag: str):
+        """Remove a club config by its tag.
+
+        Example:
+        [p]bs club remove #ABC123
+        [p]bs club rm abc123
+        """
+        key = f"#{norm_tag(tag)}".upper()
+        async with self.config.guild(ctx.guild).clubs() as clubs:
+            if key not in clubs:
+                await ctx.send(embed=emb("Unknown club", f"{key} is not configured."))
+                return
+            removed = clubs.pop(key, None)
+
+        # Nice confirmation with what was removed (if available)
+        if removed:
+            role_id = removed.get("role_id")
+            chat_id = removed.get("chat_channel_id")
+            role = ctx.guild.get_role(role_id) if role_id else None
+            ch = ctx.guild.get_channel(chat_id) if chat_id else None
+            details = []
+            if role: details.append(f"role {role.mention}")
+            if ch:   details.append(f"chat {ch.mention}")
+            extra = f" ({', '.join(details)})" if details else ""
+            await ctx.send(embed=emb("Club Removed", f"**{key}** has been removed{extra}."))
+        else:
+            await ctx.send(embed=emb("Club Removed", f"**{key}** has been removed."))
+
     @bs_club.command(name="close")
     @checks.admin_or_permissions(manage_guild=True)
     async def bs_club_close(self, ctx: commands.Context, tag: str, closed: bool):
