@@ -1,6 +1,6 @@
 # brawlstars_manager.py
 # Red-DiscordBot cog: Brawl Stars self-service onboarding & club placement
-# v0.5.0 — Interactive club add wizard + remove "Club Trophies" field
+# v0.5.1 — fix SyntaxError, interactive club add wizard, no "Club Trophies" field
 from __future__ import annotations
 
 import asyncio
@@ -57,7 +57,7 @@ class BSAPI:
         headers = {
             "Authorization": f"Bearer {key}",
             "Accept": "application/json",
-            "User-Agent": "Red-Cog-BS-Manager/0.5",
+            "User-Agent": "Red-Cog-BS-Manager/0.5.1",
         }
         url = f"{API_BASE}{path}"
         for attempt in range(3):
@@ -276,9 +276,6 @@ class ChannelPicker(discord.ui.ChannelSelect):
 class ClubAddWizard(discord.ui.View):
     """Interactive stateful wizard for adding a club config."""
 
-    def __init__().subclass__(cls, **kwargs):  # keep mypy quiet for View's metaclass
-        return super().__init_subclass__(**kwargs)
-
     def __init__(self, cog: "BrawlStarsManager", invoker: discord.Member):
         super().__init__(timeout=600)
         self.cog = cog
@@ -396,7 +393,7 @@ class BrawlStarsManager(commands.Cog):
     """Self-service Brawl Stars club placement."""
 
     __author__ = "Pat+Chat"
-    __version__ = "0.5.0"
+    __version__ = "0.5.1"
 
     def __init__(self, bot: Red):
         self.bot: Red = bot
@@ -560,7 +557,7 @@ class BrawlStarsManager(commands.Cog):
             view=view,
         )
 
-        # Detailed embeds (live info, not hardcoded) — removed "Club Trophies"
+        # Detailed embeds (live info, not hardcoded) — no "Club Trophies" field
         for c, info in eligible:
             await thread.send(embed=self._club_embed(info))
 
@@ -571,7 +568,6 @@ class BrawlStarsManager(commands.Cog):
         req = info.get("requiredTrophies", 0)
         members = info.get("members", 0)
         ctype = str(info.get("type", "unknown")).title()
-        # Removed: trophies = info.get("trophies", 0)
         em = discord.Embed(title=f"{name} ({tag})", description=desc, color=0x2B2D31)
         em.add_field(name="Type", value=str(ctype))
         em.add_field(name="Members", value=f"{members}/{MAX_CLUB_MEMBERS}")
@@ -842,7 +838,7 @@ class BrawlStarsManager(commands.Cog):
         await ctx.send(embed=emb("Posted", f"Start button posted in {ch.mention}"))
 
     # --- User tag management
-    @bs.group(name="tag", invoke_without_command=True)
+    @commands.group(name="bstag", invoke_without_command=True)
     async def bs_tag(self, ctx: commands.Context):
         """Manage your saved Brawl Stars tag."""
         await ctx.send_help()
