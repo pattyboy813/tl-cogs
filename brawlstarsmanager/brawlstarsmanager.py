@@ -1497,3 +1497,51 @@ class BrawlStarsManager(commands.Cog):
         await self.config.user(member).tag.clear()
         await ctx.send(embed=Emb("Cleared", f"Removed saved tag for {member.mention}", kind="success", guild=ctx.guild))
 
+    @Bs.command(name="diag")
+    async def BsDiag(self, ctx: commands.Context, *, tag_or_club: str = "#0000000"):
+        """Ping BS API and show raw status/info."""
+        if not await self.GuardAdmin(ctx):
+            return
+        api = await self.Api(ctx.guild)
+        probe = NormTag(tag_or_club)
+        what = "player"
+        try:
+            if probe.startswith("2") or probe.startswith("P"):  # rough heuristic
+                data = await api.Club(probe)
+                what = "club"
+            else:
+                data = await api.Player(probe)
+                what = "player"
+            pretty = json.dumps({k: data.get(k) for k in list(data)[:8]}, indent=2, ensure_ascii=False)
+            await ctx.send(embed=Emb("API OK", f"Fetched {what} `{probe}`.\n\n```json\n{pretty}\n```", kind="success", guild=ctx.guild))
+        except Exception as ex:
+            await ctx.send(embed=Emb("API error", f"`{type(ex).__name__}`\n{ex}", kind="error", guild=ctx.guild))
+
+    @Bs.command(name="myip")
+    async def BsMyIp(self, ctx: commands.Context):
+        """Show the bot's current public IP (for allowlisting)."""
+        if not await self.GuardAdmin(ctx):
+            return
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://api.ipify.org?format=json", timeout=8) as r:
+                    data = await r.json()
+            await ctx.send(embed=Emb("Current public IP", f"`{data.get('ip','?')}`\nAdd this to your Supercell key allowlist.", kind="primary", guild=ctx.guild))
+        except Exception as ex:
+            await ctx.send(embed=Emb("Couldn’t fetch IP", f"{ex}", kind="error", guild=ctx.guild))
+
+    @BsApiKey.command(name="test")
+    async def BsApiKeyTest(self, ctx: commands.Context, tag: str):
+        """Quick auth test against /players — 401/403 will be explicit."""
+        if not await self.GuardAdmin(ctx):
+            return
+        api = await self.Api(ctx.guild)
+        try:
+            # Any valid-looking tag works; even a 404 proves auth worked.
+            await api.Player(NormTag(tag))
+            await ctx.send(embed=Emb("Key looks valid", "API returned data for that tag.", kind="success", guild=ctx.guild))
+        except Exception as ex:
+            await ctx.send(embed=Emb("Auth/network problem", f"{ex}", kind="error", guild=ctx.guild))
+
+
