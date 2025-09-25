@@ -1,3 +1,6 @@
+# brawlstarsmanager.py
+# Red-DiscordBot cog: Brawl Stars self-service onboarding & club placement
+# v0.7.2 — CamelCase, role-gated admin, richer lobby, themed embeds, channel.type fix, JSON import/export
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +12,7 @@ import re
 import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, List
+from io import BytesIO
 
 import aiohttp
 import discord
@@ -21,7 +25,6 @@ log = logging.getLogger("red.brawlstars_manager")
 API_BASE = "https://api.brawlstars.com/v1"
 MAX_CLUB_MEMBERS = 50
 THREAD_AUTO_ARCHIVE_M = 1440  # 24h
-# Strip a leading "TLG " (case-insensitive) from the club name when formatting nickname suffix
 NICK_PREFIX_STRIP = re.compile(r"^(TLG\s+)", re.IGNORECASE)
 
 # ---------- visual theme & helpers ----------
@@ -70,9 +73,6 @@ def Emb(
     thumbnail_url: str | None = None,
     image_url: str | None = None,
 ) -> discord.Embed:
-    """
-    Styled embed with sensible defaults (CamelCase variant).
-    """
     if color is None:
         color = THEME.get(kind, THEME["neutral"])
     e = discord.Embed(title=title, description=desc or discord.Embed.Empty, color=color)
@@ -82,7 +82,7 @@ def Emb(
             e.set_author(name=guild.name, icon_url=icon)
         else:
             e.set_author(name=guild.name)
-    footer_text = footer or "Brawl Stars Manager • v0.7.1"
+    footer_text = footer or "Brawl Stars Manager • v0.7.2"
     e.set_footer(text=footer_text)
     if thumbnail_url:
         e.set_thumbnail(url=thumbnail_url)
@@ -98,6 +98,19 @@ def NormTag(tag: str) -> str:
 def EncTag(tag: str) -> str:
     return urllib.parse.quote(f"#{NormTag(tag)}", safe="")
 
+def ExtractId(value: Any) -> Optional[int]:
+    """Accept raw int, '123', '<@&123>', '<#123>', 'role 123' etc."""
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        m = re.search(r"\d{5,}", value)
+        if m:
+            try:
+                return int(m.group(0))
+            except Exception:
+                return None
+    return None
+
 class BSAPI:
     """Tiny BS API client with basic retry handling (CamelCase)."""
 
@@ -112,7 +125,7 @@ class BSAPI:
         headers = {
             "Authorization": f"Bearer {key}",
             "Accept": "application/json",
-            "User-Agent": "Red-Cog-BS-Manager/0.7.1",
+            "User-Agent": "Red-Cog-BS-Manager/0.7.2",
         }
         url = f"{API_BASE}{path}"
         for attempt in range(3):
@@ -250,8 +263,7 @@ class ClubSelect(discord.ui.Select):
         self.thread_id = thread_id
         self.applicant_id = applicant_id
 
-    # This must be named `callback` for discord.py:
-    async def callback(self, interaction: discord.Interaction):
+    async def callback(self, interaction: discord.Interaction):  # must be named `callback`
         if interaction.user.id != self.applicant_id:
             await interaction.response.send_message(embed=Emb("Not for you", "Only the applicant can select a club.", kind="warning"), ephemeral=True)
             return
@@ -344,10 +356,10 @@ class ChannelPicker(discord.ui.ChannelSelect):
             max_values=1,
             channel_types=[
                 discord.ChannelType.text,
-                discord.ChannelType.news,      # announcement channels
+                discord.ChannelType.news,
                 discord.ChannelType.public_thread,
                 discord.ChannelType.private_thread,
-                discord.ChannelType.forum,     # forums
+                discord.ChannelType.forum,
             ],
         )
         self.wizard = wizard
@@ -365,19 +377,17 @@ class ClubAddWizard(discord.ui.View):
         self.invoker = invoker
         self.guild = invoker.guild
 
-        self.club_tag: Optional[str] = None      # normalized "#TAG"
-        self.club_name: Optional[str] = None     # fetched from API
+        self.club_tag: Optional[str] = None
+        self.club_name: Optional[str] = None
         self.api_req_trophies: Optional[int] = None
         self.role_id: Optional[int] = None
         self.chat_channel_id: Optional[int] = None
 
-        # Dynamic pickers
         self.role_picker = RolePicker(self)
         self.channel_picker = ChannelPicker(self)
         self.add_item(self.role_picker)
         self.add_item(self.channel_picker)
 
-    # --- Buttons ---
     @discord.ui.button(label="Set Club Tag", style=discord.ButtonStyle.primary, row=2)
     async def BtnTag(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self._IsInvoker(interaction):
@@ -394,14 +404,13 @@ class ClubAddWizard(discord.ui.View):
                 ephemeral=True,
             )
             return
-        # Persist (no manual min trophies)
         tag_key = self.club_tag.upper()
         c = ClubConfig(
             tag=self.club_tag,
             role_id=self.role_id,
             chat_channel_id=self.chat_channel_id,
             closed=False,
-            min_trophies=None,  # legacy off
+            min_trophies=None,
         )
         async with self.cog.config.guild(self.guild).clubs() as clubs:
             clubs[tag_key] = c.ToDict()
@@ -423,7 +432,6 @@ class ClubAddWizard(discord.ui.View):
         await interaction.response.send_message(embed=Emb("Cancelled", "No changes saved.", kind="neutral"), ephemeral=True)
         self.stop()
 
-    # --- Setters (called from modals/selects) ---
     async def SetTag(self, interaction: discord.Interaction, raw_tag: str):
         if not self._IsInvoker(interaction):
             return
@@ -452,11 +460,16 @@ class ClubAddWizard(discord.ui.View):
         if not self._IsInvoker(interaction):
             return
 
-        ok = isinstance(
-            channel,
-            (discord.TextChannel, getattr(discord, "AnnouncementChannel", discord.TextChannel), discord.Thread, discord.ForumChannel),
-        )
-        if not ok:
+        allowed_types = {
+            discord.ChannelType.text,
+            discord.ChannelType.news,
+            discord.ChannelType.public_thread,
+            discord.ChannelType.private_thread,
+            discord.ChannelType.forum,
+        }
+        ch_type = getattr(channel, "type", None)
+
+        if ch_type not in allowed_types:
             await interaction.response.send_message(
                 embed=Emb("Unsupported channel", "Please pick a text channel, announcement channel, thread, or forum.", kind="warning"),
                 ephemeral=True,
@@ -464,12 +477,12 @@ class ClubAddWizard(discord.ui.View):
             return
 
         self.chat_channel_id = channel.id
+        mention = getattr(channel, "mention", str(channel.id))
         await interaction.response.send_message(
-            embed=Emb("Chat Channel Selected", f"{getattr(channel, 'mention', channel.id)}", kind="primary", guild=self.guild),
+            embed=Emb("Chat Channel Selected", f"{mention}", kind="primary", guild=self.guild),
             ephemeral=True,
         )
 
-    # --- helpers ---
     def _IsInvoker(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.invoker.id:
             asyncio.create_task(
@@ -486,19 +499,18 @@ class BrawlStarsManager(commands.Cog):
     """Self-service Brawl Stars club placement."""
 
     __author__ = "Pat+Chat"
-    __version__ = "0.7.1"
+    __version__ = "0.7.2"
 
     def __init__(self, bot: Red):
         self.bot: Red = bot
         self.config = Config.get_conf(self, identifier=0xB5A71C09, force_registration=True)
         self.config.register_guild(
-            api_key=None,                # guild-scoped API key (fallback to env if None)
-            lobby_channel_id=None,       # where Start button lives
-            leadership_channel_id=None,  # where leaders get notified
-            family_role_id=None,         # global family role (e.g. TLG Family)
-            clubs={},                    # { "#TAG": ClubConfigDict }
-            threads={},                  # { thread_id: {member_id, tag, chosen} }
-            # Lobby embed + guide
+            api_key=None,
+            lobby_channel_id=None,
+            leadership_channel_id=None,
+            family_role_id=None,
+            clubs={},
+            threads={},
             lobby_embed={
                 "title": "Club Placement",
                 "description": (
@@ -510,19 +522,15 @@ class BrawlStarsManager(commands.Cog):
                 "image_url": None,
                 "thumbnail_url": None,
             },
-            lobby_guide_pages=[],        # list of dicts: {"title": str, "desc": str, "image_url": str}
-            # Admin role allowlist
-            admin_role_ids=[],           # list[int]
+            lobby_guide_pages=[],
+            admin_role_ids=[],
         )
-        self.config.register_user(
-            tag=None,                    # saved user tag (e.g. "#ABC123")
-        )
+        self.config.register_user(tag=None)
         self._session: Optional[aiohttp.ClientSession] = None
 
     # -------- lifecycle --------
     async def cog_load(self):
         self._session = aiohttp.ClientSession()
-        # Persistent view so the lobby buttons survive restarts
         self.bot.add_view(StartView(self))
 
     async def cog_unload(self):
@@ -531,14 +539,6 @@ class BrawlStarsManager(commands.Cog):
 
     # -------- admin role guard --------
     async def HasAdmin(self, ctx: commands.Context) -> bool:
-        """Gate for admin operations.
-
-        Allowed if any:
-          • Bot owner
-          • Guild owner
-          • Member has Manage Guild
-          • Member has at least one of configured admin roles
-        """
         if await ctx.bot.is_owner(ctx.author):
             return True
         if ctx.guild is None:
@@ -563,7 +563,6 @@ class BrawlStarsManager(commands.Cog):
     # -------- API helper --------
     async def Api(self, guild: discord.Guild) -> BSAPI:
         async def get_key():
-            # Prefer configured key; otherwise env var fallback
             key = await self.config.guild(guild).api_key()
             if not key:
                 key = os.getenv("BRAWLSTARS_API_KEY")
@@ -584,8 +583,6 @@ class BrawlStarsManager(commands.Cog):
         )
 
         e = Emb(title, description, kind="primary", guild=guild)
-
-        # Visuals (from config)
         thumb = cfg.get("thumbnail_url")
         img = cfg.get("image_url")
         if thumb:
@@ -593,7 +590,6 @@ class BrawlStarsManager(commands.Cog):
         if img:
             e.set_image(url=img)
 
-        # What you'll need
         e.add_field(
             name=f"{EMOJI['gear']} What you’ll need",
             value=(
@@ -603,8 +599,6 @@ class BrawlStarsManager(commands.Cog):
             ),
             inline=False,
         )
-
-        # How it works (high level)
         e.add_field(
             name=f"{EMOJI['door']} How it works",
             value=(
@@ -616,8 +610,6 @@ class BrawlStarsManager(commands.Cog):
             ),
             inline=False,
         )
-
-        # Clubs quick stats
         if total_clubs:
             e.add_field(
                 name=f"{EMOJI['club']} Clubs available",
@@ -627,8 +619,6 @@ class BrawlStarsManager(commands.Cog):
                 ),
                 inline=False,
             )
-
-        # Privacy / Safety
         e.add_field(
             name=f"{EMOJI['shield']} Privacy & safety",
             value=(
@@ -638,8 +628,6 @@ class BrawlStarsManager(commands.Cog):
             ),
             inline=False,
         )
-
-        # Help
         e.add_field(
             name=f"{EMOJI['question']} Need help?",
             value=(
@@ -648,7 +636,6 @@ class BrawlStarsManager(commands.Cog):
             ),
             inline=False,
         )
-
         return e
 
     # -------- user tag helpers --------
@@ -657,12 +644,10 @@ class BrawlStarsManager(commands.Cog):
 
     # -------- flow entry --------
     async def BeginFlowWithTag(self, interaction: discord.Interaction, raw_tag: str):
-        """Entry point after modal or saved-tag shortcut."""
         if not interaction.guild:
             await interaction.response.send_message(embed=Emb("Use in a server", "Please run this in a server.", kind="warning"), ephemeral=True)
             return
 
-        # Enforce lobby if set
         gconf = self.config.guild(interaction.guild)
         lobby_id = await gconf.lobby_channel_id()
         if lobby_id and interaction.channel_id != lobby_id:
@@ -679,11 +664,8 @@ class BrawlStarsManager(commands.Cog):
 
         ign = pdata.get("name", "Unknown")
         trophies = pdata.get("trophies", 0)
-
-        # Save user tag for reuse
         await self.config.user(interaction.user).tag.set(f"#{tag}")
 
-        # Create a private thread off the lobby (or current text channel)
         parent_ch = interaction.channel
         if isinstance(parent_ch, discord.Thread):
             parent_ch = parent_ch.parent
@@ -700,17 +682,14 @@ class BrawlStarsManager(commands.Cog):
         )
         await thread.add_user(interaction.user)
 
-        # Save per-thread state
         async with gconf.threads() as threads:
             threads[str(thread.id)] = {"member_id": interaction.user.id, "tag": tag, "chosen": None}
 
-        # Acknowledge in lobby
         await interaction.response.send_message(
             embed=Emb("Thread created", f"I made a private thread for you: {thread.mention}", kind="success", guild=interaction.guild),
             ephemeral=True,
         )
 
-        # Intro in thread
         intro = Emb(
             "Welcome!",
             f"**IGN:** `{ign}` • **Tag:** `#{tag}` • **Trophies:** **{FmtNum(trophies)}**\n\n"
@@ -733,7 +712,6 @@ class BrawlStarsManager(commands.Cog):
             await thread.send(embed=Emb("No clubs configured", "An admin can add clubs with `[p]bs club add`", kind="warning", guild=thread.guild))
             return
 
-        # Step 1) fetch live club info, then compare trophies against API-required trophies
         candidates: List[Tuple[ClubConfig, Dict[str, Any]]] = []
         for c in clubs:
             if c.closed:
@@ -752,10 +730,9 @@ class BrawlStarsManager(commands.Cog):
             await thread.send(embed=Emb("Not eligible yet", "You don’t meet the trophy requirements for any configured club yet.", kind="warning", guild=thread.guild))
             return
 
-        # Step 2) remove full or closed (API)
         eligible: List[Tuple[ClubConfig, Dict[str, Any]]] = []
         for c, info in candidates:
-            ctype = (info.get("type") or "").lower()  # open/inviteOnly/closed
+            ctype = (info.get("type") or "").lower()
             members = int(info.get("members", 0))
             if ctype == "closed":
                 continue
@@ -767,7 +744,6 @@ class BrawlStarsManager(commands.Cog):
             await thread.send(embed=Emb("No open spots", "All suitable clubs are currently full or closed. Please check back later.", kind="warning", guild=thread.guild))
             return
 
-        # Step 3) Show list & detailed embeds
         options: List[discord.SelectOption] = []
         for c, info in eligible:
             name = info.get("name", c.tag)
@@ -781,8 +757,6 @@ class BrawlStarsManager(commands.Cog):
             embed=Emb("Eligible Clubs", "Select a club from the dropdown below to proceed.", kind="primary", guild=thread.guild),
             view=view,
         )
-
-        # Detailed embeds (live info, not hardcoded)
         for c, info in eligible:
             await thread.send(embed=self.ClubEmbed(info, thread.guild))
 
@@ -795,12 +769,7 @@ class BrawlStarsManager(commands.Cog):
         ctype = str(info.get("type", "unknown")).title()
         trophies = int(info.get("trophies", 0))
 
-        em = Emb(
-            f"{name} ({tag})",
-            desc,
-            kind="accent",
-            guild=guild,
-        )
+        em = Emb(f"{name} ({tag})", desc, kind="accent", guild=guild)
         em.add_field(name="Type", value=ctype)
         em.add_field(name="Members", value=f"{FmtNum(members)}/{MAX_CLUB_MEMBERS}")
         em.add_field(name="Req. Trophies", value=FmtNum(req))
@@ -888,7 +857,6 @@ class BrawlStarsManager(commands.Cog):
             return
 
         gconf = self.config.guild(interaction.guild)
-        # find thread state
         async with gconf.threads() as threads:
             t = threads.get(str(interaction.channel_id), {})
 
@@ -910,7 +878,6 @@ class BrawlStarsManager(commands.Cog):
             await interaction.response.send_message(embed=Emb("Not yet", "I don’t see you in that club yet. Try again in a minute.", kind="warning"), ephemeral=True)
             return
 
-        # Assign Family + Club role, rename, ping in club chat
         clubs_raw = await gconf.clubs()
         cconf_raw = clubs_raw.get(club_tag.upper())
         if not cconf_raw:
@@ -925,7 +892,6 @@ class BrawlStarsManager(commands.Cog):
 
         member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
 
-        # Build nickname
         try:
             cinfo = await api.Club(club_tag)
             club_name = cinfo.get("name", club_tag)
@@ -944,7 +910,6 @@ class BrawlStarsManager(commands.Cog):
 
         await interaction.response.send_message(embed=Emb("Verified!", f"Assigned your roles and set nickname to **{new_nick}**.", kind="success"), ephemeral=True)
 
-        # Welcome ping in club chat (Text/Announcement/Thread/Forum)
         if chat_chan:
             try:
                 welcome_embed = Emb("Welcome!", f"Welcome {member.mention} to **{club_suffix}**! 🎉", kind="primary", guild=interaction.guild)
@@ -959,7 +924,6 @@ class BrawlStarsManager(commands.Cog):
             except Exception:
                 pass
 
-        # Close/lock thread
         if isinstance(interaction.channel, discord.Thread):
             with contextlib.suppress(Exception):
                 await interaction.channel.edit(locked=True, archived=True)
@@ -999,10 +963,12 @@ class BrawlStarsManager(commands.Cog):
         em.add_field(
             name="Admin – Clubs",
             value=box(
-                f"{p}bs club add               -> Interactive wizard (tag -> role -> chat)\n"
-                f"{p}bs club list              -> List clubs (shows live API req & capacity)\n"
-                f"{p}bs club close <tag> <bool>-> Override closed flag\n"
-                f"{p}bs club remove <tag>      -> Remove a club",
+                f"{p}bs club add                -> Interactive wizard (tag -> role -> chat)\n"
+                f"{p}bs club list               -> List clubs (live API req & capacity)\n"
+                f"{p}bs club close <tag> <bool> -> Override closed flag\n"
+                f"{p}bs club remove <tag>       -> Remove a club\n"
+                f"{p}bs club import [merge|replace] <json or attach> -> Import clubs from JSON\n"
+                f"{p}bs club export             -> Export clubs to JSON",
                 lang="ini"
             ),
             inline=False
@@ -1021,12 +987,12 @@ class BrawlStarsManager(commands.Cog):
             inline=False
         )
         em.add_field(
-            name="Admin – Role gate (this cog)",
+            name="Admin – Role gate",
             value=box(
-                f"{p}bs adminroles add @Role     -> Allow this role to use admin commands\n"
-                f"{p}bs adminroles remove @Role  -> Remove from allowlist\n"
-                f"{p}bs adminroles list          -> Show allowed roles\n"
-                f"{p}bs adminroles clear         -> Reset allowlist",
+                f"{p}bs adminroles add @Role    -> Allow this role to use admin commands\n"
+                f"{p}bs adminroles remove @Role -> Remove from allowlist\n"
+                f"{p}bs adminroles list         -> Show allowed roles\n"
+                f"{p}bs adminroles clear        -> Reset allowlist",
                 lang="ini"
             ),
             inline=False
@@ -1038,18 +1004,15 @@ class BrawlStarsManager(commands.Cog):
 
     @commands.group(name="bs", invoke_without_command=True)
     async def Bs(self, ctx: commands.Context):
-        """(Custom help)"""
         await ctx.send(embed=self.HelpEmbed(ctx))
 
     @Bs.command(name="help")
     async def BsHelp(self, ctx: commands.Context):
-        """Show detailed help for this cog."""
         await ctx.send(embed=self.HelpEmbed(ctx))
 
-    # ---- Admin role allowlist management
+    # ---- Admin role allowlist
     @Bs.group(name="adminroles", invoke_without_command=True)
     async def BsAdminRoles(self, ctx: commands.Context):
-        """Manage which roles can run this cog's admin commands."""
         if not await self.GuardAdmin(ctx):
             return
         await ctx.send_help()
@@ -1099,10 +1062,9 @@ class BrawlStarsManager(commands.Cog):
         await self.config.guild(ctx.guild).admin_role_ids.set([])
         await ctx.send(embed=Emb("Cleared", "Admin role allowlist reset.", kind="success", guild=ctx.guild))
 
-    # API KEY (natural style) + fallback to env var
+    # ---- API key
     @Bs.group(name="apikey", invoke_without_command=True)
     async def BsApiKey(self, ctx: commands.Context):
-        """Manage the Brawl Stars API key (guild-scoped)."""
         if not await self.GuardAdmin(ctx):
             return
         key = await self.config.guild(ctx.guild).api_key()
@@ -1111,7 +1073,6 @@ class BrawlStarsManager(commands.Cog):
 
     @BsApiKey.command(name="set")
     async def BsApiKeySet(self, ctx: commands.Context, *, token: str):
-        """Set the Brawl Stars API key for this guild."""
         if not await self.GuardAdmin(ctx):
             return
         await self.config.guild(ctx.guild).api_key.set(token.strip())
@@ -1119,16 +1080,14 @@ class BrawlStarsManager(commands.Cog):
 
     @BsApiKey.command(name="clear")
     async def BsApiKeyClear(self, ctx: commands.Context):
-        """Clear the guild API key (env var may still be used)."""
         if not await self.GuardAdmin(ctx):
             return
         await self.config.guild(ctx.guild).api_key.clear()
         await ctx.send(embed=Emb("API Key Cleared", "I will try the BRAWLSTARS_API_KEY env var if present.", kind="neutral", guild=ctx.guild))
 
-    # Lobby, leadership, family role
+    # ---- Lobby / leadership / family
     @Bs.command(name="setlobby")
     async def BsSetLobby(self, ctx: commands.Context, channel: discord.TextChannel):
-        """Set the onboarding lobby channel (where Start/How-It-Works live)."""
         if not await self.GuardAdmin(ctx):
             return
         await self.config.guild(ctx.guild).lobby_channel_id.set(channel.id)
@@ -1136,7 +1095,6 @@ class BrawlStarsManager(commands.Cog):
 
     @Bs.command(name="setleadership")
     async def BsSetLeadership(self, ctx: commands.Context, channel: discord.TextChannel | discord.Thread):
-        """Set the leadership notification channel."""
         if not await self.GuardAdmin(ctx):
             return
         await self.config.guild(ctx.guild).leadership_channel_id.set(channel.id)
@@ -1144,16 +1102,14 @@ class BrawlStarsManager(commands.Cog):
 
     @Bs.command(name="setfamilyrole")
     async def BsSetFamilyRole(self, ctx: commands.Context, role: discord.Role):
-        """Set the default Family role (e.g., 'TLG Family')."""
         if not await self.GuardAdmin(ctx):
             return
         await self.config.guild(ctx.guild).family_role_id.set(role.id)
         await ctx.send(embed=Emb("Family Role Set", f"Family role is now {role.mention}", kind="success", guild=ctx.guild))
 
-    # --- Lobby config & guide
+    # ---- Lobby visuals
     @Bs.group(name="lobbycfg", invoke_without_command=True)
     async def BsLobbyCfg(self, ctx: commands.Context):
-        """Configure the lobby embed and the how-it-works guide."""
         if not await self.GuardAdmin(ctx):
             return
         await ctx.send_help()
@@ -1194,7 +1150,6 @@ class BrawlStarsManager(commands.Cog):
 
     @BsLobbyCfg.group(name="guide", invoke_without_command=True)
     async def BsLobbyGuide(self, ctx: commands.Context):
-        """Manage the photo guide pages."""
         if not await self.GuardAdmin(ctx):
             return
         await ctx.send_help()
@@ -1223,7 +1178,6 @@ class BrawlStarsManager(commands.Cog):
 
     @BsLobbyCfg.command(name="add")
     async def BsLobbyGuideAdd(self, ctx: commands.Context, image_url: str, *, text: str = ""):
-        """Add a page. Optional text can be `Title | Description` or just a single title."""
         if not await self.GuardAdmin(ctx):
             return
         title, desc = None, None
@@ -1250,17 +1204,15 @@ class BrawlStarsManager(commands.Cog):
         await self.config.guild(ctx.guild).lobby_guide_pages.set(pages)
         await ctx.send(embed=Emb("Removed page", removed.get("title") or f"Step {index}", kind="success", guild=ctx.guild))
 
-    # --- Clubs management
+    # ---- Clubs management
     @Bs.group(name="club", invoke_without_command=True)
     async def BsClub(self, ctx: commands.Context):
-        """Manage club entries."""
         if not await self.GuardAdmin(ctx):
             return
         await ctx.send_help()
 
     @BsClub.command(name="add")
     async def BsClubAdd(self, ctx: commands.Context):
-        """Start the interactive wizard to add/update a club."""
         if not await self.GuardAdmin(ctx):
             return
         if not ctx.guild:
@@ -1279,7 +1231,6 @@ class BrawlStarsManager(commands.Cog):
 
     @BsClub.command(name="close")
     async def BsClubClose(self, ctx: commands.Context, tag: str, closed: bool):
-        """Mark a club as closed/open (override)."""
         if not await self.GuardAdmin(ctx):
             return
         key = f"#{NormTag(tag)}".upper()
@@ -1292,7 +1243,6 @@ class BrawlStarsManager(commands.Cog):
 
     @BsClub.command(name="remove", aliases=["del", "delete", "rm"])
     async def BsClubRemove(self, ctx: commands.Context, tag: str):
-        """Remove a club config by its tag."""
         if not await self.GuardAdmin(ctx):
             return
         key = f"#{NormTag(tag)}".upper()
@@ -1316,7 +1266,6 @@ class BrawlStarsManager(commands.Cog):
 
     @BsClub.command(name="list")
     async def BsClubList(self, ctx: commands.Context):
-        """List configured clubs (uses live API for req & capacity)."""
         if not await self.GuardAdmin(ctx):
             return
         clubs = await self.config.guild(ctx.guild).clubs()
@@ -1337,10 +1286,142 @@ class BrawlStarsManager(commands.Cog):
             lines.append(f"{k}: role <@&{v['role_id']}> • chat <#{v['chat_channel_id']}> • closed={v.get('closed', False)}{sfx}")
         await ctx.send(embed=Emb("Clubs", box("\n".join(lines), lang="ini"), kind="primary", guild=ctx.guild))
 
-    # Post the lobby buttons + rich embed
+    # ---- Import / Export
+    @BsClub.command(name="export")
+    async def BsClubExport(self, ctx: commands.Context):
+        """Export current clubs to a JSON file."""
+        if not await self.GuardAdmin(ctx):
+            return
+        clubs = await self.config.guild(ctx.guild).clubs()
+        pretty = json.dumps(clubs, indent=2, ensure_ascii=False)
+        data = pretty.encode("utf-8")
+        buf = BytesIO(data)
+        buf.seek(0)
+        await ctx.send(
+            embed=Emb("Exported", "Here is your **clubs_export.json**.", kind="success", guild=ctx.guild),
+            file=discord.File(buf, filename="clubs_export.json"),
+        )
+
+    @BsClub.command(name="import")
+    async def BsClubImport(self, ctx: commands.Context, mode: str = "merge", *, json_text: str = ""):
+        """Import clubs from JSON.
+        Usage:
+          [p]bs club import [merge|replace] <json>
+          (or attach a .json file to the command message)
+
+        Accepts:
+          - dict keyed by tag:  { "#TAG": { ... } }
+          - list of objects:    [ { "tag": "#TAG", ... }, ... ]
+
+        Fields per club:
+          tag, role_id|role, chat_channel_id|chat, optional closed, optional min_trophies (legacy)
+        Role/Channel can be IDs or mention strings.
+        """
+        if not await self.GuardAdmin(ctx):
+            return
+        # Prefer attachment if present
+        raw = None
+        if ctx.message.attachments:
+            att = ctx.message.attachments[0]
+            try:
+                raw_bytes = await att.read()
+                raw = raw_bytes.decode("utf-8", errors="replace")
+            except Exception as e:
+                await ctx.send(embed=Emb("Attachment error", f"Could not read attachment: {e}", kind="error", guild=ctx.guild))
+                return
+        else:
+            raw = json_text.strip()
+        if not raw:
+            await ctx.send(embed=Emb("No JSON", "Provide JSON inline or attach a `.json` file.", kind="warning", guild=ctx.guild))
+            return
+
+        try:
+            payload = json.loads(raw)
+        except Exception as e:
+            await ctx.send(embed=Emb("Invalid JSON", f"{e}", kind="error", guild=ctx.guild))
+            return
+
+        # Normalize to dict[tag] = ClubConfig.ToDict()
+        imported: Dict[str, Dict[str, Any]] = {}
+        def _push(club_obj: Dict[str, Any]):
+            tag_in = club_obj.get("tag") or club_obj.get("Tag")
+            if not tag_in:
+                return "Missing 'tag'"
+            tag_norm = f"#{NormTag(tag_in)}"
+            role_val = club_obj.get("role_id", club_obj.get("role"))
+            chat_val = club_obj.get("chat_channel_id", club_obj.get("chat"))
+            role_id = ExtractId(role_val)
+            chat_id = ExtractId(chat_val)
+            if not role_id or not ctx.guild.get_role(role_id):
+                return f"Invalid role for {tag_norm}"
+            if not chat_id or not ctx.guild.get_channel(chat_id):
+                return f"Invalid channel for {tag_norm}"
+            closed = bool(club_obj.get("closed", False))
+            min_trophies = club_obj.get("min_trophies", None)
+            try:
+                if min_trophies is not None:
+                    min_trophies = int(min_trophies)
+            except Exception:
+                min_trophies = None
+            c = ClubConfig(
+                tag=tag_norm,
+                role_id=int(role_id),
+                chat_channel_id=int(chat_id),
+                closed=closed,
+                min_trophies=min_trophies,
+            )
+            imported[tag_norm.upper()] = c.ToDict()
+            return None
+
+        errors: List[str] = []
+        if isinstance(payload, dict):
+            # Either dict keyed by tag or wrapper {"clubs": ...}
+            if "clubs" in payload and isinstance(payload["clubs"], (list, dict)):
+                payload = payload["clubs"]
+            if isinstance(payload, dict):
+                for k, v in payload.items():
+                    if isinstance(v, dict) and "tag" not in v:
+                        v = {**v, "tag": k}
+                    err = _push(v if isinstance(v, dict) else {})
+                    if err:
+                        errors.append(err)
+            else:
+                await ctx.send(embed=Emb("Invalid JSON shape", "Expected dict or list.", kind="error", guild=ctx.guild))
+                return
+        elif isinstance(payload, list):
+            for item in payload:
+                err = _push(item if isinstance(item, dict) else {})
+                if err:
+                    errors.append(err)
+        else:
+            await ctx.send(embed=Emb("Invalid JSON shape", "Expected dict or list.", kind="error", guild=ctx.guild))
+            return
+
+        if errors:
+            preview = "\n".join(f"• {e}" for e in errors[:10])
+            await ctx.send(embed=Emb("Some entries were skipped", preview, kind="warning", guild=ctx.guild))
+
+        if not imported:
+            await ctx.send(embed=Emb("Nothing imported", "No valid club entries found.", kind="warning", guild=ctx.guild))
+            return
+
+        mode = (mode or "merge").lower()
+        if mode not in {"merge", "replace"}:
+            mode = "merge"
+
+        if mode == "replace":
+            await self.config.guild(ctx.guild).clubs.set(imported)
+            action_msg = "Replaced all clubs."
+        else:
+            async with self.config.guild(ctx.guild).clubs() as clubs:
+                clubs.update(imported)
+            action_msg = "Merged clubs into existing set."
+
+        await ctx.send(embed=Emb("Import complete", f"{action_msg} Imported: **{len(imported)}** entries.", kind="success", guild=ctx.guild))
+
+    # ---- Lobby posting
     @Bs.command(name="lobby")
     async def BsLobby(self, ctx: commands.Context, sub: str):
-        """`postbutton` to post Start + How-it-works in the lobby channel."""
         if not await self.GuardAdmin(ctx):
             return
         if sub.lower() != "postbutton":
@@ -1358,15 +1439,13 @@ class BrawlStarsManager(commands.Cog):
         await ch.send(embed=lobby_embed, view=StartView(self))
         await ctx.send(embed=Emb("Posted", f"Start & How-it-works posted in {ch.mention}", kind="success", guild=ctx.guild))
 
-    # --- User tag management
+    # ---- User tag management
     @commands.group(name="bstag", invoke_without_command=True)
     async def BsTag(self, ctx: commands.Context):
-        """Manage your saved Brawl Stars tag."""
         await ctx.send_help()
 
     @BsTag.command(name="show")
     async def BsTagShow(self, ctx: commands.Context, member: Optional[discord.Member] = None):
-        """Show your (or another member’s) saved tag."""
         target = member or ctx.author
         tag = await self.config.user(target).tag()
         if tag:
@@ -1376,14 +1455,13 @@ class BrawlStarsManager(commands.Cog):
 
     @BsTag.command(name="set")
     async def BsTagSet(self, ctx: commands.Context, tag: str):
-        """Set your own tag (normalizes and validates via API)."""
         if not ctx.guild:
             await ctx.send(embed=Emb("Use in a server", kind="warning"))
             return
         n = NormTag(tag)
         api = await self.Api(ctx.guild)
         try:
-            await api.Player(n)  # validate
+            await api.Player(n)
         except Exception as ex:
             await ctx.send(embed=Emb("Invalid Tag", f"Could not validate: {ex}", kind="error", guild=ctx.guild))
             return
@@ -1392,13 +1470,11 @@ class BrawlStarsManager(commands.Cog):
 
     @BsTag.command(name="clear")
     async def BsTagClear(self, ctx: commands.Context):
-        """Clear your saved tag."""
         await self.config.user(ctx.author).tag.clear()
         await ctx.send(embed=Emb("Cleared", "Your saved tag has been removed.", kind="success", guild=ctx.guild))
 
     @BsTag.command(name="setfor")
     async def BsTagSetFor(self, ctx: commands.Context, member: discord.Member, tag: str):
-        """Admin: set a member’s tag."""
         if not await self.GuardAdmin(ctx):
             return
         if not ctx.guild:
@@ -1416,8 +1492,8 @@ class BrawlStarsManager(commands.Cog):
 
     @BsTag.command(name="clearfor")
     async def BsTagClearFor(self, ctx: commands.Context, member: discord.Member):
-        """Admin: clear a member’s saved tag."""
         if not await self.GuardAdmin(ctx):
             return
         await self.config.user(member).tag.clear()
         await ctx.send(embed=Emb("Cleared", f"Removed saved tag for {member.mention}", kind="success", guild=ctx.guild))
+
