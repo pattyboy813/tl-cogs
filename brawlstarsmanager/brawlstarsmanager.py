@@ -1544,4 +1544,20 @@ class BrawlStarsManager(commands.Cog):
         except Exception as ex:
             await ctx.send(embed=Emb("Auth/network problem", f"{ex}", kind="error", guild=ctx.guild))
 
+    @BsClub.command(name="probe")
+    async def BsClubProbe(self, ctx: commands.Context, club_tag: str):
+        """Fetch a single club via the BS API to debug connectivity/auth."""
+        if not await self.GuardAdmin(ctx):
+            return
+        api = await self.Api(ctx.guild)
+        try:
+            data = await api.Club(f"#{club_tag.strip().lstrip('#').upper()}")
+            pretty = json.dumps(
+                {k: data.get(k) for k in ("tag", "name", "type", "requiredTrophies", "members", "trophies")},
+                indent=2,
+                ensure_ascii=False,
+            )
+            await ctx.send(embed=Emb("Club OK", f"```json\n{pretty}\n```", kind="success", guild=ctx.guild))
+        except Exception as ex:
+            await ctx.send(embed=Emb("Club error", f"{ex}", kind="error", guild=ctx.guild))
 
