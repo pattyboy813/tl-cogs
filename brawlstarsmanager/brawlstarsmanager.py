@@ -1608,4 +1608,3 @@ class BrawlStarsManager(commands.Cog):
                 )
             else:
                 await ctx.send(embed=Emb("Club error", msg, kind="error", guild=ctx.guild))
-
