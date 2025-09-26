@@ -15,6 +15,11 @@ CONF_ID = 9876543210123456  # change to any random large int you own
 # 0=nice, 1=cheeky, 2=snarky, 3=roast (playful, not hateful)
 # -----------------------
 
+# -----------------------
+# Quip Pools (tiered)
+# 0=nice, 1=cheeky, 2=snarky, 3=roast (clear + playful)
+# -----------------------
+
 PRAISE: Dict[int, List[str]] = {
     0: [
         "Great job, {user}! Keep it rolling.",
@@ -24,58 +29,59 @@ PRAISE: Dict[int, List[str]] = {
     ],
     1: [
         "Look at you, counting like a functional adult.",
-        "Precision. Elegance. Numerals. {user}, you’ve got them all.",
-        "That’s the stuff. Next number fears you already.",
+        "Sharp work, {user}.",
+        "That’s the stuff. Onward.",
     ],
     2: [
         "Numbers wish they were as consistent as you.",
-        "Flawless execution. Somewhere, a calculator is unemployed.",
-        "Mathematics is filing for a restraining order.",
+        "Calculator not required. Impressive.",
+        "Textbook execution.",
     ],
     3: [
-        "You didn’t just count—you **dominated** that integer.",
-        "If swagger could be measured, you’d be irrational.",
-        "{user}, the abacus is in tears.",
+        "You didn’t just count—you owned that number.",
+        "Crisp. Fast. Correct. Next.",
+        "{user}, that was clean. Keep pushing.",
     ],
 }
 
 FAIL_WRONG: Dict[int, List[str]] = {
     0: [
         "Whoops—needed **{expected}**, not **{given}**. Reset to **0**. Start at `1`.",
-        "Close! (Geometrically speaking.) Expected **{expected}**. Back to **0**.",
+        "Close! Expected **{expected}**. Back to **0**. Start at `1`.",
     ],
     1: [
-        "Almost had it—if we were in a different timeline. Needed **{expected}**.",
-        "Bold pick: **{given}**. Plot twist: answer was **{expected}**. Resetting.",
+        "Almost—answer was **{expected}**. Reset to **0**. Start at `1`.",
+        "Bold choice: **{given}**. Correct: **{expected}**. Reset to **0**.",
     ],
     2: [
-        "We ordered **{expected}**; you served **{given}**. Kitchen’s closed. Back to **0**.",
-        "Arithmetic says ‘try reading the menu’. It said **{expected}**.",
+        "We needed **{expected}**. You sent **{given}**. Reset to **0**. Start at `1`.",
+        "Wrong number: wanted **{expected}**. Back to **0**. Start at `1`.",
     ],
     3: [
-        "Technically, **{given}** is not **{expected}**. Practically, we’re at **0** now.",
-        "Brutal miss. We wanted **{expected}**. Reset. Hydrate. Rejoin at `1`.",
+        "Not it. Expected **{expected}**. Count resets to **0**. Start at `1`.",
+        "Try again: the next number was **{expected}**. We’re back at **0**.",
     ],
 }
 
 FAIL_DOUBLE: Dict[int, List[str]] = {
     0: [
         "No doubles—share the fun. Reset to **0**. Start at `1`.",
-        "Same person twice breaks the chain. Back to **0**.",
+        "Same person twice breaks the chain. Back to **0**. Start at `1`.",
     ],
     1: [
-        "Back-to-back isn’t allowed. Let someone else cook. Reset.",
-        "This isn’t solitaire. No doubles. Restarting at `1`.",
+        "Back-to-back isn’t allowed. Let someone else go. Reset to **0**.",
+        "This isn’t solitaire. No doubles. Restart at `1`.",
     ],
     2: [
-        "Take a lap, {user}. No doubles. Count’s toast.",
-        "Leave some numbers for the rest of the class.",
+        "Hold up—no doubles, {user}. Reset to **0**. Wait one turn.",
+        "Tag in a teammate next time. Reset to **0**. Start at `1`.",
     ],
     3: [
-        "Two in a row? That’s a foul. We’re at **0**.",
-        "No doubles, {user}. Pass the ball. Resetting.",
+        "Two in a row isn’t allowed. Reset to **0**. Let someone else take `1`.",
+        "No doubles, {user}. Chain resets to **0**. Wait a turn, then jump in.",
     ],
 }
+
 
 def choose_quip(pool: Dict[int, List[str]], level: int) -> str:
     level = max(0, min(3, level))
@@ -374,7 +380,7 @@ class Counting(commands.Cog):
                     await message.reply(
                         line.format(user=message.author.mention, count=expected),
                         mention_author=False,
-                        delete_after=7,
+                    
                     )
                 except discord.HTTPException:
                     pass
@@ -440,7 +446,7 @@ class Counting(commands.Cog):
             text = f"{base} Count resets to **0**. Start again with `1`."
 
         try:
-            await message.reply(text, mention_author=False, delete_after=10)
+            await message.reply(text, mention_author=False)
         except discord.HTTPException:
             pass
 
