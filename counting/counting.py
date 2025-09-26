@@ -1,409 +1,653 @@
-# counting_cog.py
-# Red-DiscordBot cog: Cooperative counting game
-# Modernized for discord.py 2.x / Red v3
-# - No payouts
-# - Fun, playful copy everywhere
-# - Rich embeds for info, status, record, resets
-# - Facepalm/celebration GIFs (randomized)
-# - Cleaner config schema (ints, not strings)
-# - Robust message parsing & reasons for reset
-# - Leaderboard of contributors (rotations)
-# - Admin utilities: set channel, set expected, reset
-
 from __future__ import annotations
 
-import re
 import random
-import logging
-from typing import Dict, Optional, Tuple, List
+import time
+from typing import Optional, Dict, List
 
 import discord
-from redbot.core import commands, checks, Config
+from discord.ui import View, Select, button, Button
+from redbot.core import commands, Config
 
-log = logging.getLogger("red.counting")
+CONF_ID = 9876543210123456  # change to any random large int you own
 
-BOT_CREDITS = "Original by Generaleoley | Made better by Pat"
+# -----------------------
+# Quip Pools (tiered)
+# 0=nice, 1=cheeky, 2=snarky, 3=roast (playful, not hateful)
+# -----------------------
 
-# Emojis
-OK_EMOJI = "✅"
-PARTY_EMOJI = "🎉"
-FAIL_EMOJI = "❌"
-INFO_EMOJI = "ℹ️"
-FIRE_EMOJI = "🔥"
-SMILE_EMOJI = "😎"
-FACEPALM_EMOJI = "🤦"
+PRAISE: Dict[int, List[str]] = {
+    0: [
+        "Great job, {user}! Keep it rolling.",
+        "Clean count. Love to see it.",
+        "Solid work—math is proud of you.",
+        "Nice and tidy. {count} achieved.",
+    ],
+    1: [
+        "Look at you, counting like a functional adult.",
+        "Precision. Elegance. Numerals. {user}, you’ve got them all.",
+        "That’s the stuff. Next number fears you already.",
+    ],
+    2: [
+        "Numbers wish they were as consistent as you.",
+        "Flawless execution. Somewhere, a calculator is unemployed.",
+        "Mathematics is filing for a restraining order.",
+    ],
+    3: [
+        "You didn’t just count—you **dominated** that integer.",
+        "If swagger could be measured, you’d be irrational.",
+        "{user}, the abacus is in tears.",
+    ],
+}
 
-# Colors
-GREEN = 0x2ECC71
-RED = 0xE74C3C
-BLUE = 0x3498DB
-GOLD = 0xF1C40F
-PURPLE = 0x9B59B6
+FAIL_WRONG: Dict[int, List[str]] = {
+    0: [
+        "Whoops—needed **{expected}**, not **{given}**. Reset to **0**. Start at `1`.",
+        "Close! (Geometrically speaking.) Expected **{expected}**. Back to **0**.",
+    ],
+    1: [
+        "Almost had it—if we were in a different timeline. Needed **{expected}**.",
+        "Bold pick: **{given}**. Plot twist: answer was **{expected}**. Resetting.",
+    ],
+    2: [
+        "We ordered **{expected}**; you served **{given}**. Kitchen’s closed. Back to **0**.",
+        "Arithmetic says ‘try reading the menu’. It said **{expected}**.",
+    ],
+    3: [
+        "Technically, **{given}** is not **{expected}**. Practically, we’re at **0** now.",
+        "Brutal miss. We wanted **{expected}**. Reset. Hydrate. Rejoin at `1`.",
+    ],
+}
 
-NUMBER_RE = re.compile(r"^\s*(\d+)\s*$")
+FAIL_DOUBLE: Dict[int, List[str]] = {
+    0: [
+        "No doubles—share the fun. Reset to **0**. Start at `1`.",
+        "Same person twice breaks the chain. Back to **0**.",
+    ],
+    1: [
+        "Back-to-back isn’t allowed. Let someone else cook. Reset.",
+        "This isn’t solitaire. No doubles. Restarting at `1`.",
+    ],
+    2: [
+        "Take a lap, {user}. No doubles. Count’s toast.",
+        "Leave some numbers for the rest of the class.",
+    ],
+    3: [
+        "Two in a row? That’s a foul. We’re at **0**.",
+        "No doubles, {user}. Pass the ball. Resetting.",
+    ],
+}
 
-# --- Fun language pools & GIFs ---
-FUN_OK_LINES = [
-    "Clean as a whistle. Next up: **{next}**.",
-    "Numbers so fresh, they crunch. Say **{next}**.",
-    "Mathemagical! **{next}** is calling you.",
-    f"{SMILE_EMOJI} You nailed it. Up next: **{{next}}**.",
-    "Certified correct™ — now give me **{next}**.",
+def choose_quip(pool: Dict[int, List[str]], level: int) -> str:
+    level = max(0, min(3, level))
+    return random.choice(pool[level])
+
+# -----------------------
+# Pretty Help UI
+# -----------------------
+
+HELP_SECTIONS = [
+    "Overview",
+    "Setup",
+    "Gameplay",
+    "Admin",
+    "Sass Controls",
+    "Custom Quips",
 ]
 
-FUN_RECORD_LINES = [
-    f"{PARTY_EMOJI} New server record: **{{record}}**! The number line trembles.",
-    f"{FIRE_EMOJI} You broke it! Record now **{{record}}**. Keep heating up!",
-    "Legendary vibes only — fresh record at **{record}**!",
-]
-
-FUN_RESET_LINES = [
-    f"{FACEPALM_EMOJI} Oof. That borked the count.",
-    "RIP the momentum — back to **1** we go.",
-    "The Count (™) has left the building. Rebooting at **1**.",
-    "Plot twist! That wasn't the number. Start over at **1**.",
-]
-
-GIF_FACEPALMS = [
-    # Curated SFW facepalm-ish GIFs (direct links)
-    "https://media.tenor.com/i2sPJMpSJ6kAAAAC/facepalm-picard.gif",
-    "https://media.tenor.com/Lk1WvR7bI8EAAAAC/oh-no-facepalm.gif",
-    "https://media.tenor.com/3V8J6s2k3_sAAAAC/disappointed-homer-simpson.gif",
-    "https://media.tenor.com/9G5F1_-8q0UAAAAC/facepalm-the-office.gif",
-]
-
-GIF_CELEBRATE = [
-    "https://media.tenor.com/2roX3uxz_68AAAAC/celebration.gif",
-    "https://media.tenor.com/at0wJt6iY7gAAAAC/party-parrot.gif",
-    "https://media.tenor.com/Tw8kM9Ce1lwAAAAC/confetti-celebrate.gif",
-    "https://media.tenor.com/xV2bqJPSm6wAAAAC/success-kid.gif",
-]
-
-
-def _make_embed(
-    *,
-    title: str,
-    description: Optional[str] = None,
-    color: int = BLUE,
-    fields: Optional[List[Tuple[str, str, bool]]] = None,
-    footer: Optional[str] = BOT_CREDITS,
-    image_url: Optional[str] = None,
-    thumbnail_url: Optional[str] = None,
-) -> discord.Embed:
-    e = discord.Embed(title=title, description=description, color=color)
-    if fields:
-        for name, value, inline in fields:
-            e.add_field(name=name, value=value, inline=inline)
-    if image_url:
-        e.set_image(url=image_url)
-    if thumbnail_url:
-        e.set_thumbnail(url=thumbnail_url)
-    if footer:
-        e.set_footer(text=footer)
+def _help_embed(section: str, prefix: str) -> discord.Embed:
+    e = discord.Embed(
+        title="🧮 Counting — Help",
+        colour=discord.Colour.blurple(),
+        description="A clean, fast counting game with optional sass. Use the selector below to browse sections.",
+    )
+    e.set_footer(text="Tip: You can run commands from here by copy/paste.")
+    if section == "Overview":
+        e.add_field(
+            name="What it does",
+            value=(
+                "• Enforces +1 counting in a chosen channel\n"
+                "• Blocks doubles (same user twice)\n"
+                "• Tracks highscores and streaks\n"
+                "• Optional ‘smartass’ mode with tiered quips"
+            ),
+            inline=False,
+        )
+        e.add_field(
+            name="Quickstart",
+            value=(
+                f"`{prefix}counting setchannel #counting`\n"
+                "Start at `1` in that channel. I’ll ✅ correct counts, ❌ fails."
+            ),
+            inline=False,
+        )
+    elif section == "Setup":
+        e.add_field(
+            name="Initial setup",
+            value=(
+                f"• Set channel: `{prefix}counting setchannel #counting`\n"
+                f"• Allow bots (optional): `{prefix}counting allowbots true|false`\n"
+                f"• Set starting number: `{prefix}counting setstart 0`"
+            ),
+            inline=False,
+        )
+        e.add_field(
+            name="Status & Reset",
+            value=(
+                f"• Status: `{prefix}counting status`\n"
+                f"• Reset: `{prefix}counting reset`  → next expected becomes **1**\n"
+                f"• Reset to N: `{prefix}counting reset 50` → next expected is **51**"
+            ),
+            inline=False,
+        )
+    elif section == "Gameplay":
+        e.add_field(
+            name="Rules",
+            value=(
+                "• Post an integer that is exactly the next number (+1)\n"
+                "• No doubles: same user cannot count twice in a row\n"
+                "• Wrong number or double resets the chain to **0**"
+            ),
+            inline=False,
+        )
+        e.add_field(
+            name="Feedback",
+            value="• ✅ for correct counts • ❌ + cheeky reply on fails (if smartass is enabled)",
+            inline=False,
+        )
+        e.add_field(
+            name="Leaderboard",
+            value=f"`{prefix}counting leaderboard` — shows top best streaks",
+            inline=False,
+        )
+    elif section == "Admin":
+        e.add_field(
+            name="Admin Commands",
+            value=(
+                f"`{prefix}counting setchannel <#channel>`\n"
+                f"`{prefix}counting status`\n"
+                f"`{prefix}counting reset [start_at]`\n"
+                f"`{prefix}counting setstart <n>`\n"
+                f"`{prefix}counting allowbots <true|false>`"
+            ),
+            inline=False,
+        )
+    elif section == "Sass Controls":
+        e.add_field(
+            name="Smartass Mode",
+            value=(
+                f"`{prefix}counting smartass <true|false>` — turn quips on/off\n"
+                f"`{prefix}counting sasslevel <0|1|2|3>` — 0=nice, 3=roast-cap\n"
+                f"`{prefix}counting allowroast <true|false>` — allow tier-3 roasts\n"
+                f"`{prefix}counting praiserate <N>` — 1 in N successes praised (min 2)\n"
+                f"`{prefix}counting roastrate <N>` — 1 in N fails may roast (min 1)\n"
+                f"`{prefix}counting gentlefirst <N>` — keep early game ≤ cheeky for first N"
+            ),
+            inline=False,
+        )
+    elif section == "Custom Quips":
+        e.add_field(
+            name="Add your own lines",
+            value=(
+                f"`{prefix}counting quips addpraise <line>`  — vars: `{{user}}`, `{{count}}`\n"
+                f"`{prefix}counting quips addfailwrong <line>` — vars: `{{user}}`, `{{expected}}`, `{{given}}`\n"
+                f"`{prefix}counting quips addfaildouble <line>` — vars: `{{user}}`\n"
+                f"`{prefix}counting quips list`\n"
+                f"`{prefix}counting quips clear <praise|wrong|double>`"
+            ),
+            inline=False,
+        )
     return e
 
+class HelpSelect(Select):
+    def __init__(self, prefix: str, default_section: str = "Overview"):
+        options = [discord.SelectOption(label=s, value=s, default=(s == default_section)) for s in HELP_SECTIONS]
+        super().__init__(placeholder="Pick a help section…", options=options, min_values=1, max_values=1)
+        self.prefix = prefix
+
+    async def callback(self, interaction: discord.Interaction):
+        section = self.values[0]
+        await interaction.response.edit_message(embed=_help_embed(section, self.prefix), view=self.view)
+
+class HelpView(View):
+    def __init__(self, prefix: str, author_id: int):
+        super().__init__(timeout=120)
+        self.add_item(HelpSelect(prefix))
+        self.prefix = prefix
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        perms = interaction.channel.permissions_for(interaction.user) if interaction.channel else None
+        return bool(perms and perms.manage_guild)
+
+    @button(label="⟵ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: Button):
+        current = self._current_section_from_embed(interaction.message)
+        idx = HELP_SECTIONS.index(current)
+        new_section = HELP_SECTIONS[(idx - 1) % len(HELP_SECTIONS)]
+        await interaction.response.edit_message(embed=_help_embed(new_section, self.prefix), view=self)
+
+    @button(label="Next ⟶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: Button):
+        current = self._current_section_from_embed(interaction.message)
+        idx = HELP_SECTIONS.index(current)
+        new_section = HELP_SECTIONS[(idx + 1) % len(HELP_SECTIONS)]
+        await interaction.response.edit_message(embed=_help_embed(new_section, self.prefix), view=self)
+
+    @button(label="Close", style=discord.ButtonStyle.danger)
+    async def close_btn(self, interaction: discord.Interaction, button: Button):
+        try:
+            await interaction.message.delete()
+        except discord.HTTPException:
+            await interaction.response.edit_message(content="(closed)", embed=None, view=None)
+
+    def _current_section_from_embed(self, message: discord.Message) -> str:
+        emb = message.embeds[0] if message.embeds else None
+        if not emb:
+            return "Overview"
+        # Guess based on field names present
+        names = [f.name for f in emb.fields]
+        if "What it does" in names:
+            return "Overview"
+        for s in HELP_SECTIONS:
+            if any(s in n for n in names):
+                return s
+        return "Overview"
+
+# -----------------------
+# Cog
+# -----------------------
 
 class Counting(commands.Cog):
-    """Cooperative counting game — with embeds, gifs, and fun language (no payouts)."""
+    """+1 counting game with tiered smartass mode (nice → roast) and a pretty help menu."""
 
-    __author__ = "BigPattyOG | Concept by Gen"
-    __version__ = "3.0.0"
-
-    def __init__(self, bot: commands.Bot):
+    def __init__(self, bot):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=903428736)
+        self.config = Config.get_conf(self, identifier=CONF_ID, force_registration=True)
+
         default_guild = {
-            "channel": None,           # int channel ID
-            "record": 0,               # highest number reached
-            "expected": 1,             # next expected number
-            "last_user": None,         # last user ID who counted
-            "players": {},             # user_id -> counts contributed in current run
+            "channel_id": None,
+            "last_number": 0,
+            "last_user_id": None,
+            "high_score": 0,
+            "allow_bots": False,
+
+            # Sass controls
+            "smartass": True,        # global toggle for quips
+            "sass_level": 2,         # 0..3 upper bound
+            "allow_roast": True,     # allow tier-3 lines
+            "praise_rate": 12,       # 1 in N correct counts
+            "roast_rate": 1,         # 1 in N fails may use roast (min 1)
+            "gentle_first_n": 10,    # first N expected numbers: stay ≤ cheeky
+
+            # Custom quips (persistence)
+            "custom_praise": [],
+            "custom_fail_wrong": [],
+            "custom_fail_double": [],
+        }
+        default_member = {
+            "correct": 0,
+            "fails": 0,
+            "current_streak": 0,
+            "best_streak": 0,
+            # fail escalation
+            "recent_fail_count": 0,
+            "recent_fail_ts": 0.0,
         }
         self.config.register_guild(**default_guild)
+        self.config.register_member(**default_member)
 
-    # -----------------------------
-    # Helpers
-    # -----------------------------
-    async def _get_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        channel_id = await self.config.guild(guild).channel()
-        if channel_id is None:
-            return None
-        ch = guild.get_channel(channel_id)
-        if isinstance(ch, discord.TextChannel):
-            return ch
-        return None
+    # -------------- Listener --------------
 
-    async def _status_embed(self, guild: discord.Guild) -> discord.Embed:
-        conf = self.config.guild(guild)
-        expected = await conf.expected()
-        record = await conf.record()
-        last_user = await conf.last_user()
-        channel = await self._get_channel(guild)
-        last_user_str = f"<@{last_user}>" if last_user else "—"
-        channel_str = channel.mention if channel else "Not set"
-        fields = [
-            ("Next Number", f"**{expected}**", True),
-            ("Record", f"**{record}**", True),
-            ("Last Counter", last_user_str, True),
-            ("Channel", channel_str, True),
-        ]
-        return _make_embed(
-            title=f"{INFO_EMOJI} Counting Status",
-            description=(
-                "Work together to count upwards, one human at a time.\n\n"
-                "**Rules**: rotate users, no edits, only the number."
-            ),
-            color=BLUE,
-            fields=fields,
-            thumbnail_url="https://media.tenor.com/3u4r0aZ9k5wAAAAC/counting-the-count.gif",
-        )
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if not message.guild or message.author is None:
+            return
 
-    async def _announce_reset(
+        # ignore bots unless explicitly allowed
+        allow_bots = await self.config.guild(message.guild).allow_bots()
+        if message.author.bot and not allow_bots:
+            return
+
+        gconf = await self.config.guild(message.guild).all()
+        channel_id = gconf["channel_id"]
+        if channel_id is None or message.channel.id != channel_id:
+            return
+
+        content = message.content.strip()
+        try:
+            value = int(content)
+        except ValueError:
+            return  # ignore non-numeric messages
+
+        # state
+        last_number = gconf["last_number"]
+        last_user_id = gconf["last_user_id"]
+
+        # No doubles
+        if last_user_id is not None and message.author.id == last_user_id:
+            await self._fail(message, reason="double")
+            return
+
+        # Must be +1
+        expected = last_number + 1
+        if value != expected:
+            await self._fail(message, reason="wrong", expected=expected, given=value)
+            return
+
+        # Success
+        await self.config.guild(message.guild).last_number.set(value)
+        await self.config.guild(message.guild).last_user_id.set(message.author.id)
+
+        # Member stats
+        async with self.config.member(message.author).all() as m:
+            m["correct"] += 1
+            m["current_streak"] += 1
+            m["recent_fail_count"] = 0
+            m["recent_fail_ts"] = 0.0
+            if m["current_streak"] > m["best_streak"]:
+                m["best_streak"] = m["current_streak"]
+
+        # High score
+        if value > gconf["high_score"]:
+            await self.config.guild(message.guild).high_score.set(value)
+
+        # React to acknowledge
+        try:
+            await message.add_reaction("✅")
+        except discord.HTTPException:
+            pass
+
+        # Praise (smartass)
+        if gconf.get("smartass", True):
+            rate = max(2, int(gconf.get("praise_rate", 12)))
+            gentle_ceiling = 1 if expected <= int(gconf.get("gentle_first_n", 10)) else gconf.get("sass_level", 2)
+            if random.randint(1, rate) == 1:
+                level_cap = min(3 if gconf.get("allow_roast", True) else 2, int(gentle_ceiling))
+                weights = [4, 3, 2, 1]  # bias to nicer tones
+                pool_levels = list(range(0, level_cap + 1))
+                pool_weights = weights[: level_cap + 1]
+                level = random.choices(pool_levels, weights=pool_weights, k=1)[0]
+                line = random.choice(PRAISE[level] + gconf.get("custom_praise", []))
+                try:
+                    await message.reply(
+                        line.format(user=message.author.mention, count=expected),
+                        mention_author=False,
+                        delete_after=7,
+                    )
+                except discord.HTTPException:
+                    pass
+
+    # -------------- Helpers --------------
+
+    async def _fail(
         self,
         message: discord.Message,
         *,
         reason: str,
-        got: Optional[str] = None,
-    ) -> None:
-        try:
-            await message.add_reaction(FAIL_EMOJI)
-        except discord.HTTPException:
-            pass
-        fields = [
-            ("Reset Reason", reason, False),
-            ("Back To", "**1**", True),
-            ("How To", "Just send the number only.", True),
-        ]
-        if got is not None:
-            fields.insert(0, ("You Sent", f"`{got}`", False))
-        embed = _make_embed(
-            title=random.choice(FUN_RESET_LINES),
-            description="The sacred count has reset. Breathe in. Start at **1**.",
-            color=RED,
-            fields=fields,
-            image_url=random.choice(GIF_FACEPALMS),
-        )
-        await message.channel.send(embed=embed)
+        expected: Optional[int] = None,
+        given: Optional[int] = None,
+    ):
+        guild = message.guild
+        gconf = await self.config.guild(guild).all()
 
-    async def _announce_correct(
-        self,
-        message: discord.Message,
-        *,
-        new_expected: int,
-    ) -> None:
-        try:
-            await message.add_reaction(OK_EMOJI)
-        except discord.HTTPException:
-            pass
-        # Post an embed at helpful cadence
-        if new_expected in (2, 3) or (new_expected - 1) % 10 == 0:
-            line = random.choice(FUN_OK_LINES).format(next=new_expected)
-            embed = _make_embed(
-                title="Nice!",
-                description=line,
-                color=GREEN,
-            )
-            await message.channel.send(embed=embed)
+        # increment member fails and reset streak; track recent fails (10 min window)
+        now = time.time()
+        async with self.config.member(message.author).all() as m:
+            m["fails"] += 1
+            m["current_streak"] = 0
+            if now - float(m.get("recent_fail_ts", 0)) <= 600:
+                m["recent_fail_count"] = int(m.get("recent_fail_count", 0)) + 1
+            else:
+                m["recent_fail_count"] = 1
+            m["recent_fail_ts"] = now
+            recent_fails = m["recent_fail_count"]
 
-    async def _announce_record(
-        self,
-        message: discord.Message,
-        *,
-        record: int,
-        players: Dict[str, int],
-    ) -> None:
+        await self.config.guild(guild).last_number.set(0)
+        await self.config.guild(guild).last_user_id.set(None)
+
         try:
-            await message.add_reaction(PARTY_EMOJI)
+            await message.add_reaction("❌")
         except discord.HTTPException:
             pass
-        # Build a simple top-10 leaderboard snapshot for this run
-        if players:
-            top = sorted(players.items(), key=lambda kv: kv[1], reverse=True)[:10]
-            lines = [f"<@{uid}> — **{cnt}**" for uid, cnt in top]
-            leaderboard = "\n".join(lines)
+
+        # Smartass reply
+        if gconf.get("smartass", True):
+            base_level = int(gconf.get("sass_level", 2))
+            esc = 1 if recent_fails >= 2 else 0
+            level_cap = 3 if gconf.get("allow_roast", True) else 2
+            gentle_cap = 1 if (expected or 0) <= int(gconf.get("gentle_first_n", 10)) else 3
+            level = min(base_level + esc, level_cap, gentle_cap)
+
+            if level_cap == 3 and random.randint(1, max(1, int(gconf.get("roast_rate", 1)))) == 1:
+                level = min(3, level)
+
+            if reason == "double":
+                line = choose_quip(FAIL_DOUBLE, level)
+                extras = gconf.get("custom_fail_double", [])
+                if extras and random.randint(1, 3) == 1:
+                    line = random.choice(extras + [line])
+                text = line.format(user=message.author.mention)
+            else:
+                line = choose_quip(FAIL_WRONG, level)
+                extras = gconf.get("custom_fail_wrong", [])
+                if extras and random.randint(1, 3) == 1:
+                    line = random.choice(extras + [line])
+                text = line.format(user=message.author.mention, expected=expected, given=given)
         else:
-            leaderboard = "—"
-        fields = [
-            ("New F*cking Record!", f"Reached **{record}**", False),
-            ("Top Contributors (this run)", leaderboard, False),
-        ]
-        embed = _make_embed(
-            title=random.choice(FUN_RECORD_LINES).format(record=record),
-            description="Numbers fear you now.",
-            color=GOLD,
-            fields=fields,
-            image_url=random.choice(GIF_CELEBRATE),
+            base = f"Expected **{expected}**." if expected is not None else "No doubles (same user twice)."
+            text = f"{base} Count resets to **0**. Start again with `1`."
+
+        try:
+            await message.reply(text, mention_author=False, delete_after=10)
+        except discord.HTTPException:
+            pass
+
+    # -------------- Commands --------------
+
+    @commands.guild_only()
+    @commands.group(name="counting", invoke_without_command=True)
+    async def _counting(self, ctx: commands.Context):
+        """Base command shows the interactive help menu."""
+        # Show the pretty help when invoked as just `!counting`
+        prefix = ctx.clean_prefix if hasattr(ctx, "clean_prefix") else (ctx.prefix or "!")
+        view = HelpView(prefix, ctx.author.id)
+        emb = _help_embed("Overview", prefix)
+        await ctx.send(embed=emb, view=view)
+
+    @_counting.command(name="help")
+    async def counting_help(self, ctx: commands.Context):
+        """Show the interactive help menu."""
+        prefix = ctx.clean_prefix if hasattr(ctx, "clean_prefix") else (ctx.prefix or "!")
+        view = HelpView(prefix, ctx.author.id)
+        emb = _help_embed("Overview", prefix)
+        await ctx.send(embed=emb, view=view)
+
+    @_counting.command(name="setchannel")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def counting_setchannel(self, ctx: commands.Context, channel: discord.TextChannel):
+        """Set the counting channel."""
+        await self.config.guild(ctx.guild).channel_id.set(channel.id)
+        await ctx.send(f"Counting channel set to {channel.mention}. Start with `1`!")
+
+    @_counting.command(name="status")
+    async def counting_status(self, ctx: commands.Context):
+        """Show current status and high score."""
+        g = await self.config.guild(ctx.guild).all()
+        ch = ctx.guild.get_channel(g["channel_id"]) if g["channel_id"] else None
+        last_user = f"<@{g['last_user_id']}>" if g["last_user_id"] else "None"
+        await ctx.send(
+            f"**Channel:** {ch.mention if ch else 'Not set'}\n"
+            f"**Last number:** {g['last_number']}\n"
+            f"**Last user:** {last_user}\n"
+            f"**High score:** {g['high_score']}\n"
+            f"**Allow bots:** {g['allow_bots']}\n"
+            f"**Smartass:** {g.get('smartass', True)}\n"
+            f"**Sass level:** {g.get('sass_level', 2)} (0 nice → 3 roast-cap)\n"
+            f"**Allow roast:** {g.get('allow_roast', True)}\n"
+            f"**Praise rate:** 1/{max(2, int(g.get('praise_rate', 12)))}\n"
+            f"**Roast rate (fails):** 1/{max(1, int(g.get('roast_rate', 1)))}\n"
+            f"**Gentle first N:** {int(g.get('gentle_first_n', 10))}"
         )
-        await message.channel.send(embed=embed)
 
-    async def _hard_reset(self, guild: discord.Guild) -> None:
-        conf = self.config.guild(guild)
-        await conf.expected.set(1)
-        await conf.last_user.set(None)
-        await conf.players.set({})
+    @_counting.command(name="reset")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def counting_reset(self, ctx: commands.Context, start_at: Optional[int] = 0):
+        """Reset the count (default 0)."""
+        if start_at is None or start_at < 0:
+            start_at = 0
+        await self.config.guild(ctx.guild).last_number.set(start_at)
+        await self.config.guild(ctx.guild).last_user_id.set(None)
+        await ctx.send(f"Count reset. Next expected is **{start_at + 1}**.")
 
-    def _is_commandish(self, content: str) -> bool:
-        # Treat common command prefixes as exempt from counting
-        return content.startswith(("!", "/", ".", "?", "-"))
+    @_counting.command(name="setstart")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def counting_setstart(self, ctx: commands.Context, start_at: int):
+        """Set the starting number (next expected will be start+1)."""
+        if start_at < 0:
+            return await ctx.send("Start must be >= 0.")
+        await self.config.guild(ctx.guild).last_number.set(start_at)
+        await self.config.guild(ctx.guild).last_user_id.set(None)
+        await ctx.send(f"Start set to **{start_at}**. Next expected is **{start_at + 1}**.")
 
-    # -----------------------------
-    # Commands
-    # -----------------------------
-    @commands.group()
-    async def counting(self, ctx: commands.Context):
-        """Counting game controls."""
-        if ctx.invoked_subcommand is None:
-            await ctx.send(embed=await self._status_embed(ctx.guild))
+    @_counting.command(name="allowbots")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def counting_allowbots(self, ctx: commands.Context, toggle: bool):
+        """Allow or disallow bot accounts to participate."""
+        await self.config.guild(ctx.guild).allow_bots.set(bool(toggle))
+        await ctx.send(f"Allow bots set to **{bool(toggle)}**.")
 
-    @counting.command(aliases=["info"])
-    async def help(self, ctx: commands.Context):
-        """How to play."""
-        embed = _make_embed(
-            title="Welcome to Counting!",
-            description=(
-                "You're all teaming up to count upwards. Easy, right? **Wrong.**\n\n"
-                "**Send only the number.**\n"
-                "Rotate users (no double-dipping).\n"
-                "Edits, extra words, or wrong numbers = **reset to 1**."
-            ),
-            color=PURPLE,
-            image_url="https://media.tenor.com/4Oe1i3ZyqS4AAAAC/sesame-street-count.gif",
+    # ------- Sass controls -------
+    @_counting.command(name="smartass")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def counting_smartass(self, ctx: commands.Context, toggle: bool):
+        """Enable/disable smartass mode."""
+        await self.config.guild(ctx.guild).smartass.set(bool(toggle))
+        await ctx.send(f"Smartass mode set to **{bool(toggle)}**.")
+
+    @_counting.command(name="sasslevel")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def counting_sasslevel(self, ctx: commands.Context, level: int):
+        """Set sass level (0=nice, 1=cheeky, 2=snarky, 3=roast-cap)."""
+        level = max(0, min(3, int(level)))
+        await self.config.guild(ctx.guild).sass_level.set(level)
+        await ctx.send(f"Sass level set to **{level}**.")
+
+    @_counting.command(name="allowroast")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def counting_allowroast(self, ctx: commands.Context, toggle: bool):
+        """Allow tier-3 'roast' lines (disable if your server prefers gentle)."""
+        await self.config.guild(ctx.guild).allow_roast.set(bool(toggle))
+        await ctx.send(f"Allow roast set to **{bool(toggle)}**.")
+
+    @_counting.command(name="praiserate")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def counting_praiserate(self, ctx: commands.Context, one_in_n: int):
+        """Set praise frequency; 1 in N correct counts gets a praise line (min 2)."""
+        one_in_n = max(2, int(one_in_n))
+        await self.config.guild(ctx.guild).praise_rate.set(one_in_n)
+        await ctx.send(f"Praise rate set to **1/{one_in_n}**.")
+
+    @_counting.command(name="roastrate")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def counting_roastrate(self, ctx: commands.Context, one_in_n: int):
+        """Set roast consideration on fails; 1 in N fails may use roast tier (min 1 = always)."""
+        one_in_n = max(1, int(one_in_n))
+        await self.config.guild(ctx.guild).roast_rate.set(one_in_n)
+        await ctx.send(f"Roast rate (fails) set to **1/{one_in_n}**.")
+
+    @_counting.command(name="gentlefirst")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def counting_gentlefirst(self, ctx: commands.Context, n: int):
+        """Keep early game ≤ cheeky for the first N expected numbers (default 10)."""
+        n = max(0, int(n))
+        await self.config.guild(ctx.guild).gentle_first_n.set(n)
+        await ctx.send(f"Gentle-first window set to **{n}**.")
+
+    # ------- Custom quips -------
+    @_counting.group(name="quips", invoke_without_command=True)
+    @commands.has_guild_permissions(manage_guild=True)
+    async def counting_quips(self, ctx: commands.Context):
+        """Manage custom quips: add your own lines."""
+        await ctx.send_help()
+
+    @counting_quips.command(name="addpraise")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def quips_addpraise(self, ctx: commands.Context, *, line: str):
+        """Add a custom praise line. Vars: {user}, {count}."""
+        async with self.config.guild(ctx.guild).custom_praise() as arr:
+            arr.append(line.strip())
+        await ctx.send("Added custom praise line.")
+
+    @counting_quips.command(name="addfailwrong")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def quips_addfailwrong(self, ctx: commands.Context, *, line: str):
+        """Add a custom wrong-number line. Vars: {user}, {expected}, {given}."""
+        async with self.config.guild(ctx.guild).custom_fail_wrong() as arr:
+            arr.append(line.strip())
+        await ctx.send("Added custom wrong-number line.")
+
+    @counting_quips.command(name="addfaildouble")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def quips_addfaildouble(self, ctx: commands.Context, *, line: str):
+        """Add a custom double-post line. Vars: {user}."""
+        async with self.config.guild(ctx.guild).custom_fail_double() as arr:
+            arr.append(line.strip())
+        await ctx.send("Added custom double-post line.")
+
+    @counting_quips.command(name="list")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def quips_list(self, ctx: commands.Context):
+        """List custom quips."""
+        g = await self.config.guild(ctx.guild).all()
+        def fmt(arr): return "\n".join(f"- {x}" for x in arr) if arr else "_none_"
+        await ctx.send(
+            "**Custom Praise:**\n"
+            f"{fmt(g.get('custom_praise', []))}\n\n"
+            "**Custom Fail (wrong):**\n"
+            f"{fmt(g.get('custom_fail_wrong', []))}\n\n"
+            "**Custom Fail (double):**\n"
+            f"{fmt(g.get('custom_fail_double', []))}"
         )
-        await ctx.send(embed=embed)
 
-    @counting.command()
-    async def status(self, ctx: commands.Context):
-        """Show current status."""
-        await ctx.send(embed=await self._status_embed(ctx.guild))
+    @counting_quips.command(name="clear")
+    @commands.has_guild_permissions(manage_guild=True)
+    async def quips_clear(self, ctx: commands.Context, category: str):
+        """Clear a category: praise | wrong | double"""
+        category = category.lower().strip()
+        key = {
+            "praise": "custom_praise",
+            "wrong": "custom_fail_wrong",
+            "double": "custom_fail_double",
+        }.get(category)
+        if not key:
+            return await ctx.send("Pick one: `praise`, `wrong`, or `double`.")
+        await self.config.guild(ctx.guild).set_raw(key, value=[])
+        await ctx.send(f"Cleared custom {category} quips.")
 
-    @counting.command()
-    async def record(self, ctx: commands.Context):
-        """Get the highest count record."""
-        record = await self.config.guild(ctx.guild).record()
-        embed = _make_embed(
-            title="All-Time Record",
-            description=f"Server best is **{record}**. Dare to beat it?",
-            color=GOLD,
+    @_counting.command(name="leaderboard")
+    async def counting_leaderboard(self, ctx: commands.Context, top: int = 10):
+        """Show top members by best streak."""
+        data = await self.config.all_members(ctx.guild)
+        items = []
+        for member_id, stats in data.items():
+            best = stats.get("best_streak", 0)
+            if best > 0:
+                member = ctx.guild.get_member(int(member_id))
+                items.append((member.mention if member else f"<@{member_id}>", best))
+        if not items:
+            return await ctx.send("No data yet.")
+        items.sort(key=lambda x: x[1], reverse=True)
+        top = max(1, min(top, 25))
+        lines = [f"**{i+1}.** {name} — **{score}**" for i, (name, score) in enumerate(items[:top])]
+        await ctx.send("__**Best Streaks**__\n" + "\n".join(lines))
+
+    # -------------- Help hook --------------
+
+    async def format_help_for_context(self, ctx: commands.Context) -> str:
+        prefix = ctx.clean_prefix if hasattr(ctx, "clean_prefix") else (ctx.prefix or "!")
+        return (
+            "Counting — a +1 counting game with optional sass.\n"
+            f"Try `{prefix}counting` for the interactive help menu."
         )
-        await ctx.send(embed=embed)
-
-    @commands.group(aliases=["setcounting"]) 
-    async def setcount(self, ctx: commands.Context):
-        """Configure counting."""
-        if ctx.invoked_subcommand is None:
-            await ctx.send_help()
-
-    @checks.admin_or_permissions()
-    @setcount.command()
-    async def channel(self, ctx: commands.Context, channel: discord.TextChannel):
-        """Set the channel where counting happens."""
-        await self.config.guild(ctx.guild).channel.set(channel.id)
-        embed = _make_embed(
-            title="Channel Updated",
-            description=f"Counting will now happen in {channel.mention}.",
-            color=BLUE,
-        )
-        await ctx.send(embed=embed)
-
-    @checks.admin_or_permissions()
-    @setcount.command()
-    async def expected(self, ctx: commands.Context, count: int):
-        """Manually set the next expected number (no rewards, no refunds)."""
-        if count < 1:
-            count = 1
-        await self.config.guild(ctx.guild).expected.set(count)
-        embed = _make_embed(
-            title="Expected Number Updated",
-            description=f"Okay brainiacs, next number is now **{count}**.",
-            color=PURPLE,
-        )
-        await ctx.send(embed=embed)
-
-    @checks.admin_or_permissions()
-    @setcount.command()
-    async def reset(self, ctx: commands.Context):
-        """Reset the run back to 1 and clear contributors."""
-        await self._hard_reset(ctx.guild)
-        embed = _make_embed(
-            title="Manual Reset",
-            description="Dusting off the abacus. Start again at **1**.",
-            color=RED,
-            image_url=random.choice(GIF_FACEPALMS),
-        )
-        await ctx.send(embed=embed)
-
-    # -----------------------------
-    # Listeners
-    # -----------------------------
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild:
-            return
-        conf = self.config.guild(message.guild)
-        channel = await self._get_channel(message.guild)
-        if not channel or message.channel.id != channel.id:
-            return
-
-        content = message.content
-        # Treat common bot prefixes as non-counting
-        if content.startswith(("!", "/", ".", "?", "-")):
-            return
-
-        m = NUMBER_RE.match(content)
-        if not m:
-            await self._hard_reset(message.guild)
-            await self._announce_reset(message, reason="Message wasn't just a number.", got=content)
-            return
-
-        number = int(m.group(1))
-        expected = await conf.expected()
-        last_user = await conf.last_user()
-
-        # Must be the exact expected number
-        if number != expected:
-            await self._hard_reset(message.guild)
-            await self._announce_reset(
-                message,
-                reason=f"Expected **{expected}**, got **{number}**.",
-                got=str(number),
-            )
-            return
-
-        # Must rotate users
-        if last_user is not None and last_user == str(message.author.id):
-            await self._hard_reset(message.guild)
-            await self._announce_reset(message, reason="Same user twice in a row.", got=str(number))
-            return
-
-        # Update state for a correct number
-        new_expected = expected + 1
-        await conf.expected.set(new_expected)
-        await conf.last_user.set(str(message.author.id))
-        players = await conf.players()
-        players[str(message.author.id)] = players.get(str(message.author.id), 0) + 1
-        await conf.players.set(players)
-
-        # React OK & maybe say nice line
-        await self._announce_correct(message, new_expected=new_expected)
-
-        # Check for record
-        record = await conf.record()
-        just_reached = number
-        if just_reached > record:
-            await conf.record.set(just_reached)
-            await self._announce_record(message, record=just_reached, players=players)
-
-    @commands.Cog.listener()
-    async def on_message_edit(self, before: discord.Message, after: discord.Message):
-        # Any edit in the counting channel resets
-        if not after.guild:
-            return
-        channel = await self._get_channel(after.guild)
-        if channel and after.channel.id == channel.id and before.content != after.content:
-            await self._hard_reset(after.guild)
-            await self._announce_reset(after, reason="Message was edited.", got=after.content)
-
-    # Metadata for [p]cog info
-    def format_help_for_context(self, ctx: commands.Context) -> str:
-        pre = super().format_help_for_context(ctx)
-        return f"{pre}\n\nVersion: {self.__version__}\nAuthor: {self.__author__}"
