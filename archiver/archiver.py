@@ -6,14 +6,14 @@ import discord
 from redbot.core import commands, checks, Config
 
 
-__author__ = "yourname"
-__version__ = "1.1.0"
+__author__ = "DABIGMANPATTY"
+__version__ = "1.2.0"
 
 
 DEFAULT_GUILD = {
-    "management_guild_id": 773827710165844008,        # int
-    "management_category_id": 1344350295219638363,     # Optional[int]
-    "delete_after_archive": True,                      # bool
+    "management_guild_id": None,         # Optional[int]
+    "management_category_id": None,      # Optional[int]
+    "delete_after_archive": True,        # bool
 }
 
 
@@ -108,29 +108,42 @@ class ChannelArchiver(commands.Cog):
             webhook = await dest_channel.create_webhook(name=f"ArchiveMirror-{src_channel.name}")
         except discord.Forbidden:
             await status_msg.edit(content="❌ Missing Manage Webhooks in destination channel.")
+            try:
+                await dest_channel.delete(reason="Archive failed: webhook creation forbidden")
+            except Exception:
+                pass
             return None
         except Exception as e:
             await status_msg.edit(content=f"❌ Failed to create webhook in destination channel: {e}")
+            try:
+                await dest_channel.delete(reason="Archive failed: webhook creation error")
+            except Exception:
+                pass
             return None
 
         # Header message in destination
-        await dest_channel.send(
-            embed=discord.Embed(
-                title="Channel Archived",
-                description=(
-                    f"Archived from **{src_guild.name}** `{src_guild.id}`\n"
-                    f"Source channel: **#{src_channel.name}** `{src_channel.id}`\n"
-                    f"Messages are replayed below using a webhook to preserve author names and avatars."
-                ),
-                color=discord.Color.blurple(),
-            ).set_footer(text=f"Started by {ctx.author} ({ctx.author.id})")
-        )
+        try:
+            await dest_channel.send(
+                embed=discord.Embed(
+                    title="Channel Archived",
+                    description=(
+                        f"Archived from **{src_guild.name}** `{src_guild.id}`\n"
+                        f"Source channel: **#{src_channel.name}** `{src_channel.id}`\n"
+                        f"Messages are replayed below using a webhook to preserve author names and avatars."
+                    ),
+                    color=discord.Color.blurple(),
+                ).set_footer(text=f"Started by {ctx.author} ({ctx.author.id})")
+            )
+        except Exception:
+            # Not fatal, but log to status
+            await status_msg.edit(content="⚠️ Created destination channel, but failed to send header embed.")
 
         # Copy messages oldest -> newest
         total = 0
         try:
             async for message in src_channel.history(limit=None, oldest_first=True):
-                if message.id == status_msg.id:
+                # Skip our own status message if it's actually in this channel
+                if message.id == status_msg.id and message.channel.id == src_channel.id:
                     continue
 
                 username = f"{message.author.display_name}"
@@ -153,9 +166,9 @@ class ChannelArchiver(commands.Cog):
                     except Exception:
                         final_text += f"\n[Attachment could not be mirrored, original URL]({att.url})"
 
-                # Embeds: best-effort copy
+                # Embeds: best-effort copy, but don't exceed Discord limits
                 embeds: List[discord.Embed] = []
-                for em in message.embeds:
+                for em in message.embeds[:10]:  # Discord max 10 embeds per message
                     try:
                         e = discord.Embed.from_dict(em.to_dict())
                         embeds.append(e)
@@ -166,15 +179,20 @@ class ChannelArchiver(commands.Cog):
                     safe_content = chunk_text if chunk_text is not None else ""
                     payload_embeds = embeds if (first and embeds) else []
                     payload_files = files if (first and files) else []
-                    await webhook.send(
-                        content=safe_content,
-                        username=username,
-                        avatar_url=avatar_url,
-                        embeds=payload_embeds,
-                        files=payload_files,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                        wait=True,
-                    )
+
+                    try:
+                        await webhook.send(
+                            content=safe_content,
+                            username=username,
+                            avatar_url=avatar_url,
+                            embeds=payload_embeds,
+                            files=payload_files,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                            wait=True,
+                        )
+                    except discord.HTTPException:
+                        # Skip this message but keep going
+                        pass
 
                 # Chunking for long content
                 if final_text and isinstance(final_text, str) and len(final_text) > 2000:
@@ -198,22 +216,50 @@ class ChannelArchiver(commands.Cog):
                     await send_chunk(final_text, first=True)
 
                 total += 1
-                if total % 50 == 0:
+
+                # Progress updates every 100 messages with date info
+                if total % 100 == 0:
+                    date_str = message.created_at.strftime("%Y-%m-%d")
                     try:
-                        await status_msg.edit(content=f"📦 Archived {total} messages so far…")
+                        await status_msg.edit(
+                            content=(
+                                f"📦 Archived {total} messages so far… "
+                                f"currently at messages from **{date_str}**."
+                            )
+                        )
                     except Exception:
                         pass
 
-                # Gentle pacing to reduce global rate limits
-                await asyncio.sleep(0.3)
+                # Gentle pacing to reduce global rate limits (only every 20 msgs)
+                if total % 20 == 0:
+                    await asyncio.sleep(0.1)
 
         except discord.Forbidden:
             await status_msg.edit(content="❌ I don't have permission to read the channel history.")
+            try:
+                await webhook.delete(reason="Archive aborted: read history forbidden")
+            except Exception:
+                pass
+            return None
+        except asyncio.TimeoutError:
+            await status_msg.edit(
+                content=f"⚠️ Archive hit a network timeout after {total} messages. "
+                        f"Some messages may not have been mirrored."
+            )
+            try:
+                await webhook.delete(reason="Archive aborted: timeout")
+            except Exception:
+                pass
             return None
         except Exception as e:
             await status_msg.edit(content=f"⚠️ Archive encountered an error after {total} messages: {e}")
+            try:
+                await webhook.delete(reason="Archive aborted: error")
+            except Exception:
+                pass
             return None
         finally:
+            # If we got here without the above returns, try to clean the webhook
             try:
                 await webhook.delete(reason="Archive complete")
             except Exception:
@@ -238,6 +284,7 @@ class ChannelArchiver(commands.Cog):
 
     @commands.group(name="archiveset")
     @checks.admin()
+    @commands.guild_only()
     async def archiveset(self, ctx: commands.Context):
         """Configure where archives go and behavior."""
         if ctx.invoked_subcommand is None:
@@ -315,7 +362,8 @@ class ChannelArchiver(commands.Cog):
     @commands.guild_only()
     async def archivecategory(self, ctx: commands.Context, *, confirm: Optional[str] = None):
         """
-        Archive **all text channels** in the current channel's category.
+        Archive **all text channels** in the current channel's category, except the channel
+        you are running the command from (so we have somewhere to report progress).
 
         Destination category on the management server will be named: `ARCHIVE | <CategoryName>`.
         """
@@ -334,9 +382,13 @@ class ChannelArchiver(commands.Cog):
         if not dest_guild:
             return await ctx.send("❌ I am not in the management guild or it is unavailable.")
 
-        text_channels = [c for c in src_category.channels if isinstance(c, discord.TextChannel)]
+        # Skip the current channel so it isn't deleted mid-archive
+        text_channels = [
+            c for c in src_category.channels
+            if isinstance(c, discord.TextChannel) and c.id != ctx.channel.id
+        ]
         if not text_channels:
-            return await ctx.send("ℹ️ No text channels found in this category.")
+            return await ctx.send("ℹ️ No text channels (other than this one) found in this category.")
 
         dest_cat_name = f"ARCHIVE | {src_category.name}"
 
@@ -360,7 +412,8 @@ class ChannelArchiver(commands.Cog):
             )
             if dest is not None:
                 successes += 1
-            await asyncio.sleep(1.0)  # brief pause between channels to reduce rate limits
+            # brief pause between channels to reduce rate limits
+            await asyncio.sleep(1.0)
 
         failures = len(text_channels) - successes
         await ctx.send(
