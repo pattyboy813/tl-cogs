@@ -3,7 +3,7 @@ import asyncio
 from typing import Optional, Dict, List
 import discord
 from discord.ui import View, Select, button, Button
-from rebot.core import commands, Config
+from redbot.core import commands, Config
 
 CONF_ID = 347209384723923874
 
