@@ -90,7 +90,7 @@ def helpEmbed(section: str) -> discord.Embed:
 
 class HelpSelect(Select):
     def __init__(self, default_section: str = "Overview"):
-        options = [discord.SelectOption(label=s, value=s, default=(s == default_section)) for s in HELP_SECTIONS]
+        options = [discord.SelectOption(label=s, value=s, default=(s == default_section)) for s in helpSections]
         super().__init__(placeholder="Pick a help section…", options=options, min_values=1, max_values=1)
         
 
@@ -115,15 +115,15 @@ class HelpView(View):
     @button(label="⟵ Prev", style=discord.ButtonStyle.secondary)
     async def prev_btn(self, interaction: discord.Interaction, button: Button):
         current = self._current_section_from_embed(interaction.message)
-        idx = HELP_SECTIONS.index(current)
-        new_section = HELP_SECTIONS[(idx - 1) % len(HELP_SECTIONS)]
+        idx = helpSections.index(current)
+        new_section = helpSections[(idx - 1) % len(helpSections)]
         await interaction.response.edit_message(embed=_help_embed(new_section, ), view=self)
 
     @button(label="Next ⟶", style=discord.ButtonStyle.secondary)
     async def next_btn(self, interaction: discord.Interaction, button: Button):
         current = self._current_section_from_embed(interaction.message)
-        idx = HELP_SECTIONS.index(current)
-        new_section = HELP_SECTIONS[(idx + 1) % len(HELP_SECTIONS)]
+        idx = helpSections.index(current)
+        new_section = helpSections[(idx + 1) % len(helpSections)]
         await interaction.response.edit_message(embed=_help_embed(new_section, ), view=self)
 
     @button(label="Close", style=discord.ButtonStyle.danger)
@@ -140,7 +140,7 @@ class HelpView(View):
         names = [f.name for f in emb.fields]
         if "What it does" in names:
             return "Overview"
-        for s in HELP_SECTIONS:
+        for s in helpSections:
             if any(s in n for n in names):
                 return s
         return "Overview"
