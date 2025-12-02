@@ -426,7 +426,6 @@ class Counting(commands.Cog):
     @commands.group(name="counting", invoke_without_command=True)
     async def _counting(self, ctx: commands.Context):
         """Base command shows the interactive help menu."""
-         = ctx.clean_ if hasattr(ctx, "clean_") else (ctx. or "!")
         view = HelpView(, ctx.author.id)
         emb = _help_embed("Overview", )
         await ctx.send(embed=emb, view=view)
@@ -434,7 +433,6 @@ class Counting(commands.Cog):
     @_counting.command(name="help")
     async def counting_help(self, ctx: commands.Context):
         """Show the interactive help menu."""
-         = ctx.clean_ if hasattr(ctx, "clean_") else (ctx. or "!")
         view = HelpView(, ctx.author.id)
         emb = _help_embed("Overview", )
         await ctx.send(embed=emb, view=view)
