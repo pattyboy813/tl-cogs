@@ -514,7 +514,6 @@ class Counting(commands.Cog):
 
     # help hook
     async def format_help_for_context(self, ctx: commands.Context) -> str:
-         = ctx.clean_ if hasattr(ctx, "clean_") else (ctx. or "!")
         return (
             "Counting — a +1 counting game with a simple setup wizard.\n"
             f"Try `!counting setup` to configure it."
