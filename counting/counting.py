@@ -146,7 +146,7 @@ class HelpView(View):
         return "Overview"
 
 
-class countingSetupView(View):
+class CountingSetupView(View):
     def __init__(self, cog: "Counting", ctx: commands.Context, current: dict):
         super().__init__(timeout=300)
         self.cog = cog
