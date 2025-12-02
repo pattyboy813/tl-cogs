@@ -96,7 +96,7 @@ class HelpSelect(Select):
 
     async def callback(self, interaction: discord.Interaction):
         section = self.values[0]
-        await interaction.response.edit_message(embed=_help_embed(section, ), view=self.view)
+        await interaction.response.edit_message(embed=helpEmbed(section, ), view=self.view)
 
 
 class HelpView(View):
@@ -117,14 +117,14 @@ class HelpView(View):
         current = self._current_section_from_embed(interaction.message)
         idx = helpSections.index(current)
         new_section = helpSections[(idx - 1) % len(helpSections)]
-        await interaction.response.edit_message(embed=_help_embed(new_section, ), view=self)
+        await interaction.response.edit_message(embed=helpEmbed(new_section, ), view=self)
 
     @button(label="Next ⟶", style=discord.ButtonStyle.secondary)
     async def next_btn(self, interaction: discord.Interaction, button: Button):
         current = self._current_section_from_embed(interaction.message)
         idx = helpSections.index(current)
         new_section = helpSections[(idx + 1) % len(helpSections)]
-        await interaction.response.edit_message(embed=_help_embed(new_section, ), view=self)
+        await interaction.response.edit_message(embed=helpEmbed(new_section, ), view=self)
 
     @button(label="Close", style=discord.ButtonStyle.danger)
     async def close_btn(self, interaction: discord.Interaction, button: Button):
@@ -427,14 +427,14 @@ class Counting(commands.Cog):
     async def _counting(self, ctx: commands.Context):
         """Base command shows the interactive help menu."""
         view = HelpView(ctx.author.id)
-        emb = _help_embed("Overview", )
+        emb = helpEmbed("Overview", )
         await ctx.send(embed=emb, view=view)
 
     @_counting.command(name="help")
     async def counting_help(self, ctx: commands.Context):
         """Show the interactive help menu."""
         view = HelpView(ctx.author.id)
-        emb = _help_embed("Overview", )
+        emb = helpEmbed("Overview", )
         await ctx.send(embed=emb, view=view)
 
     @_counting.command(name="setup")
