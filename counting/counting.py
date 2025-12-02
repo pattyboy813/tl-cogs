@@ -92,18 +92,18 @@ class HelpSelect(Select):
     def __init__(self, default_section: str = "Overview"):
         options = [discord.SelectOption(label=s, value=s, default=(s == default_section)) for s in HELP_SECTIONS]
         super().__init__(placeholder="Pick a help section…", options=options, min_values=1, max_values=1)
-        self.prefix = prefix
+        
 
     async def callback(self, interaction: discord.Interaction):
         section = self.values[0]
-        await interaction.response.edit_message(embed=_help_embed(section, self.prefix), view=self.view)
+        await interaction.response.edit_message(embed=_help_embed(section, ), view=self.view)
 
 
 class HelpView(View):
     def __init__(self, author_id: int):
         super().__init__(timeout=120)
-        self.add_item(HelpSelect(prefix))
-        self.prefix = prefix
+        self.add_item(HelpSelect())
+        
         self.author_id = author_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -117,14 +117,14 @@ class HelpView(View):
         current = self._current_section_from_embed(interaction.message)
         idx = HELP_SECTIONS.index(current)
         new_section = HELP_SECTIONS[(idx - 1) % len(HELP_SECTIONS)]
-        await interaction.response.edit_message(embed=_help_embed(new_section, self.prefix), view=self)
+        await interaction.response.edit_message(embed=_help_embed(new_section, ), view=self)
 
     @button(label="Next ⟶", style=discord.ButtonStyle.secondary)
     async def next_btn(self, interaction: discord.Interaction, button: Button):
         current = self._current_section_from_embed(interaction.message)
         idx = HELP_SECTIONS.index(current)
         new_section = HELP_SECTIONS[(idx + 1) % len(HELP_SECTIONS)]
-        await interaction.response.edit_message(embed=_help_embed(new_section, self.prefix), view=self)
+        await interaction.response.edit_message(embed=_help_embed(new_section, ), view=self)
 
     @button(label="Close", style=discord.ButtonStyle.danger)
     async def close_btn(self, interaction: discord.Interaction, button: Button):
@@ -426,17 +426,17 @@ class Counting(commands.Cog):
     @commands.group(name="counting", invoke_without_command=True)
     async def _counting(self, ctx: commands.Context):
         """Base command shows the interactive help menu."""
-        prefix = ctx.clean_prefix if hasattr(ctx, "clean_prefix") else (ctx.prefix or "!")
-        view = HelpView(prefix, ctx.author.id)
-        emb = _help_embed("Overview", prefix)
+         = ctx.clean_ if hasattr(ctx, "clean_") else (ctx. or "!")
+        view = HelpView(, ctx.author.id)
+        emb = _help_embed("Overview", )
         await ctx.send(embed=emb, view=view)
 
     @_counting.command(name="help")
     async def counting_help(self, ctx: commands.Context):
         """Show the interactive help menu."""
-        prefix = ctx.clean_prefix if hasattr(ctx, "clean_prefix") else (ctx.prefix or "!")
-        view = HelpView(prefix, ctx.author.id)
-        emb = _help_embed("Overview", prefix)
+         = ctx.clean_ if hasattr(ctx, "clean_") else (ctx. or "!")
+        view = HelpView(, ctx.author.id)
+        emb = _help_embed("Overview", )
         await ctx.send(embed=emb, view=view)
 
     @_counting.command(name="setup")
@@ -516,7 +516,7 @@ class Counting(commands.Cog):
 
     # help hook
     async def format_help_for_context(self, ctx: commands.Context) -> str:
-        prefix = ctx.clean_prefix if hasattr(ctx, "clean_prefix") else (ctx.prefix or "!")
+         = ctx.clean_ if hasattr(ctx, "clean_") else (ctx. or "!")
         return (
             "Counting — a +1 counting game with a simple setup wizard.\n"
             f"Try `!counting setup` to configure it."
