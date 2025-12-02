@@ -17,7 +17,7 @@ helpSections = [
 def helpEmbed(section: str) -> discord.Embed:
     e = discord.Embed(
         title = "Counting - Help",
-        colour = discord.colour.red(),
+        colour = 0xFF0000,
         description = "Some help for keeping the count in line.",
     )
     e.set_footer(text = "Tip: Made you look")
