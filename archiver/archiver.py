@@ -7,7 +7,7 @@ from redbot.core import commands, checks, Config
 
 
 __author__ = "DABIGMANPATTY"
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 
 DEFAULT_GUILD = {
@@ -74,12 +74,18 @@ class ChannelArchiver(commands.Cog):
         use_configured_category: bool = True,
         delete_after: bool = True,
     ) -> Optional[discord.TextChannel]:
-        """Archive a single text channel to dest_guild. Returns the created dest channel or None on failure."""
+        """
+        Archive a single text channel to dest_guild.
+        Returns the created dest channel or None on failure.
+        """
         src_guild: discord.Guild = src_channel.guild
         settings = await self.config.guild(src_guild).all()
         cat_id = settings.get("management_category_id") if use_configured_category else None
 
-        status_msg = await ctx.send(f"🚚 Archiving **#{src_channel.name}** …")
+        status_msg = await ctx.send(
+            f"🚚 Archiving **#{src_channel.name}** …\n"
+            f"📦 Archived **0** messages so far."
+        )
 
         # Destination category
         dest_category = await self._get_or_create_category(dest_guild, dest_category_name, cat_id)
@@ -217,21 +223,22 @@ class ChannelArchiver(commands.Cog):
 
                 total += 1
 
-                # Progress updates every 100 messages with date info
-                if total % 100 == 0:
-                    date_str = message.created_at.strftime("%Y-%m-%d")
+                # Progress updates every 25 messages with date info
+                if total % 25 == 0:
+                    date_str = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
                     try:
                         await status_msg.edit(
                             content=(
-                                f"📦 Archived {total} messages so far… "
-                                f"currently at messages from **{date_str}**."
+                                f"🚚 Archiving **#{src_channel.name}** …\n"
+                                f"📦 Archived **{total:,}** messages so far.\n"
+                                f"🕒 Currently at messages from **{date_str}**."
                             )
                         )
                     except Exception:
                         pass
 
-                # Gentle pacing to reduce global rate limits (only every 20 msgs)
-                if total % 20 == 0:
+                # Gentle pacing to reduce global rate limits (only every 50 msgs)
+                if total % 50 == 0:
                     await asyncio.sleep(0.1)
 
         except discord.Forbidden:
@@ -265,9 +272,12 @@ class ChannelArchiver(commands.Cog):
             except Exception:
                 pass
 
-        await dest_channel.send(f"✅ Archive complete. Mirrored **{total}** messages.")
+        await dest_channel.send(f"✅ Archive complete. Mirrored **{total:,}** messages.")
         await status_msg.edit(
-            content=f"✅ Archive complete. Mirrored **{total}** messages to {dest_guild.name} → {dest_channel.mention}."
+            content=(
+                f"✅ Archive complete for **#{src_channel.name}**.\n"
+                f"📦 Mirrored **{total:,}** messages to {dest_guild.name} → {dest_channel.mention}."
+            )
         )
 
         if delete_after:
@@ -382,7 +392,7 @@ class ChannelArchiver(commands.Cog):
         if not dest_guild:
             return await ctx.send("❌ I am not in the management guild or it is unavailable.")
 
-        # Skip the current channel so it isn't deleted mid-archive
+        # Only text channels, and skip the current one so it isn't deleted mid-archive
         text_channels = [
             c for c in src_category.channels
             if isinstance(c, discord.TextChannel) and c.id != ctx.channel.id
@@ -400,8 +410,27 @@ class ChannelArchiver(commands.Cog):
                 + ".\nType `[p]archivecategory yes` to proceed."
             )
 
+        progress_msg = await ctx.send(
+            f"📂 Starting category archive of **{len(text_channels)}** channel(s) "
+            f"from **{src_category.name}** to `{dest_cat_name}`.\n"
+            f"Channels will be processed one at a time (this may take a while for large histories)."
+        )
+
         successes = 0
-        for ch in text_channels:
+        total_channels = len(text_channels)
+
+        for idx, ch in enumerate(text_channels, start=1):
+            try:
+                await progress_msg.edit(
+                    content=(
+                        f"📂 Category archive in progress…\n"
+                        f"▶️ Now archiving channel **{idx}/{total_channels}**: **#{ch.name}**\n"
+                        f"Channels are processed sequentially to avoid overloading the bot."
+                    )
+                )
+            except Exception:
+                pass
+
             dest = await self._archive_channel(
                 ctx,
                 ch,
@@ -412,11 +441,23 @@ class ChannelArchiver(commands.Cog):
             )
             if dest is not None:
                 successes += 1
-            # brief pause between channels to reduce rate limits
+
+            # brief pause between channels to reduce rate limits and CPU spikes
             await asyncio.sleep(1.0)
 
-        failures = len(text_channels) - successes
-        await ctx.send(
-            f"✅ Category archive finished: {successes} succeeded, {failures} failed. "
-            f"Destination category: `{dest_cat_name}`."
-        )
+        failures = total_channels - successes
+
+        try:
+            await progress_msg.edit(
+                content=(
+                    f"✅ Category archive finished.\n"
+                    f"📦 Channels archived successfully: **{successes}/{total_channels}**.\n"
+                    f"❌ Failed: **{failures}**.\n"
+                    f"Destination category: `{dest_cat_name}`."
+                )
+            )
+        except Exception:
+            await ctx.send(
+                f"✅ Category archive finished: {successes} succeeded, {failures} failed. "
+                f"Destination category: `{dest_cat_name}`."
+            )
