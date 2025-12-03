@@ -126,31 +126,72 @@ class AI(commands.Cog):
         short = self._shorten_reply(cleaned)
         return short
 
+    async def generate_chat_reply(self, user_text: str) -> str:
+        """
+        Reply to a normal chat message in-character.
+        Handles greetings and obvious small-talk without hitting the model.
+        """
+        if self._is_simple_greeting(user_text):
+            return self._random_greeting_reply()
+
+        if self._looks_like_smalltalk(user_text):
+            return self._fallback_smalltalk(user_text)
+
+        prompt = f"{BASE_PROMPT}\n\nLast message: {user_text}\nTLG AI:"
+        reply = await self.ask_ollama(prompt)
+
+        # If it still talks to "TLG AI" like a third person, just use a fallback.
+        if "tlg ai" in reply.lower():
+            return self._fallback_smalltalk(user_text)
+
+        return reply
+
+    async def generate_mod_reply(self, instruction: str, target_mention: str) -> str:
+        """
+        Ask the AI to phrase a moderation message (for spam / invites) in character.
+        """
+        prompt = (
+            f"{BASE_PROMPT}\n\n"
+            "Context: something happened in chat and you need to react to it.\n"
+            f"Instruction: {instruction}\n"
+            f"Address this message directly to {target_mention}. "
+            "Keep it to 1 short, casual sentence, maybe one emoji. "
+            "Don't lecture, just friendly but firm.\n\n"
+            "TLG AI:"
+        )
+        reply = await self.ask_ollama(prompt)
+        return reply
+
     def _is_simple_greeting(self, text: str) -> bool:
-        """
-        Detect very simple greetings so we can handle them ourselves
-        instead of trusting the LLM to not be weird.
-        """
+        """Detect very simple greetings we can reply to without the LLM."""
         t = text.strip().lower()
-        # Kill trailing punctuation
         t = re.sub(r"[!?.,]+$", "", t)
 
-        # Remove our name if they typed it
         for name in ["tlg ai", "tlgai", "tlg", "@tlg", "@tlg ai"]:
             t = t.replace(name, "")
         t = t.strip()
 
-        # Very short -> likely just a greeting
         if len(t) == 0:
             return True
 
         greetings = {"hi", "hey", "hello", "yo", "hiya", "heya", "sup"}
         return t in greetings
 
-    def _fallback_smalltalk(self, text: str) -> str:
-        """Fallback for stuff like 'hey, how are you' when the LLM is being cringe."""
+    def _looks_like_smalltalk(self, text: str) -> bool:
+        """Quick check for 'hey how are you' style stuff."""
         t = text.lower()
-        if re.search(r"how\s+are\s+(you|u)", t) or "hru" in t or "how's it going" in t:
+        return (
+            "how are you" in t
+            or "how r u" in t
+            or "hru" in t
+            or "how's it going" in t
+            or "hows it going" in t
+        )
+
+    def _fallback_smalltalk(self, text: str) -> str:
+        """Fallback for 'hey, how are you' etc when we don't want the LLM to be cringe."""
+        t = text.lower()
+        if self._looks_like_smalltalk(t):
             options = [
                 "pretty good, just vibing. you?",
                 "tired but alive lmao, hbu?",
@@ -159,7 +200,6 @@ class AI(commands.Cog):
             ]
             return random.choice(options)
 
-        # Generic short answer if the model output was unusable
         options = [
             "lmao fair enough",
             "yeah I feel that 😅",
@@ -180,46 +220,23 @@ class AI(commands.Cog):
         ]
         return random.choice(replies)
 
-    async def generate_reply(self, user_text: str) -> str:
-        """
-        Decide if we handle this as a simple greeting or send it to the LLM,
-        and patch over obviously bad model habits.
-        """
-        if self._is_simple_greeting(user_text):
-            return self._random_greeting_reply()
-
-        prompt = f"{BASE_PROMPT}\n\nLast message: {user_text}\nTLG AI:"
-        reply = await self.ask_ollama(prompt)
-
-        # If it still talks to "TLG AI" like a third person, just use a fallback.
-        if "tlg ai" in reply.lower():
-            return self._fallback_smalltalk(user_text)
-
-        return reply
-
     def _cleanup_reply(self, text: str) -> str:
         """
-        Lightly de-corporatize the reply:
-        - strip super formal greetings
-        - remove/replace assistant-y phrases
-        - strip narrator-style junk or echoed prompt text
-        - strip wrapping quotes
+        Strip formal / weird stuff the model sometimes adds.
         """
         original = text
         t = text.strip()
         lower = t.lower()
 
-        # Remove wrapping quotes like " ... " or ‘…’
+        # Remove wrapping quotes
         quote_pairs = [('\"', '\"'), ("'", "'"), ("“", "”"), ("‘", "’")]
         for ql, qr in quote_pairs:
             if t.startswith(ql) and t.endswith(qr) and len(t) > 2:
                 t = t[1:-1].strip()
-        # Also nuke stray leading quotes
         t = t.lstrip("\"'“”‘’").rstrip()
-
         lower = t.lower()
 
-        # If the model echoed the prompt, cut off anything after these markers
+        # Remove prompt echoes
         end_markers = [
             "tlg's reply (just the message):",
             "tlg's reply:",
@@ -235,7 +252,7 @@ class AI(commands.Cog):
                 lower = t.lower()
                 break
 
-        # Kill narrator-style meta intros the model loves
+        # Remove narrator-style intros
         meta_prefixes = [
             "here is a short response from tlg",
             "here's a short response from tlg",
@@ -277,7 +294,7 @@ class AI(commands.Cog):
                 lower = t.lower()
                 break
 
-        # Replace some obvious assistant phrases / polite filler
+        # Replace assistant phrases / polite filler
         replacements = {
             "I'm here to help with the fun stuff": "I'm just here hanging out with everyone",
             "I'm here to help with the fun stuff!": "I'm just here hanging out with everyone!",
@@ -300,9 +317,7 @@ class AI(commands.Cog):
         return t.strip()
 
     def _shorten_reply(self, text: str, max_sentences: int = 2, max_chars: int = 220) -> str:
-        """
-        Keep the reply short: max N sentences and max length.
-        """
+        """Keep replies short and Discord-ish."""
         parts = re.split(r'(?<=[.!?])\s+', text)
         if len(parts) > max_sentences:
             text = " ".join(parts[:max_sentences])
@@ -315,7 +330,7 @@ class AI(commands.Cog):
 
         return text
 
-    # ---------- Moderation helpers ----------
+    # ---------- Moderation helpers (detection = code, message = AI) ----------
 
     async def handle_invites(
         self,
@@ -339,7 +354,6 @@ class AI(commands.Cog):
         allowed_codes = set(code.lower() for code in guild_conf.get("allowed_invite_codes", []))
         timeout_seconds = int(guild_conf.get("invite_timeout_seconds", 0))
 
-        # If ANY invite in the message is not whitelisted, block the message
         for code in matches:
             if code.lower() not in allowed_codes:
                 # Delete the message
@@ -348,11 +362,14 @@ class AI(commands.Cog):
                 except discord.HTTPException:
                     pass
 
-                # Warn in channel
+                # Friendly AI warning
                 try:
-                    await message.channel.send(
-                        f"{message.author.mention} Discord invite links aren't allowed here."
+                    warn = await self.generate_mod_reply(
+                        "They posted a Discord invite link that isn't allowed. "
+                        "Tell them invites aren't allowed here.",
+                        message.author.mention,
                     )
+                    await message.channel.send(warn)
                 except discord.HTTPException:
                     pass
 
@@ -410,9 +427,12 @@ class AI(commands.Cog):
             except discord.HTTPException:
                 pass
             try:
-                await message.channel.send(
-                    f"{message.author.mention} you're sending messages too fast, slow down a bit."
+                warn = await self.generate_mod_reply(
+                    "They're sending messages too fast. "
+                    "Tell them to slow down a bit without being harsh.",
+                    message.author.mention,
                 )
+                await message.channel.send(warn)
             except discord.HTTPException:
                 pass
             return True
@@ -606,7 +626,7 @@ class AI(commands.Cog):
         Talk directly to TLG AI (admin only).
         """
         async with ctx.typing():
-            reply = await self.generate_reply(message)
+            reply = await self.generate_chat_reply(message)
 
         await ctx.reply(reply)
 
@@ -644,21 +664,22 @@ class AI(commands.Cog):
             prefixes = await self.bot.get_valid_prefixes()
         is_command_like = any(content.startswith(p) for p in prefixes)
 
-        # --- Direct mention detection: reply if bot is mentioned anywhere ---
         bot_user = self.bot.user
-        if bot_user and (bot_user in message.mentions) and not is_command_like:
-            # Remove the first occurrence of the bot mention from the text
+
+        # --- Direct mention detection using raw_mentions (no member intent needed) ---
+        if bot_user and (bot_user.id in message.raw_mentions) and not is_command_like:
+            # Strip the first mention of the bot from the content
             mention_pattern = rf"<@!?{bot_user.id}>"
             user_text = re.sub(mention_pattern, "", content, count=1).strip()
             if not user_text:
-                user_text = "hi"  # pure ping → treat as greeting
+                user_text = "hi"
 
             try:
                 await message.channel.trigger_typing()
             except discord.HTTPException:
                 pass
 
-            reply = await self.generate_reply(user_text)
+            reply = await self.generate_chat_reply(user_text)
             try:
                 await message.reply(reply)
             except discord.HTTPException:
@@ -700,7 +721,7 @@ class AI(commands.Cog):
         except discord.HTTPException:
             pass
 
-        reply = await self.generate_reply(user_text)
+        reply = await self.generate_chat_reply(user_text)
         try:
             await message.reply(reply)
         except discord.HTTPException:
