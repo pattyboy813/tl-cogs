@@ -134,12 +134,6 @@ If you're not sure what they want, use "action": "none" and write a normal chat-
 class AI(commands.Cog):
     """
     TLG AI - local LLM-powered server regular + automod + light server manager.
-
-    Big ideas:
-    - Hangs out in chat like another member.
-    - Learns how people in the server talk by watching messages.
-    - Uses AI to help with moderation.
-    - Admins can talk to it in natural language for simple management tasks.
     """
 
     def __init__(self, bot: Red):
@@ -150,15 +144,15 @@ class AI(commands.Cog):
 
         default_guild = {
             # Chat behaviour
-            "enabled": True,                # auto-chat enabled
-            "chat_channels": [],            # channels where it can auto-reply
-            "auto_reply_chance": 0.08,      # 8% chance to reply to a normal message
-            "cooldown_seconds": 40.0,       # min seconds between auto-replies per guild
+            "enabled": True,
+            "chat_channels": [],
+            "auto_reply_chance": 0.08,
+            "cooldown_seconds": 40.0,
             "last_reply_ts": 0.0,
 
             # Observation / "learning how people talk"
-            "observe_history_on_start": False,  # if True, read some history at startup
-            "history_messages_per_channel": 400,  # how deep to scan per text channel
+            "observe_history_on_start": False,
+            "history_messages_per_channel": 400,
 
             # Moderation settings
             "mod_enabled": True,
@@ -167,22 +161,20 @@ class AI(commands.Cog):
             "spam_messages": 6,
             "spam_interval": 7,
             "invite_timeout_seconds": 600,
-            "ai_moderation": True,          # use AI to classify messages
+            "ai_moderation": True,
         }
         self.config.register_guild(**default_guild)
 
-        # In-memory spam tracking: (guild_id, user_id) -> [timestamps...]
         self._spam_tracker: Dict[Tuple[int, int], List[float]] = defaultdict(list)
 
-        # Guilds where a full-history scan is running (lockdown mode)
+        # Guilds where full-history scan is running (lockdown)
         self._history_lockdown_guilds: set[int] = set()
 
-        # Per-guild, per-user short "how they talk" samples; not persisted
+        # Style memory (not persisted)
         self._style_samples: Dict[int, Dict[int, Deque[str]]] = defaultdict(
             lambda: defaultdict(lambda: deque(maxlen=30))
         )
 
-        # Whether we've kicked off a history observation task for a guild
         self._history_tasks: Dict[int, asyncio.Task] = {}
 
     # ---------------------------------------------------------------------- #
@@ -196,10 +188,6 @@ class AI(commands.Cog):
         temperature: float = 0.7,
         top_p: float = 0.9,
     ) -> str:
-        """
-        Low-level call to the local LLM (Ollama by default).
-        Returns raw text (no shortening / persona cleanup).
-        """
         payload = {
             "model": OLLAMA_MODEL,
             "prompt": prompt,
@@ -227,7 +215,6 @@ class AI(commands.Cog):
     # ---------------------------------------------------------------------- #
 
     def _remember_style(self, message: discord.Message) -> None:
-        """Store a short sample of how this user talks in this guild."""
         if not message.guild or not message.content:
             return
         if message.author.bot:
@@ -237,7 +224,6 @@ class AI(commands.Cog):
         uid = message.author.id
         text = message.content.strip()
 
-        # Ignore super short or super long stuff
         if len(text) < 4:
             return
         if len(text) > 220:
@@ -275,12 +261,6 @@ class AI(commands.Cog):
         *,
         scan_all: bool = False,
     ) -> None:
-        """
-        History scan to seed style samples.
-
-        If scan_all=True: try to read the entire history of every text channel
-        the bot can see. Otherwise, only read up to history_messages_per_channel.
-        """
         conf = await self.config.guild(guild).all()
         per_channel = int(conf.get("history_messages_per_channel", 400))
 
@@ -307,10 +287,7 @@ class AI(commands.Cog):
             limit = None if scan_all else per_channel
 
             try:
-                async for msg in channel.history(
-                    limit=limit,
-                    oldest_first=True,
-                ):
+                async for msg in channel.history(limit=limit, oldest_first=True):
                     self._remember_style(msg)
             except discord.HTTPException as e:
                 log.warning(
@@ -327,7 +304,6 @@ class AI(commands.Cog):
         log.info("TLG AI: finished history observation for guild %s", guild.id)
 
     async def cog_load(self) -> None:
-        # Kick off optional observation tasks for guilds that want it (no lockdown)
         for guild in self.bot.guilds:
             conf = await self.config.guild(guild).all()
             if conf.get("observe_history_on_start", False):
@@ -349,10 +325,6 @@ class AI(commands.Cog):
         message: discord.Message,
         user_text: str,
     ) -> str:
-        """
-        Reply to a normal chat message in-character.
-        Handles greetings and obvious small-talk without hitting the model when possible.
-        """
         if self._is_simple_greeting(user_text):
             return self._random_greeting_reply()
 
@@ -362,9 +334,10 @@ class AI(commands.Cog):
         guild = message.guild
         assert guild is not None
 
-        # Grab some style samples
         user_samples = self._get_user_samples(guild.id, message.author.id, max_count=4)
-        server_samples = self._get_server_samples(guild.id, exclude_user=message.author.id, max_count=6)
+        server_samples = self._get_server_samples(
+            guild.id, exclude_user=message.author.id, max_count=6
+        )
 
         persona_parts = [BASE_PERSONA_PROMPT.strip()]
 
@@ -399,9 +372,6 @@ class AI(commands.Cog):
         return short
 
     async def generate_mod_reply(self, instruction: str, target_mention: str) -> str:
-        """
-        Ask the LLM to phrase a moderation message (for spam / invites / AI moderation) in character.
-        """
         prompt = (
             BASE_PERSONA_PROMPT
             + "\n\nContext: something happened in chat and you need to react to it.\n"
@@ -422,9 +392,6 @@ class AI(commands.Cog):
     # ---------------------------------------------------------------------- #
 
     async def _plan_admin_action(self, message: discord.Message, user_text: str) -> Dict[str, Any]:
-        """
-        Ask the LLM to turn an admin's natural language request into a structured action.
-        """
         guild = message.guild
         channel = message.channel
 
@@ -440,20 +407,29 @@ class AI(commands.Cog):
 
         raw = await self._llm_request(prompt, temperature=0.2, top_p=0.95)
         if not raw:
-            return {"action": "none", "human_reply": "not totally sure what you want me to do there tbh 😅"}
+            return {
+                "action": "none",
+                "human_reply": "not totally sure what you want me to do there tbh 😅",
+            }
 
         text = raw.strip()
         start = text.find("{")
         end = text.rfind("}")
         if start == -1 or end == -1 or end <= start:
             log.warning("Admin intent LLM output not JSON: %r", raw[:300])
-            return {"action": "none", "human_reply": "I didn't quite parse that as a task, but I can still chat about it."}
+            return {
+                "action": "none",
+                "human_reply": "I didn't quite parse that as a task, but I can still chat about it.",
+            }
 
         try:
             obj = json.loads(text[start : end + 1])
         except Exception as e:
             log.warning("Failed to parse admin intent JSON: %s | %r", e, raw[:300])
-            return {"action": "none", "human_reply": "My brain scuffed that request, maybe try phrasing it a bit clearer?"}
+            return {
+                "action": "none",
+                "human_reply": "My brain scuffed that request, maybe try phrasing it a bit clearer?",
+            }
 
         action = obj.get("action") or "none"
         if action == "clean_channel":
@@ -461,10 +437,10 @@ class AI(commands.Cog):
             obj["messages"] = max(1, min(msgs, 200))
         elif action == "timeout_user":
             secs = int(obj.get("timeout_seconds") or 0)
-            obj["timeout_seconds"] = max(0, min(secs, 604800))  # up to 7 days
+            obj["timeout_seconds"] = max(0, min(secs, 604800))
         elif action == "set_slowmode":
             secs = int(obj.get("seconds") or 0)
-            obj["seconds"] = max(0, min(secs, 21600))  # up to 6 hours
+            obj["seconds"] = max(0, min(secs, 21600))
 
         if "human_reply" not in obj or not isinstance(obj["human_reply"], str):
             obj["human_reply"] = "gotchu 👍"
@@ -472,9 +448,6 @@ class AI(commands.Cog):
         return obj
 
     async def _execute_admin_action(self, message: discord.Message, plan: Dict[str, Any]) -> None:
-        """
-        Execute a planned admin action (if possible) and send the human_reply.
-        """
         guild = message.guild
         channel = message.channel
         me: Optional[discord.Member] = guild.me if guild else None
@@ -511,7 +484,7 @@ class AI(commands.Cog):
                 return
 
             limit = int(plan.get("messages") or 50)
-            limit = max(1, min(limit + 1, 200))  # include their command
+            limit = max(1, min(limit + 1, 200))
 
             try:
                 await channel.purge(limit=limit)
@@ -581,7 +554,10 @@ class AI(commands.Cog):
 
             seconds = int(plan.get("seconds") or 0)
             try:
-                await channel.edit(slowmode_delay=seconds, reason=f"Requested by {message.author} via TLG AI.")
+                await channel.edit(
+                    slowmode_delay=seconds,
+                    reason=f"Requested by {message.author} via TLG AI.",
+                )
             except discord.HTTPException as e:
                 log.warning("Slowmode edit failed: %s", e)
                 await message.reply("Discord didn't let me change slowmode.")
@@ -597,10 +573,6 @@ class AI(commands.Cog):
     # ---------------------------------------------------------------------- #
 
     async def _ai_moderation_decision(self, message: discord.Message, guild_conf: dict) -> bool:
-        """
-        Optional AI moderation after cheap checks (invites / spam).
-        Returns True if the message was moderated (deleted / warning / timeout).
-        """
         if not guild_conf.get("ai_moderation", True):
             return False
         if not guild_conf.get("mod_enabled", True):
@@ -613,7 +585,9 @@ class AI(commands.Cog):
             if perms.manage_messages or perms.administrator:
                 return False
 
-        context_snippets = self._get_server_samples(message.guild.id, exclude_user=message.author.id, max_count=5)
+        context_snippets = self._get_server_samples(
+            message.guild.id, exclude_user=message.author.id, max_count=5
+        )
         prompt = MODERATION_CLASSIFIER_PROMPT + "\n\n"
 
         if context_snippets:
@@ -716,10 +690,6 @@ class AI(commands.Cog):
         message: discord.Message,
         guild_conf: dict,
     ) -> bool:
-        """
-        Detect and block invite links if needed.
-        Returns True if the message was moderated (deleted/blocked).
-        """
         if not guild_conf.get("mod_enabled", True):
             return False
         if not guild_conf.get("block_invites", True):
@@ -730,7 +700,9 @@ class AI(commands.Cog):
         if not matches:
             return False
 
-        allowed_codes = {code.lower() for code in guild_conf.get("allowed_invite_codes", [])}
+        allowed_codes = {
+            code.lower() for code in guild_conf.get("allowed_invite_codes", [])
+        }
         timeout_seconds = int(guild_conf.get("invite_timeout_seconds", 0))
 
         for code in matches:
@@ -757,7 +729,9 @@ class AI(commands.Cog):
                 ):
                     me = message.guild.me
                     if me and me.guild_permissions.moderate_members:
-                        until = datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
+                        until = datetime.now(timezone.utc) + timedelta(
+                            seconds=timeout_seconds
+                        )
                         try:
                             await message.author.edit(
                                 timed_out_until=until,
@@ -775,10 +749,6 @@ class AI(commands.Cog):
         message: discord.Message,
         guild_conf: dict,
     ) -> bool:
-        """
-        Basic per-user spam detection.
-        Returns True if the message was moderated.
-        """
         if not guild_conf.get("mod_enabled", True):
             return False
 
@@ -820,7 +790,6 @@ class AI(commands.Cog):
     # ---------------------------------------------------------------------- #
 
     def _is_simple_greeting(self, text: str) -> bool:
-        """Detect very simple greetings we can reply to without the LLM."""
         t = text.strip().lower()
         t = re.sub(r"[!?.,]+$", "", t)
 
@@ -835,7 +804,6 @@ class AI(commands.Cog):
         return t in greetings
 
     def _looks_like_smalltalk(self, text: str) -> bool:
-        """Quick check for 'hey how are you' style stuff."""
         t = text.lower()
         return (
             "how are you" in t
@@ -846,7 +814,6 @@ class AI(commands.Cog):
         )
 
     def _fallback_smalltalk(self, text: str) -> str:
-        """Fallback for 'hey, how are you' etc when we don't want the LLM to be cringe."""
         t = text.lower()
         if self._looks_like_smalltalk(t):
             options = [
@@ -878,9 +845,6 @@ class AI(commands.Cog):
         return random.choice(replies)
 
     def _cleanup_reply(self, text: str) -> str:
-        """
-        Strip formal / weird stuff the model sometimes adds.
-        """
         original = text
         t = text.strip()
         lower = t.lower()
@@ -975,7 +939,6 @@ class AI(commands.Cog):
         max_sentences: int = 2,
         max_chars: int = 220,
     ) -> str:
-        """Keep replies short and Discord-ish."""
         parts = re.split(r'(?<=[.!?])\s+', text)
         if len(parts) > max_sentences:
             text = " ".join(parts[:max_sentences])
@@ -1011,7 +974,6 @@ class AI(commands.Cog):
 
     @aichat_group.command(name="channels")
     async def aichat_channels(self, ctx: commands.Context):
-        """List all channels where TLG auto-chat is active."""
         ids = await self.config.guild(ctx.guild).chat_channels()
         if not ids:
             await ctx.send("I'm not auto-chatting in any channels.")
@@ -1032,7 +994,6 @@ class AI(commands.Cog):
     async def aichat_addchannel(
         self, ctx: commands.Context, channel: discord.TextChannel
     ):
-        """Add a channel where TLG may auto-chat."""
         ids = await self.config.guild(ctx.guild).chat_channels()
         if channel.id in ids:
             await ctx.send(f"{channel.mention} is already enabled.")
@@ -1046,7 +1007,6 @@ class AI(commands.Cog):
     async def aichat_removechannel(
         self, ctx: commands.Context, channel: discord.TextChannel
     ):
-        """Remove a channel from TLG auto-chat."""
         ids = await self.config.guild(ctx.guild).chat_channels()
         if channel.id not in ids:
             await ctx.send(f"{channel.mention} is not currently active.")
@@ -1058,7 +1018,6 @@ class AI(commands.Cog):
 
     @aichat_group.command(name="toggle")
     async def aichat_toggle(self, ctx: commands.Context):
-        """Toggle TLG auto-chat on/off for this server."""
         enabled = await self.config.guild(ctx.guild).enabled()
         enabled = not enabled
         await self.config.guild(ctx.guild).enabled.set(enabled)
@@ -1066,9 +1025,6 @@ class AI(commands.Cog):
 
     @aichat_group.command(name="chance")
     async def aichat_chance(self, ctx: commands.Context, chance: float):
-        """
-        Set chance (0–1) that TLG responds to a message in active channels.
-        """
         chance = max(0.0, min(1.0, chance))
         await self.config.guild(ctx.guild).auto_reply_chance.set(chance)
         await ctx.send(f"Auto-reply chance set to **{chance:.2f}**.")
@@ -1077,10 +1033,6 @@ class AI(commands.Cog):
 
     @aichat_group.command(name="observeonstart")
     async def aichat_observeonstart(self, ctx: commands.Context, toggle: bool):
-        """
-        Toggle whether TLG should scan some message history on startup
-        to learn how people talk.
-        """
         await self.config.guild(ctx.guild).observe_history_on_start.set(toggle)
         await ctx.send(
             f"History observation on startup is now **{'enabled' if toggle else 'disabled'}**.\n"
@@ -1093,14 +1045,6 @@ class AI(commands.Cog):
         """
         Full history scan: read as many messages as Discord lets me see
         in every text channel, and temporarily lock down this cog.
-
-        While the scan is running:
-        - No auto-chat
-        - No AI moderation
-        - No invite/spam moderation
-        - No admin-intent actions
-
-        Other cogs/commands on the bot still work normally.
         """
         guild = ctx.guild
         gid = guild.id
@@ -1132,7 +1076,6 @@ class AI(commands.Cog):
 
     @aichat_group.command(name="modtoggle")
     async def aichat_modtoggle(self, ctx: commands.Context):
-        """Toggle TLG's automod features on/off."""
         conf = await self.config.guild(ctx.guild).all()
         current = conf.get("mod_enabled", True)
         new_val = not current
@@ -1141,7 +1084,6 @@ class AI(commands.Cog):
 
     @aichat_group.command(name="aimod")
     async def aichat_aimod(self, ctx: commands.Context, toggle: bool):
-        """Enable or disable AI-based message moderation."""
         await self.config.guild(ctx.guild).ai_moderation.set(toggle)
         await ctx.send(
             f"AI moderation is now **{'enabled' if toggle else 'disabled'}**.\n"
@@ -1150,7 +1092,6 @@ class AI(commands.Cog):
 
     @aichat_group.command(name="blockinvites")
     async def aichat_blockinvites(self, ctx: commands.Context, toggle: bool):
-        """Enable or disable blocking of Discord invite links."""
         await self.config.guild(ctx.guild).block_invites.set(toggle)
         await ctx.send(
             f"Blocking of Discord invites is now **{'enabled' if toggle else 'disabled'}**."
@@ -1158,9 +1099,6 @@ class AI(commands.Cog):
 
     @aichat_group.command(name="allowinvite")
     async def aichat_allowinvite(self, ctx: commands.Context, code: str):
-        """
-        Add an invite code that is allowed (e.g. 'abcdef' from 'discord.gg/abcdef').
-        """
         code = code.strip()
         ids = await self.config.guild(ctx.guild).allowed_invite_codes()
         if code.lower() in (c.lower() for c in ids):
@@ -1173,7 +1111,6 @@ class AI(commands.Cog):
 
     @aichat_group.command(name="removeinvite")
     async def aichat_removeinvite(self, ctx: commands.Context, code: str):
-        """Remove an invite code from the allowlist."""
         code = code.strip()
         ids = await self.config.guild(ctx.guild).allowed_invite_codes()
         lower_ids = [c.lower() for c in ids]
@@ -1187,7 +1124,6 @@ class AI(commands.Cog):
 
     @aichat_group.command(name="listinvites")
     async def aichat_listinvites(self, ctx: commands.Context):
-        """List all allowed invite codes."""
         ids = await self.config.guild(ctx.guild).allowed_invite_codes()
         if not ids:
             await ctx.send("No invite codes are allowed; all invites are blocked.")
@@ -1202,10 +1138,6 @@ class AI(commands.Cog):
         messages: int,
         seconds: int,
     ):
-        """
-        Set spam limit: <messages> per <seconds>.
-        Example: aichat spamlimit 6 7
-        """
         messages = max(1, messages)
         seconds = max(1, seconds)
         await self.config.guild(ctx.guild).spam_messages.set(messages)
@@ -1216,10 +1148,6 @@ class AI(commands.Cog):
 
     @aichat_group.command(name="invitetimeout")
     async def aichat_invitetimeout(self, ctx: commands.Context, seconds: int):
-        """
-        Set timeout length (in seconds) for users who post blocked invite links.
-        Use 0 to disable timeouts (still deletes the message).
-        """
         seconds = max(0, seconds)
         await self.config.guild(ctx.guild).invite_timeout_seconds.set(seconds)
         if seconds == 0:
@@ -1242,8 +1170,12 @@ class AI(commands.Cog):
     async def ai_command(self, ctx: commands.Context, *, message: str):
         """
         Talk directly to TLG AI (admin only).
-        This just gives you a raw chat reply using the same style as mention replies.
+        Disabled while historyscan lockdown is active.
         """
+        if ctx.guild.id in self._history_lockdown_guilds:
+            await ctx.reply("busy reading server history right now, gimme a bit 😅")
+            return
+
         async with ctx.typing():
             reply = await self.generate_chat_reply(ctx.message, message)
 
@@ -1255,14 +1187,6 @@ class AI(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """
-        - Runs basic automod (invites + spam) and optional AI moderation.
-        - Tracks style samples for everyone (when not locked down).
-        - If someone mentions the bot in a message (anywhere) and it's not a command,
-          TLG AI replies directly.
-        - If the author is an admin, mention-requests can trigger simple management actions.
-        - Otherwise, it may occasionally auto-reply in configured channels.
-        """
         if message.author.bot:
             return
         if not message.guild:
@@ -1278,13 +1202,13 @@ class AI(commands.Cog):
         guild = message.guild
         guild_conf = await self.config.guild(guild).all()
 
-        # --- Automod first (cheap checks) ---
+        # --- Automod first ---
         if await self.handle_invites(message, guild_conf):
             return
         if await self.handle_spam(message, guild_conf):
             return
 
-        # Then AI moderation
+        # AI moderation
         if await self._ai_moderation_decision(message, guild_conf):
             return
 
@@ -1299,11 +1223,24 @@ class AI(commands.Cog):
 
         bot_user = self.bot.user
 
-        # --- Direct mention detection ---
-        if bot_user and (bot_user.id in message.raw_mentions) and not is_command_like:
-            mention_pattern = rf"<@!?{bot_user.id}>"
-            user_text = re.sub(mention_pattern, "", content, count=1).strip()
-            if not user_text:
+        # Check if this is a reply to the bot
+        is_reply_to_bot = False
+        if message.reference and isinstance(message.reference.resolved, discord.Message):
+            ref_msg = message.reference.resolved
+            if bot_user and ref_msg.author.id == bot_user.id:
+                is_reply_to_bot = True
+
+        # --- Direct mention / reply detection ---
+        has_mention = bot_user and (bot_user.id in message.raw_mentions)
+
+        if (has_mention or is_reply_to_bot) and not is_command_like:
+            user_text = content
+
+            if has_mention:
+                mention_pattern = rf"<@!?{bot_user.id}>"
+                user_text = re.sub(mention_pattern, "", content, count=1).strip()
+
+            if not user_text.strip():
                 user_text = "hi"
 
             is_admin = isinstance(message.author, discord.Member) and (
@@ -1311,9 +1248,14 @@ class AI(commands.Cog):
                 or message.author.guild_permissions.manage_guild
             )
 
-            # If it's clearly just smalltalk, treat it like normal chat,
-            # even if they're an admin.
-            if is_admin and not self._is_simple_greeting(user_text) and not self._looks_like_smalltalk(user_text):
+            # Only treat as an admin task if:
+            # - they're admin, and
+            # - it's not just greetings/smalltalk
+            if (
+                is_admin
+                and not self._is_simple_greeting(user_text)
+                and not self._looks_like_smalltalk(user_text)
+            ):
                 async with message.channel.typing():
                     plan = await self._plan_admin_action(message, user_text)
                     plan["raw_text"] = user_text
