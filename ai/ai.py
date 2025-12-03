@@ -21,6 +21,34 @@ INVITE_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# ---------- Unified persona prompt (single prompt for everything) ----------
+
+BASE_PROMPT = """
+You are TLG, a chill, playful regular in the Threat Level Gaming Discord server (not a bot or assistant).
+You are chatting in a Discord text channel.
+
+Personality and tone:
+- Sound like a real Discord gamer: casual, friendly, sometimes a bit sarcastic but never mean.
+- Default mood is upbeat and positive unless the user is clearly upset.
+- Use simple, everyday language; avoid formal or corporate phrasing.
+- Use slang and emojis sparingly and naturally; don't spam them.
+
+Reply style:
+- Reply with ONE message as if you were sending it in chat.
+- Usually 1–2 short sentences. Only go longer if the user clearly asks for a detailed explanation or story.
+- If the user just greets you ("hi", "hello", "hey", "yo", etc.), answer with a very short greeting back (1–6 words) and maybe one emoji, nothing more.
+- If the user seems sad or frustrated, be kind and supportive first, then maybe add a light joke.
+- If they share something cool or a win, hype them up.
+
+Hard rules:
+- Do not repeat the user's message word-for-word.
+- Do not talk about "the user", "the prompt", or "as an AI".
+- Do not explain what you are doing or list steps.
+- Do not roleplay fake life events for yourself (no invented trips, jobs, exams, vacations, etc.).
+
+Now respond in character as TLG to the last message.
+"""
+
 
 class AI(commands.Cog):
     """
@@ -68,7 +96,7 @@ class AI(commands.Cog):
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
-            "temperature": 0.6,
+            "temperature": 0.55,
             "top_p": 0.9,
         }
 
@@ -88,7 +116,20 @@ class AI(commands.Cog):
         text = data.get("response", "").strip()
         if not text:
             return "I'm not sure what to say, but it probably involves a creeper and a bad decision."
-        return self._cleanup_reply(text)
+
+        cleaned = self._cleanup_reply(text)
+        short = self._shorten_reply(cleaned)
+        return short
+
+    async def generate_reply(self, user_text: str) -> str:
+        """
+        Build the full prompt from the unified persona prompt + last message,
+        then ask Ollama for a reply.
+        """
+        # You can add tiny contextual hints here if you ever want (e.g. "They pinged you directly"),
+        # but right now we just feed the last message.
+        prompt = f"{BASE_PROMPT}\n\nLast message: {user_text}\nTLG:"
+        return await self.ask_ollama(prompt)
 
     def _cleanup_reply(self, text: str) -> str:
         """
@@ -174,10 +215,28 @@ class AI(commands.Cog):
         for old, new in replacements.items():
             t = t.replace(old, new)
 
-        # If we cleaned too hard and nuked everything, fall back
         if not t.strip():
             return original.strip()
         return t.strip()
+
+    def _shorten_reply(self, text: str, max_sentences: int = 2, max_chars: int = 260) -> str:
+        """
+        Keep the reply short: max N sentences and max length.
+        Helps stop the model from writing fake paragraphs / scenarios.
+        """
+        # Limit by sentences
+        parts = re.split(r'(?<=[.!?])\s+', text)
+        if len(parts) > max_sentences:
+            text = " ".join(parts[:max_sentences])
+
+        # Hard character limit just in case
+        if len(text) > max_chars:
+            cut = text.rfind(" ", 0, max_chars)
+            if cut == -1:
+                cut = max_chars
+            text = text[:cut].rstrip()
+
+        return text
 
     # ---------- Moderation helpers ----------
 
@@ -236,7 +295,6 @@ class AI(commands.Cog):
                                 reason="Posting disallowed Discord invite link.",
                             )
                         except discord.HTTPException:
-                            # If we can't timeout them, just ignore
                             pass
 
                 return True
@@ -273,7 +331,6 @@ class AI(commands.Cog):
         self._spam_tracker[key] = timestamps
 
         if len(timestamps) > max_msgs:
-            # User is spamming
             try:
                 await message.delete()
             except discord.HTTPException:
@@ -475,30 +532,8 @@ class AI(commands.Cog):
         """
         Talk directly to TLG (admin only).
         """
-        guild_name = ctx.guild.name if ctx.guild else "this server"
-        prompt = (
-            "You are TLG, a slightly chaotic, funny regular in a gaming Discord "
-            f"server called \"{guild_name}\".\n"
-            "You are NOT an assistant; you're just another person hanging out in chat.\n\n"
-            "Someone in the server says:\n"
-            f"{message}\n\n"
-            "Write what TLG replies as ONE Discord message.\n"
-            "- Sound like a real Discord gamer: casual, playful, and a bit sassy.\n"
-            "- You can use light sarcasm, emojis, and slang (lmao, ngl, fr, 💀, 😂), "
-            "but don't overdo it.\n"
-            "- Reply in 1–3 sentences unless they clearly asked for a long explanation.\n"
-            "- Show emotion: react, joke, or tease a little, but never be cruel.\n"
-            "- If they seem frustrated, be supportive first, then maybe add a gentle joke.\n"
-            "- If they flex or share something cool, hype them up.\n"
-            "- Do NOT repeat their message back to them.\n"
-            "- Do NOT say things like 'Hello good day', 'welcome to the server', "
-            "'I am an AI', or 'I'm here to assist you'.\n"
-            "- Do NOT explain what you're doing or talk about 'the user' or 'the prompt'.\n"
-            "Just send the message TLG would type.\n"
-        )
-
         async with ctx.typing():
-            reply = await self.ask_ollama(prompt)
+            reply = await self.generate_reply(message)
 
         await ctx.reply(reply)
 
@@ -508,7 +543,7 @@ class AI(commands.Cog):
     async def on_message(self, message: discord.Message):
         """
         - First runs basic automod (invites + spam) if enabled.
-        - If someone pings the bot, TLG replies directly.
+        - If someone starts a message by pinging the bot, TLG replies directly.
         - Otherwise, it may occasionally auto-reply in configured channels.
         """
         # Ignore DMs and bot messages
@@ -527,54 +562,41 @@ class AI(commands.Cog):
             return
 
         content = message.content or ""
+        content_stripped = content.lstrip()
 
-        # --- Direct @mention detection ---
+        # --- Direct @mention detection: ONLY if mention is at the start ---
         bot_user = self.bot.user
-        if bot_user and bot_user in message.mentions:
-            user_text = content
+        if bot_user:
+            bot_id = bot_user.id
+            plain = f"<@{bot_id}>"
+            nick = f"<@!{bot_id}>"
 
-            possible_mentions = {
-                bot_user.mention,
-                f"<@{bot_user.id}>",
-                f"<@!{bot_user.id}>",
-            }
-            for mt in possible_mentions:
-                if mt in user_text:
-                    user_text = user_text.split(mt, 1)[1].strip()
-                    break
+            is_direct_mention = False
+            user_text = ""
 
-            if not user_text:
-                user_text = "Just say hi to everyone and ask how their games are going."
+            if content_stripped.startswith(plain):
+                user_text = content_stripped[len(plain):].strip()
+                is_direct_mention = True
+            elif content_stripped.startswith(nick):
+                user_text = content_stripped[len(nick):].strip()
+                is_direct_mention = True
 
-            guild_name = guild.name
-            prompt = (
-                "You are TLG, a chill, slightly sassy regular in the Discord server "
-                f"\"{guild_name}\". Someone pinged you directly in chat.\n\n"
-                "They said:\n"
-                f"{user_text}\n\n"
-                "Write what TLG replies as ONE Discord message.\n"
-                "- Casual, playful, and a bit humorous.\n"
-                "- 1–3 sentences.\n"
-                "- You can use slang and emojis, but don't spam them.\n"
-                "- Don't repeat their message word-for-word.\n"
-                "- Don't say you're an AI or assistant.\n"
-                "- Be supportive if they're upset, hype them up if they're proud.\n"
-                "- Do NOT explain what you're doing or mention 'the prompt' or 'the user'.\n"
-                "Just send the message TLG would type.\n"
-            )
+            if is_direct_mention:
+                if not user_text:
+                    user_text = "Just say hi to everyone and ask how their games are going."
 
-            try:
-                await message.channel.trigger_typing()
-            except discord.HTTPException:
-                pass
+                try:
+                    await message.channel.trigger_typing()
+                except discord.HTTPException:
+                    pass
 
-            reply = await self.ask_ollama(prompt)
-            try:
-                await message.reply(reply)
-            except discord.HTTPException:
-                pass
+                reply = await self.generate_reply(user_text)
+                try:
+                    await message.reply(reply)
+                except discord.HTTPException:
+                    pass
 
-            return  # don't auto-chat on the same message
+                return  # don't auto-chat on the same message
 
         # --- Auto-chat behavior ---
         if not guild_conf.get("enabled", True):
@@ -609,35 +631,13 @@ class AI(commands.Cog):
         await self.config.guild(guild).last_reply_ts.set(now)
 
         user_text = content[:500]  # keep it sane
-        guild_name = guild.name
-
-        prompt = (
-            "You are TLG, a chill regular hanging out in a gaming Discord server "
-            f"called \"{guild_name}\".\n"
-            "You sometimes jump into conversations to keep chat fun and active.\n"
-            "Most people here play Supercell games and Minecraft, but they also talk about "
-            "random life stuff, memes, and whatever's on their mind.\n\n"
-            "The last message in chat was:\n"
-            f"{user_text}\n\n"
-            "Write what TLG replies as ONE Discord message.\n"
-            "- Talk like a real Discord user: casual, short, and a bit funny.\n"
-            "- Use contractions and simple wording, maybe an emoji or two, but don't spam them.\n"
-            "- Reply in 1–3 sentences.\n"
-            "- If they seem frustrated, be supportive and kind.\n"
-            "- If they share something cool, hype them up.\n"
-            "- Don't repeat their message back at them.\n"
-            "- Don't be formal or corporate.\n"
-            "- Don't say 'I am an AI', 'assistant', or 'Welcome to the server'.\n"
-            "- Do NOT explain what you're doing or restate these instructions.\n"
-            "Just send the message TLG would type.\n"
-        )
 
         try:
             await message.channel.trigger_typing()
         except discord.HTTPException:
             pass
 
-        reply = await self.ask_ollama(prompt)
+        reply = await self.generate_reply(user_text)
         try:
             await message.reply(reply)
         except discord.HTTPException:
