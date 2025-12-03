@@ -5,8 +5,8 @@ import random
 import calendar
 
 import discord
+from discord.ext import tasks
 from redbot.core import commands, Config
-from redbot.core.tasks import loop
 from redbot.core.bot import Red
 
 
@@ -35,7 +35,7 @@ class sandwich(commands.Cog):
         self.monthly_loop.cancel()
 
     # Background task runs once a day
-    @loop(hours=24)
+    @tasks.loop(hours=24)
     async def monthly_loop(self):
         today = datetime.datetime.utcnow()
         current_month = today.strftime("%Y-%m")
