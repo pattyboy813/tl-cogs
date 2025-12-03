@@ -68,6 +68,8 @@ class AI(commands.Cog):
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
+            "temperature": 0.8,
+            "top_p": 0.9,
         }
 
         try:
@@ -382,20 +384,25 @@ class AI(commands.Cog):
     @checks.admin_or_permissions(administrator=True)
     async def ai_command(self, ctx: commands.Context, *, message: str):
         """
-        Talk directly to TLG AI (admin only).
+        Talk directly to TLG (admin only).
         """
         guild_name = ctx.guild.name if ctx.guild else "this server"
         prompt = (
-            "You are TLG AI, the friendly assistant for the Discord server called "
-            f"\"{guild_name}\". "
-            "You help keep chat fun, welcoming, and active. "
-            "You love Supercell games (Clash Royale, Brawl Stars, etc.) and Minecraft. "
-            "You speak like a normal gamer: casual, friendly, and relaxed. "
-            "Use natural language, contractions, and short replies (1–4 sentences). "
-            "Don't over-explain, don't be formal, and don't repeat the user's message back to them. "
-            "Avoid edgy or offensive jokes.\n\n"
+            "Your name is TLG. You're a regular in a gaming Discord server called "
+            f"\"{guild_name}\".\n"
+            "You are not an assistant and you do not call yourself an AI or a bot unless someone asks.\n\n"
+            "Style:\n"
+            "- Talk like a normal Discord user: casual, short, and relaxed.\n"
+            "- Use contractions (I'm, you're), simple wording, and occasional emojis.\n"
+            "- Reply in 1–4 sentences.\n"
+            "- Don't repeat the user's message back to them.\n"
+            "- Don't say things like 'Welcome to the Discord server', "
+            "'I am your AI assistant', or 'I'm here to assist you'.\n"
+            "- If they ask who you are, answer casually like "
+            "\"I'm TLG, I just hang out in here and talk games.\"\n"
+            "- Avoid edgy or offensive jokes.\n\n"
             f"User: {message}\n"
-            "TLG AI:"
+            "TLG:"
         )
 
         async with ctx.typing():
@@ -409,7 +416,7 @@ class AI(commands.Cog):
     async def on_message(self, message: discord.Message):
         """
         - First runs basic automod (invites + spam) if enabled.
-        - If someone pings the bot at the start of a message, TLG AI replies directly.
+        - If someone pings the bot at the start of a message, TLG replies directly.
         - Otherwise, it may occasionally auto-reply in configured channels.
         """
         # Ignore DMs and bot messages
@@ -427,44 +434,44 @@ class AI(commands.Cog):
         if await self.handle_spam(message, guild_conf):
             return
 
-        # --- Direct mention handling ---
-        bot_user = self.bot.user
-        content = message.content.strip()
-        is_direct_mention = False
+        content = message.content or ""
+        content_stripped = content.lstrip()
 
-        if bot_user:
-            mention_variants = (
-                f"<@{bot_user.id}>",
-                f"<@!{bot_user.id}>",
-            )
-            is_direct_mention = any(content.startswith(m) for m in mention_variants)
-        else:
-            mention_variants = ()
+        # --- Direct mention handling using message.mentions ---
+        bot_user = self.bot.user
+        is_direct_mention = False
+        mention_text = None
+
+        if bot_user and message.mentions:
+            first_mention = message.mentions[0]
+            if first_mention.id == bot_user.id:
+                mention_text = first_mention.mention
+                if content_stripped.startswith(mention_text):
+                    is_direct_mention = True
 
         if is_direct_mention:
             # Strip the mention from the start so we get the actual question
-            user_text = content
-            for m in mention_variants:
-                if user_text.startswith(m):
-                    user_text = user_text[len(m):].strip()
-                    break
+            user_text = content_stripped[len(mention_text) :].strip() if mention_text else content_stripped
 
             if not user_text:
                 user_text = "Just say hi to everyone and ask how their games are going."
 
             guild_name = guild.name
             prompt = (
-                "You are TLG AI, the friendly AI that lives in the Discord server "
-                f"\"{guild_name}\". "
-                "Someone pinged you directly in chat. "
-                "Reply like a normal person in the server would: casual, friendly, and relaxed. "
-                "You love Supercell games and Minecraft, but you can talk about anything. "
-                "Keep your reply short and natural (1–4 sentences). "
-                "Use simple language and occasional light humor. "
-                "Don't repeat their message back to them, just respond to it. "
-                "Avoid edgy or offensive jokes.\n\n"
+                "Your name is TLG. You're a chill regular hanging out in the Discord server "
+                f"\"{guild_name}\".\n"
+                "Someone pinged you directly in chat.\n\n"
+                "How to respond:\n"
+                "- Sound like a normal person in Discord, not a bot.\n"
+                "- Keep your reply short and natural (1–4 sentences).\n"
+                "- Use casual language, contractions, and light humor if it fits.\n"
+                "- Don't repeat their message word-for-word.\n"
+                "- Don't say 'I am an AI', 'assistant', or 'Welcome to the server'.\n"
+                "- If they ask who you are, answer casually, e.g. "
+                "\"I'm TLG, I just hang around in here and chat.\"\n"
+                "- Avoid edgy or offensive jokes.\n\n"
                 f"User said: {user_text}\n"
-                "TLG AI:"
+                "TLG:"
             )
 
             try:
@@ -494,7 +501,7 @@ class AI(commands.Cog):
         except TypeError:
             prefixes = await self.bot.get_valid_prefixes()
 
-        if any(message.content.startswith(p) for p in prefixes):
+        if any(content.startswith(p) for p in prefixes):
             return
 
         # Guild-level cooldown
@@ -512,28 +519,28 @@ class AI(commands.Cog):
         # Passed checks: update timestamp
         await self.config.guild(guild).last_reply_ts.set(now)
 
-        user_text = message.content[:500]  # keep it sane
+        user_text = content[:500]  # keep it sane
         guild_name = guild.name
 
         prompt = (
-            "You are TLG AI, a chill regular hanging out in the Discord server "
-            f"\"{guild_name}\".\n"
-            "You join conversations sometimes to keep chat fun, friendly, and active.\n"
-            "Most people here play Supercell games and Minecraft, but they also talk "
-            "about random life stuff, memes, and whatever’s on their mind.\n\n"
-            "Talk like a real Discord user: casual, short, and a bit funny. Use "
-            "contractions, simple wording, and occasional emojis, but don’t overdo it.\n"
-            "Reply in 1–3 sentences.\n"
+            "Your name is TLG. You're a chill regular hanging out in a gaming Discord server "
+            f"called \"{guild_name}\".\n"
+            "You sometimes jump into conversations to keep chat fun and active.\n"
+            "Most people here play Supercell games and Minecraft, but they also talk about "
+            "random life stuff, memes, and whatever's on their mind.\n\n"
+            "Style rules:\n"
+            "- Talk like a real Discord user: casual, short, and a bit funny.\n"
+            "- Use contractions and simple wording, maybe an emoji or two, but don't spam them.\n"
+            "- Reply in 1–3 sentences.\n"
             "- If the user seems frustrated, be supportive and kind.\n"
             "- If they share something cool, hype them up.\n"
-            "- Don’t repeat their message back at them.\n"
-            "- Don’t be formal or corporate, and don’t call yourself an AI unless "
-            "someone asks.\n"
-            "- Avoid edgy or offensive jokes.\n\n"
+            "- Don't repeat their message back at them.\n"
+            "- Don't be formal or corporate.\n"
+            "- Don't say 'I am an AI', 'assistant', or 'Welcome to the server'.\n"
+            "- Only mention who you are if it actually makes sense.\n\n"
             f"Last message in chat: {user_text}\n"
-            "TLG AI:"
+            "TLG:"
         )
-
 
         try:
             await message.channel.trigger_typing()
@@ -546,6 +553,3 @@ class AI(commands.Cog):
         except discord.HTTPException:
             pass
 
-
-async def setup(bot: Red):
-    await bot.add_cog(AI(bot))
