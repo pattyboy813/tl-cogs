@@ -22,7 +22,7 @@ log = logging.getLogger("red.tlg_ai")
 OLLAMA_URL = "http://localhost:11434/api/generate"
 # Use something a bit beefier than a 135M toy model if you can.
 # Examples: "llama3.2:1b", "llama3.2:3b", "qwen2.5:3b"
-OLLAMA_MODEL = "llama3.2:1b"
+OLLAMA_MODEL = "smollm2:135m"
 
 INVITE_REGEX = re.compile(
     r"(?:discord\.gg/|discord\.com/invite/)([A-Za-z0-9-]+)",
