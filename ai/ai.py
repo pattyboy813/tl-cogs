@@ -95,11 +95,27 @@ class AI(commands.Cog):
         Lightly de-corporatize the reply:
         - strip super formal greetings
         - remove/replace assistant-y phrases
-        - strip narrator-style intros like 'Here is a response from TLG...'
+        - strip narrator-style junk or echoed prompt text
         """
         original = text
         t = text.strip()
         lower = t.lower()
+
+        # If the model echoed the prompt, cut off anything after these markers
+        end_markers = [
+            "tlg's reply (just the message):",
+            "tlg's reply:",
+            "\nuser:",
+            "\nuser\n",
+            "\nUser:",
+            "\nUser\n",
+        ]
+        for mark in end_markers:
+            idx = lower.find(mark)
+            if idx != -1:
+                t = t[:idx].rstrip()
+                lower = t.lower()
+                break
 
         # Kill narrator-style meta intros the model loves
         meta_prefixes = [
@@ -464,20 +480,21 @@ class AI(commands.Cog):
             "You are TLG, a slightly chaotic, funny regular in a gaming Discord "
             f"server called \"{guild_name}\".\n"
             "You are NOT an assistant; you're just another person hanging out in chat.\n\n"
-            "Write exactly ONE Discord message as TLG.\n"
+            "Someone in the server says:\n"
+            f"{message}\n\n"
+            "Write what TLG replies as ONE Discord message.\n"
             "- Sound like a real Discord gamer: casual, playful, and a bit sassy.\n"
             "- You can use light sarcasm, emojis, and slang (lmao, ngl, fr, 💀, 😂), "
             "but don't overdo it.\n"
-            "- Reply in 1–3 sentences unless the user clearly asks for a long explanation.\n"
+            "- Reply in 1–3 sentences unless they clearly asked for a long explanation.\n"
             "- Show emotion: react, joke, or tease a little, but never be cruel.\n"
-            "- If the user seems frustrated, be supportive first, then maybe add a gentle joke.\n"
+            "- If they seem frustrated, be supportive first, then maybe add a gentle joke.\n"
             "- If they flex or share something cool, hype them up.\n"
             "- Do NOT repeat their message back to them.\n"
             "- Do NOT say things like 'Hello good day', 'welcome to the server', "
             "'I am an AI', or 'I'm here to assist you'.\n"
-            "- Do NOT explain what you're doing or say 'Here is a response'.\n\n"
-            f"User: {message}\n"
-            "TLG's reply (just the message):"
+            "- Do NOT explain what you're doing or talk about 'the user' or 'the prompt'.\n"
+            "Just send the message TLG would type.\n"
         )
 
         async with ctx.typing():
@@ -514,12 +531,12 @@ class AI(commands.Cog):
         # --- Direct @mention detection ---
         bot_user = self.bot.user
         if bot_user and bot_user in message.mentions:
-            # Remove first occurrence of the bot's mention from the content
             user_text = content
 
-            # This covers <@id> and <@!id> forms
             possible_mentions = {
                 bot_user.mention,
+                f"<@{bot_user.id}>",
+                f"<@!{bot_user.id}>",
             }
             for mt in possible_mentions:
                 if mt in user_text:
@@ -533,16 +550,17 @@ class AI(commands.Cog):
             prompt = (
                 "You are TLG, a chill, slightly sassy regular in the Discord server "
                 f"\"{guild_name}\". Someone pinged you directly in chat.\n\n"
-                "Write exactly ONE Discord message as TLG.\n"
+                "They said:\n"
+                f"{user_text}\n\n"
+                "Write what TLG replies as ONE Discord message.\n"
                 "- Casual, playful, and a bit humorous.\n"
                 "- 1–3 sentences.\n"
                 "- You can use slang and emojis, but don't spam them.\n"
                 "- Don't repeat their message word-for-word.\n"
                 "- Don't say you're an AI or assistant.\n"
                 "- Be supportive if they're upset, hype them up if they're proud.\n"
-                "- Do NOT explain what you're doing or say things like 'Here is a response'.\n\n"
-                f"User said: {user_text}\n"
-                "TLG's reply (just the message):"
+                "- Do NOT explain what you're doing or mention 'the prompt' or 'the user'.\n"
+                "Just send the message TLG would type.\n"
             )
 
             try:
@@ -599,18 +617,19 @@ class AI(commands.Cog):
             "You sometimes jump into conversations to keep chat fun and active.\n"
             "Most people here play Supercell games and Minecraft, but they also talk about "
             "random life stuff, memes, and whatever's on their mind.\n\n"
-            "Write exactly ONE Discord message as TLG.\n"
+            "The last message in chat was:\n"
+            f"{user_text}\n\n"
+            "Write what TLG replies as ONE Discord message.\n"
             "- Talk like a real Discord user: casual, short, and a bit funny.\n"
             "- Use contractions and simple wording, maybe an emoji or two, but don't spam them.\n"
             "- Reply in 1–3 sentences.\n"
-            "- If the user seems frustrated, be supportive and kind.\n"
+            "- If they seem frustrated, be supportive and kind.\n"
             "- If they share something cool, hype them up.\n"
             "- Don't repeat their message back at them.\n"
             "- Don't be formal or corporate.\n"
             "- Don't say 'I am an AI', 'assistant', or 'Welcome to the server'.\n"
-            "- Do NOT explain what you're doing or say 'Here is a response'.\n\n"
-            f"Last message in chat: {user_text}\n"
-            "TLG's reply (just the message):"
+            "- Do NOT explain what you're doing or restate these instructions.\n"
+            "Just send the message TLG would type.\n"
         )
 
         try:
