@@ -30,7 +30,7 @@ class AI(commands.Cog):
     - Admin-only commands to control behavior.
     - Can occasionally join chat in configured channels.
     - Responds when pinged directly.
-    - Basic automod: anti-spam + invite blocking with timeout.
+    - Basic automod: anti-spam + invite blocking with optional timeout.
     """
 
     def __init__(self, bot: Red):
@@ -42,7 +42,7 @@ class AI(commands.Cog):
         default_guild = {
             # AI chat config
             "enabled": True,              # AI auto-chat
-            "chat_channels": [],          # list of channel IDs where TLG AI may auto-chat
+            "chat_channels": [],          # list of channel IDs where TLG may auto-chat
             "auto_reply_chance": 0.08,    # 8% chance to reply to a normal message
             "cooldown_seconds": 40,       # min seconds between AI auto-replies per guild
             "last_reply_ts": 0.0,
@@ -219,10 +219,10 @@ class AI(commands.Cog):
 
     @aichat_group.command(name="channels")
     async def aichat_channels(self, ctx: commands.Context):
-        """List all channels where TLG AI auto-chat is active."""
+        """List all channels where TLG auto-chat is active."""
         ids = await self.config.guild(ctx.guild).chat_channels()
         if not ids:
-            await ctx.send("TLG AI is not auto-chatting in any channels.")
+            await ctx.send("TLG isn't auto-chatting in any channels.")
             return
 
         channels = []
@@ -234,13 +234,13 @@ class AI(commands.Cog):
         if not channels:
             await ctx.send("The configured channels no longer exist.")
         else:
-            await ctx.send("TLG AI auto-chats in: " + ", ".join(channels))
+            await ctx.send("TLG auto-chats in: " + ", ".join(channels))
 
     @aichat_group.command(name="addchannel")
     async def aichat_addchannel(
         self, ctx: commands.Context, channel: discord.TextChannel
     ):
-        """Add a channel where TLG AI can auto-chat."""
+        """Add a channel where TLG may auto-chat."""
         ids = await self.config.guild(ctx.guild).chat_channels()
         if channel.id in ids:
             await ctx.send(f"{channel.mention} is already enabled.")
@@ -248,13 +248,13 @@ class AI(commands.Cog):
 
         ids.append(channel.id)
         await self.config.guild(ctx.guild).chat_channels.set(ids)
-        await ctx.send(f"TLG AI will now join conversations in {channel.mention}.")
+        await ctx.send(f"TLG will now sometimes join conversations in {channel.mention}.")
 
     @aichat_group.command(name="removechannel")
     async def aichat_removechannel(
         self, ctx: commands.Context, channel: discord.TextChannel
     ):
-        """Remove a channel from TLG AI auto-chat."""
+        """Remove a channel from TLG auto-chat."""
         ids = await self.config.guild(ctx.guild).chat_channels()
         if channel.id not in ids:
             await ctx.send(f"{channel.mention} is not currently active.")
@@ -262,35 +262,35 @@ class AI(commands.Cog):
 
         ids.remove(channel.id)
         await self.config.guild(ctx.guild).chat_channels.set(ids)
-        await ctx.send(f"TLG AI will no longer speak in {channel.mention}.")
+        await ctx.send(f"TLG will no longer speak in {channel.mention}.")
 
     @aichat_group.command(name="toggle")
     async def aichat_toggle(self, ctx: commands.Context):
-        """Toggle TLG AI auto-chat on/off for this server."""
+        """Toggle TLG auto-chat on/off for this server."""
         enabled = await self.config.guild(ctx.guild).enabled()
         enabled = not enabled
         await self.config.guild(ctx.guild).enabled.set(enabled)
-        await ctx.send(f"TLG AI auto-chat is now {'enabled' if enabled else 'disabled'}.")
+        await ctx.send(f"TLG auto-chat is now {'enabled' if enabled else 'disabled'}.")
 
     @aichat_group.command(name="chance")
     async def aichat_chance(self, ctx: commands.Context, chance: float):
         """
-        Set chance (0–1) that TLG AI responds to a message in active channels.
+        Set chance (0–1) that TLG responds to a message in active channels.
         """
         chance = max(0.0, min(1.0, chance))
         await self.config.guild(ctx.guild).auto_reply_chance.set(chance)
-        await ctx.send(f"TLG AI auto-reply chance set to **{chance:.2f}**.")
+        await ctx.send(f"TLG auto-reply chance set to **{chance:.2f}**.")
 
     # ----- Moderation config -----
 
     @aichat_group.command(name="modtoggle")
     async def aichat_modtoggle(self, ctx: commands.Context):
-        """Toggle TLG AI's automod features on/off."""
+        """Toggle TLG's automod features on/off."""
         conf = await self.config.guild(ctx.guild).all()
         current = conf.get("mod_enabled", True)
         new_val = not current
         await self.config.guild(ctx.guild).mod_enabled.set(new_val)
-        await ctx.send(f"TLG AI automod is now {'enabled' if new_val else 'disabled'}.")
+        await ctx.send(f"TLG automod is now {'enabled' if new_val else 'disabled'}.")
 
     @aichat_group.command(name="blockinvites")
     async def aichat_blockinvites(self, ctx: commands.Context, toggle: bool):
@@ -388,20 +388,27 @@ class AI(commands.Cog):
         """
         guild_name = ctx.guild.name if ctx.guild else "this server"
         prompt = (
-            "Your name is TLG. You're a regular in a gaming Discord server called "
-            f"\"{guild_name}\".\n"
-            "You are not an assistant and you do not call yourself an AI or a bot unless someone asks.\n\n"
-            "Style:\n"
-            "- Talk like a normal Discord user: casual, short, and relaxed.\n"
-            "- Use contractions (I'm, you're), simple wording, and occasional emojis.\n"
-            "- Reply in 1–4 sentences.\n"
-            "- Don't repeat the user's message back to them.\n"
-            "- Don't say things like 'Welcome to the Discord server', "
-            "'I am your AI assistant', or 'I'm here to assist you'.\n"
-            "- If they ask who you are, answer casually like "
-            "\"I'm TLG, I just hang out in here and talk games.\"\n"
-            "- Avoid edgy or offensive jokes.\n\n"
-            f"User: {message}\n"
+            "Your name is TLG. You're a slightly chaotic, funny regular in a gaming Discord "
+            f"server called \"{guild_name}\".\n"
+            "You are NOT an assistant; you're just another person hanging out in chat.\n\n"
+            "Tone & style:\n"
+            "- Sound like a real Discord gamer: casual, playful, and a bit sassy.\n"
+            "- You can use light sarcasm, emojis, and slang (lmao, ngl, fr, 💀, 😂), "
+            "but don't overdo it.\n"
+            "- Reply in 1–3 sentences unless the user clearly asks for a long explanation.\n"
+            "- Show emotion: react, joke, or tease a little, but never be cruel.\n"
+            "- If the user seems frustrated, be supportive first, then maybe add a gentle joke.\n"
+            "- If they flex or share something cool, hype them up.\n"
+            "- Do NOT repeat their message back to them.\n"
+            "- Do NOT say things like 'Hello good day', 'welcome to the server', "
+            "'I am an AI', or 'I'm here to assist you'.\n"
+            "- Never use slurs, NSFW content, or harsh insults.\n\n"
+            "Examples of the vibe (do NOT copy, just match the energy):\n"
+            "User: who are you?\n"
+            "TLG: I'm TLG, the little goblin that lives in this server and talks way too much about games 😂\n\n"
+            "User: I played so bad today\n"
+            "TLG: Happens to all of us, honestly. Shake it off and queue again, redemption arc time 💪\n\n"
+            f"Now respond to this user:\nUser: {message}\n"
             "TLG:"
         )
 
@@ -437,39 +444,42 @@ class AI(commands.Cog):
         content = message.content or ""
         content_stripped = content.lstrip()
 
-        # --- Direct mention handling using message.mentions ---
+        # --- Direct @mention detection using raw text ---
         bot_user = self.bot.user
         is_direct_mention = False
         mention_text = None
 
-        if bot_user and message.mentions:
-            first_mention = message.mentions[0]
-            if first_mention.id == bot_user.id:
-                mention_text = first_mention.mention
-                if content_stripped.startswith(mention_text):
-                    is_direct_mention = True
+        if bot_user:
+            bot_id = bot_user.id
+            plain = f"<@{bot_id}>"
+            nick = f"<@!{bot_id}>"
+
+            if content_stripped.startswith(plain):
+                mention_text = plain
+                is_direct_mention = True
+            elif content_stripped.startswith(nick):
+                mention_text = nick
+                is_direct_mention = True
 
         if is_direct_mention:
             # Strip the mention from the start so we get the actual question
-            user_text = content_stripped[len(mention_text) :].strip() if mention_text else content_stripped
+            user_text = content_stripped[len(mention_text):].strip() if mention_text else content_stripped
 
             if not user_text:
                 user_text = "Just say hi to everyone and ask how their games are going."
 
             guild_name = guild.name
             prompt = (
-                "Your name is TLG. You're a chill regular hanging out in the Discord server "
-                f"\"{guild_name}\".\n"
-                "Someone pinged you directly in chat.\n\n"
-                "How to respond:\n"
-                "- Sound like a normal person in Discord, not a bot.\n"
-                "- Keep your reply short and natural (1–4 sentences).\n"
-                "- Use casual language, contractions, and light humor if it fits.\n"
+                "Your name is TLG. You're a chill, slightly sassy regular in the Discord server "
+                f"\"{guild_name}\". Someone pinged you directly in chat.\n\n"
+                "Respond like a real person in the server:\n"
+                "- Casual, playful, and a bit humorous.\n"
+                "- 1–3 sentences.\n"
+                "- You can use slang and emojis, but don't spam them.\n"
                 "- Don't repeat their message word-for-word.\n"
-                "- Don't say 'I am an AI', 'assistant', or 'Welcome to the server'.\n"
-                "- If they ask who you are, answer casually, e.g. "
-                "\"I'm TLG, I just hang around in here and chat.\"\n"
-                "- Avoid edgy or offensive jokes.\n\n"
+                "- Don't say you're an AI or assistant.\n"
+                "- Be supportive if they're upset, hype them up if they're proud.\n"
+                "- No slurs or harsh insults.\n\n"
                 f"User said: {user_text}\n"
                 "TLG:"
             )
@@ -552,4 +562,3 @@ class AI(commands.Cog):
             await message.reply(reply)
         except discord.HTTPException:
             pass
-
