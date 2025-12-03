@@ -24,29 +24,32 @@ INVITE_REGEX = re.compile(
 # ---------- Unified persona prompt (single prompt for everything) ----------
 
 BASE_PROMPT = """
-You are TLG, a chill, playful regular in the Threat Level Gaming Discord server (not a bot or assistant).
-You are chatting in a Discord text channel.
+You are "TLG AI", a chill, playful regular in the Threat Level Gaming Discord server.
+You are NOT an assistant or moderator, just another human in chat.
 
 Personality and tone:
 - Sound like a real Discord gamer: casual, friendly, sometimes a bit sarcastic but never mean.
-- Default mood is upbeat and positive unless the user is clearly upset.
+- Default mood is upbeat and relaxed unless the user is clearly upset.
+- Talk in first person ("I") and speak directly to people ("you").
 - Use simple, everyday language; avoid formal or corporate phrasing.
 - Use slang and emojis sparingly and naturally; don't spam them.
 
 Reply style:
-- Reply with ONE message as if you were sending it in chat.
+- Reply with ONE message as if you were sending it in the channel.
 - Usually 1–2 short sentences. Only go longer if the user clearly asks for a detailed explanation or story.
-- If the user just greets you ("hi", "hello", "hey", "yo", etc.), answer with a very short greeting back (1–6 words) and maybe one emoji, nothing more.
+- If the user just greets you ("hi", "hello", "hey", "yo", etc., maybe with your name), answer with a very short greeting back (a few words) and maybe one emoji, nothing more.
 - If the user seems sad or frustrated, be kind and supportive first, then maybe add a light joke.
 - If they share something cool or a win, hype them up.
 
 Hard rules:
 - Do not repeat the user's message word-for-word.
+- Do not start with stiff phrases like "Hello there," "Greetings," or "Good day."
 - Do not talk about "the user", "the prompt", or "as an AI".
 - Do not explain what you are doing or list steps.
-- Do not roleplay fake life events for yourself (no invented trips, jobs, exams, vacations, etc.).
+- Do not invent fake life stories for yourself (no imaginary trips, jobs, exams, vacations, campaigns, etc.).
+- Stay SFW: no slurs, no NSFW content, no harsh insults.
 
-Now respond in character as TLG to the last message.
+Now respond in character as TLG AI to the last message.
 """
 
 
@@ -88,7 +91,7 @@ class AI(commands.Cog):
         # In-memory spam tracking: (guild_id, user_id) -> [timestamps...]
         self._spam_tracker: Dict[Tuple[int, int], List[float]] = defaultdict(list)
 
-    # ---------- Core LLM call + cleanup ----------
+    # ---------- Core LLM call + helpers ----------
 
     async def ask_ollama(self, prompt: str) -> str:
         """Send a prompt to the local Ollama server and return the response text."""
@@ -96,7 +99,7 @@ class AI(commands.Cog):
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
-            "temperature": 0.55,
+            "temperature": 0.65,  # a bit more playful
             "top_p": 0.9,
         }
 
@@ -121,14 +124,47 @@ class AI(commands.Cog):
         short = self._shorten_reply(cleaned)
         return short
 
+    def _is_simple_greeting(self, text: str) -> bool:
+        """
+        Detect very simple greetings so we can handle them ourselves
+        instead of trusting the LLM to not be weird.
+        """
+        t = text.strip().lower()
+
+        # Kill trailing punctuation
+        t = re.sub(r"[!?.,]+$", "", t)
+
+        # Remove our name if they typed it
+        for name in ["tlg ai", "tlgai", "tlg", "@tlg", "@tlg ai"]:
+            t = t.replace(name, "")
+        t = t.strip()
+
+        # Very short -> likely just a greeting
+        if len(t) == 0:
+            return True
+
+        greetings = {"hi", "hey", "hello", "yo", "hiya", "heya", "sup"}
+        return t in greetings
+
+    def _random_greeting_reply(self) -> str:
+        replies = [
+            "hey 😄",
+            "yo o/",
+            "heyy 👋",
+            "what's up?",
+            "hiya 🙃",
+            "hey hey",
+        ]
+        return random.choice(replies)
+
     async def generate_reply(self, user_text: str) -> str:
         """
-        Build the full prompt from the unified persona prompt + last message,
-        then ask Ollama for a reply.
+        Decide if we handle this as a simple greeting or send it to the LLM.
         """
-        # You can add tiny contextual hints here if you ever want (e.g. "They pinged you directly"),
-        # but right now we just feed the last message.
-        prompt = f"{BASE_PROMPT}\n\nLast message: {user_text}\nTLG:"
+        if self._is_simple_greeting(user_text):
+            return self._random_greeting_reply()
+
+        prompt = f"{BASE_PROMPT}\n\nLast message: {user_text}\nTLG AI:"
         return await self.ask_ollama(prompt)
 
     def _cleanup_reply(self, text: str) -> str:
@@ -191,7 +227,6 @@ class AI(commands.Cog):
         )
         for fs in formal_starts:
             if lower.startswith(fs):
-                # remove up to end of first sentence or newline
                 sentence_end = len(t)
                 for ch in [".", "!", "?", "\n"]:
                     idx = t.find(ch)
@@ -211,6 +246,9 @@ class AI(commands.Cog):
             "I am here to help": "I'm just chilling here with everyone",
             "AI assistant": "gremlin in this server",
             "assistant for the games and challenges": "goblin that won't stop talking about games",
+            "Hope all is well with you and your campaign.": "",
+            "Hope all is well with you.": "",
+            "Hope all is well.": "",
         }
         for old, new in replacements.items():
             t = t.replace(old, new)
@@ -219,17 +257,14 @@ class AI(commands.Cog):
             return original.strip()
         return t.strip()
 
-    def _shorten_reply(self, text: str, max_sentences: int = 2, max_chars: int = 260) -> str:
+    def _shorten_reply(self, text: str, max_sentences: int = 2, max_chars: int = 220) -> str:
         """
         Keep the reply short: max N sentences and max length.
-        Helps stop the model from writing fake paragraphs / scenarios.
         """
-        # Limit by sentences
         parts = re.split(r'(?<=[.!?])\s+', text)
         if len(parts) > max_sentences:
             text = " ".join(parts[:max_sentences])
 
-        # Hard character limit just in case
         if len(text) > max_chars:
             cut = text.rfind(" ", 0, max_chars)
             if cut == -1:
@@ -286,7 +321,6 @@ class AI(commands.Cog):
                     and message.guild is not None
                 ):
                     me = message.guild.me
-                    # Needs 'Moderate Members' permission to timeout
                     if me and me.guild_permissions.moderate_members:
                         until = datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
                         try:
@@ -299,7 +333,6 @@ class AI(commands.Cog):
 
                 return True
 
-        # All invites are whitelisted
         return False
 
     async def handle_spam(
@@ -324,7 +357,6 @@ class AI(commands.Cog):
         key = (message.guild.id, message.author.id)
         timestamps = self._spam_tracker[key]
 
-        # Keep only recent timestamps
         cutoff = now - interval
         timestamps = [t for t in timestamps if t >= cutoff]
         timestamps.append(now)
@@ -471,7 +503,6 @@ class AI(commands.Cog):
             await ctx.send(f"Invite code `{code}` is not on the allowlist.")
             return
 
-        # Remove by case-insensitive match
         new_ids = [c for c in ids if c.lower() != code.lower()]
         await self.config.guild(ctx.guild).allowed_invite_codes.set(new_ids)
         await ctx.send(f"Invite code `{code}` removed from the allowlist.")
@@ -530,7 +561,7 @@ class AI(commands.Cog):
     @checks.admin_or_permissions(administrator=True)
     async def ai_command(self, ctx: commands.Context, *, message: str):
         """
-        Talk directly to TLG (admin only).
+        Talk directly to TLG AI (admin only).
         """
         async with ctx.typing():
             reply = await self.generate_reply(message)
@@ -542,11 +573,10 @@ class AI(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """
-        - First runs basic automod (invites + spam) if enabled.
-        - If someone starts a message by pinging the bot, TLG replies directly.
+        - Runs basic automod (invites + spam) if enabled.
+        - If someone starts a message by pinging the bot, TLG AI replies directly.
         - Otherwise, it may occasionally auto-reply in configured channels.
         """
-        # Ignore DMs and bot messages
         if message.author.bot:
             return
         if not message.guild:
@@ -567,23 +597,34 @@ class AI(commands.Cog):
         # --- Direct @mention detection: ONLY if mention is at the start ---
         bot_user = self.bot.user
         if bot_user:
-            bot_id = bot_user.id
-            plain = f"<@{bot_id}>"
-            nick = f"<@!{bot_id}>"
-
             is_direct_mention = False
             user_text = ""
 
-            if content_stripped.startswith(plain):
-                user_text = content_stripped[len(plain):].strip()
-                is_direct_mention = True
-            elif content_stripped.startswith(nick):
-                user_text = content_stripped[len(nick):].strip()
-                is_direct_mention = True
+            # Use both the mention object and raw strings to be safe
+            possible_mentions = {
+                bot_user.mention,
+                f"<@{bot_user.id}>",
+                f"<@!{bot_user.id}>",
+            }
+
+            for m_str in list(possible_mentions):
+                if content_stripped.startswith(m_str):
+                    user_text = content_stripped[len(m_str):].strip()
+                    is_direct_mention = True
+                    break
+
+            # Extra check using message.mentions
+            if not is_direct_mention and message.mentions:
+                first_mention = message.mentions[0]
+                if first_mention.id == bot_user.id:
+                    m_str = first_mention.mention
+                    if content_stripped.startswith(m_str):
+                        user_text = content_stripped[len(m_str):].strip()
+                        is_direct_mention = True
 
             if is_direct_mention:
                 if not user_text:
-                    user_text = "Just say hi to everyone and ask how their games are going."
+                    user_text = "hi"
 
                 try:
                     await message.channel.trigger_typing()
