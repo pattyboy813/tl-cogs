@@ -1128,8 +1128,9 @@ class AI(commands.Cog):
 
         self._history_lockdown_guilds.add(gid)
         await ctx.send(
-            "Alright, going into nerd mode and reading through the whole server history I can see. "
-            "I'll stay quiet and not run automod/chat stuff until I'm done."
+            "I'll be back shortly. Currently brushing up on the server's history so I know what I am on about."
+            "\n"
+            "-# TLG AI isn't perfect and can make mistakes. That means don't believe everything this bot says. -TLG Admin"
         )
 
         async def run_scan():
