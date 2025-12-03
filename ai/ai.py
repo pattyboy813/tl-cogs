@@ -143,11 +143,6 @@ class AI(commands.Cog):
         """
         Talk directly to TLG AI (admin only).
         """
-        try:
-            await ctx.trigger_typing()
-        except discord.HTTPException:
-            pass
-
         guild_name = ctx.guild.name if ctx.guild else "this server"
         prompt = (
             "You are TLG AI, the friendly assistant for the Discord server called "
@@ -160,7 +155,10 @@ class AI(commands.Cog):
             "TLG AI:"
         )
 
-        reply = await self.ask_ollama(prompt)
+        # Show typing while we wait on Ollama
+        async with ctx.typing():
+            reply = await self.ask_ollama(prompt)
+
         await ctx.reply(reply)
 
     # ---------- Passive chat listener ----------
