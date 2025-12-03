@@ -868,14 +868,28 @@ class AI(commands.Cog):
         return t in greetings
 
     def _looks_like_smalltalk(self, text: str) -> bool:
+        """Quick check for 'hey how are you' style stuff."""
         t = text.lower()
-        return (
-            "how are you" in t
-            or "how r u" in t
-            or "hru" in t
-            or "how's it going" in t
-            or "hows it going" in t
-        )
+
+        patterns = [
+            "how are you",
+            "how r u",
+            "hru",
+            "how's it going",
+            "hows it going",
+            "how you doing",
+            "how you doin",
+            "how u doing",
+            "how u doin",
+        ]
+        if any(p in t for p in patterns):
+            return True
+
+        chill_words = ["wyd", "what you up to", "wuu2"]
+        if any(w in t for w in chill_words):
+            return True
+
+        return False
 
     def _fallback_smalltalk(self, text: str) -> str:
         t = text.lower()
@@ -974,6 +988,11 @@ class AI(commands.Cog):
                 t = t[sentence_end:].lstrip()
                 lower = t.lower()
                 break
+
+        # strip short parenthetical meta-comments like "(greeting is usually brief ...)"
+        t = re.sub(r"\([^)]{0,160}\)", "", t)
+        t = re.sub(r"\s{2,}", " ", t).strip()
+        lower = t.lower()
 
         replacements = {
             "I'm here to help with the fun stuff": "I'm just here hanging out with everyone",
@@ -1128,9 +1147,8 @@ class AI(commands.Cog):
 
         self._history_lockdown_guilds.add(gid)
         await ctx.send(
-            "I'll be back shortly. Currently brushing up on the server's history so I know what I am on about."
-            "\n"
-            "-# TLG AI isn't perfect and can make mistakes. That means don't believe everything this bot says. -TLG Admin"
+            "Alright, going into nerd mode and reading through the whole server history I can see. "
+            "I'll stay quiet and not run automod/chat stuff until I'm done."
         )
 
         async def run_scan():
@@ -1242,6 +1260,7 @@ class AI(commands.Cog):
 
     @commands.command(name="ai")
     @commands.guild_only()
+    @checks.admin_or_permissions(administrator=True)
     async def ai_command(self, ctx: commands.Context, *, message: str):
         """
         Talk directly to TLG AI (admin only).
