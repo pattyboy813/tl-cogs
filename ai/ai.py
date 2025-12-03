@@ -20,8 +20,7 @@ log = logging.getLogger("red.tlg_ai")
 # ---- Ollama (or other local LLM) config ------------------------------------
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-# Use something a bit beefier than a 135M toy model if you can.
-# Examples: "llama3.2:1b", "llama3.2:3b", "qwen2.5:3b"
+# You can swap this for something bigger like "llama3.2:1b" later
 OLLAMA_MODEL = "smollm2:135m"
 
 INVITE_REGEX = re.compile(
@@ -261,18 +260,37 @@ class AI(commands.Cog):
         *,
         scan_all: bool = False,
     ) -> None:
+        """
+        Read message history for this guild and feed style samples.
+
+        When scan_all=True, it reads as far back as Discord lets it for each
+        text channel. Otherwise, it reads up to history_messages_per_channel.
+        Logs progress to console so you can see what it's doing.
+        """
         conf = await self.config.guild(guild).all()
         per_channel = int(conf.get("history_messages_per_channel", 400))
 
         if per_channel <= 0 and not scan_all:
+            log.info(
+                "TLG AI: history observation skipped for guild %s (%s) "
+                "because per_channel=%s and scan_all=%s",
+                guild.id,
+                guild.name,
+                per_channel,
+                scan_all,
+            )
             return
 
         log.info(
-            "TLG AI: starting history observation for guild %s (%s), scan_all=%s",
+            "TLG AI: starting history observation for guild %s (%s), scan_all=%s, per_channel=%s",
             guild.id,
             guild.name,
             scan_all,
+            per_channel,
         )
+
+        total_messages = 0
+        channel_count = 0
 
         for channel in guild.text_channels:
             try:
@@ -282,26 +300,72 @@ class AI(commands.Cog):
 
             perms = channel.permissions_for(me) if me else None
             if not perms or not perms.read_message_history:
+                log.debug(
+                    "TLG AI: skipping channel #%s (%s) in guild %s – no read_message_history perms",
+                    channel.name,
+                    channel.id,
+                    guild.id,
+                )
                 continue
 
             limit = None if scan_all else per_channel
+            channel_count += 1
+            msg_count = 0
+
+            log.info(
+                "TLG AI: historyscan -> starting channel #%s (%s) in guild %s (limit=%s)",
+                channel.name,
+                channel.id,
+                guild.id,
+                "ALL" if limit is None else limit,
+            )
 
             try:
                 async for msg in channel.history(limit=limit, oldest_first=True):
                     self._remember_style(msg)
+                    msg_count += 1
+                    total_messages += 1
+
+                    # Log every 500 messages so logs don't explode
+                    if msg_count % 500 == 0:
+                        log.info(
+                            "TLG AI: historyscan -> #%s (%s) processed %s messages so far "
+                            "(guild total=%s)",
+                            channel.name,
+                            channel.id,
+                            msg_count,
+                            total_messages,
+                        )
             except discord.HTTPException as e:
                 log.warning(
-                    "History read failed in #%s (%s): %s",
+                    "TLG AI: history read failed in #%s (%s) of guild %s: %s",
                     channel.name,
-                    guild.name,
+                    channel.id,
+                    guild.id,
                     e,
                 )
                 await asyncio.sleep(2.0)
                 continue
 
+            log.info(
+                "TLG AI: historyscan -> finished channel #%s (%s): %s messages processed "
+                "(guild running total=%s)",
+                channel.name,
+                channel.id,
+                msg_count,
+                total_messages,
+            )
+
             await asyncio.sleep(1.5)
 
-        log.info("TLG AI: finished history observation for guild %s", guild.id)
+        log.info(
+            "TLG AI: finished history observation for guild %s (%s). "
+            "Scanned %s text channels, %s messages total.",
+            guild.id,
+            guild.name,
+            channel_count,
+            total_messages,
+        )
 
     async def cog_load(self) -> None:
         for guild in self.bot.guilds:
@@ -1053,6 +1117,15 @@ class AI(commands.Cog):
             await ctx.send("I'm already in full history-scan mode for this server.")
             return
 
+        # Log who started it
+        log.info(
+            "TLG AI: historyscan requested in guild %s (%s) by %s (%s)",
+            gid,
+            guild.name,
+            ctx.author,
+            ctx.author.id,
+        )
+
         self._history_lockdown_guilds.add(gid)
         await ctx.send(
             "Alright, going into nerd mode and reading through the whole server history I can see. "
@@ -1061,9 +1134,11 @@ class AI(commands.Cog):
 
         async def run_scan():
             try:
+                log.info("TLG AI: entering historyscan lockdown for guild %s", gid)
                 await self._observe_history_for_guild(guild, scan_all=True)
             finally:
                 self._history_lockdown_guilds.discard(gid)
+                log.info("TLG AI: exiting historyscan lockdown for guild %s", gid)
                 try:
                     await ctx.send("Done reading history, I'm back to normal behavior now.")
                 except discord.HTTPException:
