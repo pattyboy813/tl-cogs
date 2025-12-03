@@ -60,7 +60,7 @@ class AI(commands.Cog):
         # In-memory spam tracking: (guild_id, user_id) -> [timestamps...]
         self._spam_tracker: Dict[Tuple[int, int], List[float]] = defaultdict(list)
 
-    # ---------- Core LLM call ----------
+    # ---------- Core LLM call + cleanup ----------
 
     async def ask_ollama(self, prompt: str) -> str:
         """Send a prompt to the local Ollama server and return the response text."""
@@ -68,7 +68,7 @@ class AI(commands.Cog):
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False,
-            "temperature": 0.8,
+            "temperature": 0.85,
             "top_p": 0.9,
         }
 
@@ -88,7 +88,60 @@ class AI(commands.Cog):
         text = data.get("response", "").strip()
         if not text:
             return "I'm not sure what to say, but it probably involves a creeper and a bad decision."
-        return text
+        return self._cleanup_reply(text)
+
+    def _cleanup_reply(self, text: str) -> str:
+        """
+        Lightly de-corporatize the reply:
+        - strip super formal greetings
+        - remove/replace assistant-y phrases
+        """
+        original = text
+        t = text.strip()
+
+        lower = t.lower()
+
+        # Kill very formal greeting sentences at the start
+        formal_starts = (
+            "hello! good day",
+            "hello good day",
+            "good day",
+            "hello there",
+            "hello!",
+            "hello.",
+            "hello,",
+            "hi there",
+            "greetings",
+        )
+        for fs in formal_starts:
+            if lower.startswith(fs):
+                # remove up to end of first sentence or newline
+                sentence_end = len(t)
+                for ch in [".", "!", "?", "\n"]:
+                    idx = t.find(ch)
+                    if idx != -1:
+                        sentence_end = min(sentence_end, idx + 1)
+                t = t[sentence_end:].lstrip()
+                break
+
+        # Replace some obvious assistant phrases
+        replacements = {
+            "I'm here to help with the fun stuff": "I'm just here hanging out with everyone",
+            "I'm here to help with the fun stuff!": "I'm just here hanging out with everyone!",
+            "I'm here to help with the fun stuff.": "I'm just here hanging out with everyone.",
+            "I'm here to help with the fun": "I'm just here hanging out",
+            "I'm here to help": "I'm just chilling here with everyone",
+            "I am here to help": "I'm just chilling here with everyone",
+            "AI assistant": "gremlin in this server",
+            "assistant for the games and challenges": "goblin that won't stop talking about games",
+        }
+        for old, new in replacements.items():
+            t = t.replace(old, new)
+
+        # If we cleaned too hard and nuked everything, fall back
+        if not t.strip():
+            return original.strip()
+        return t.strip()
 
     # ---------- Moderation helpers ----------
 
@@ -562,3 +615,4 @@ class AI(commands.Cog):
             await message.reply(reply)
         except discord.HTTPException:
             pass
+
