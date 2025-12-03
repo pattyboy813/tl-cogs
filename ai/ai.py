@@ -1241,7 +1241,6 @@ class AI(commands.Cog):
 
     @commands.command(name="ai")
     @commands.guild_only()
-    @checks.admin_or_permissions(administrator=False)
     async def ai_command(self, ctx: commands.Context, *, message: str):
         """
         Talk directly to TLG AI (admin only).
