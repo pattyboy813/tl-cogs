@@ -27,24 +27,26 @@ BASE_PROMPT = """
 You are "TLG AI", a chill, playful regular in the Threat Level Gaming Discord server.
 You are NOT an assistant or moderator, just another human in chat.
 
-Personality and tone:
-- Sound like a real Discord gamer: casual, friendly, sometimes a bit sarcastic but never mean.
-- Default mood is upbeat and relaxed unless the user is clearly upset.
-- Talk in first person ("I") and speak directly to people ("you").
+Who you are and how you talk:
+- Sound like a real Discord gamer: casual, relaxed, sometimes a bit sarcastic but never mean.
+- Default mood is upbeat unless the other person is clearly upset.
+- Talk in first person ("I") and speak directly to people ("you"), not "the user".
+- NEVER address yourself by name in your reply (no "Hey TLG AI").
 - Use simple, everyday language; avoid formal or corporate phrasing.
 - Use slang and emojis sparingly and naturally; don't spam them.
 
 Reply style:
 - Reply with ONE message as if you were sending it in the channel.
-- Usually 1–2 short sentences. Only go longer if the user clearly asks for a detailed explanation or story.
-- If the user just greets you ("hi", "hello", "hey", "yo", etc., maybe with your name), answer with a very short greeting back (a few words) and maybe one emoji, nothing more.
-- If the user seems sad or frustrated, be kind and supportive first, then maybe add a light joke.
+- Usually 1–2 short sentences. Only go longer if they clearly ask for detail.
+- If they just greet you ("hi", "hello", "hey", "yo", etc., maybe with your name), answer with a very short casual greeting back (a few words) and maybe one emoji, nothing more.
+- If they say something like "how are you", respond briefly about how you're doing and bounce the question back.
+- If they seem sad or frustrated, be kind and supportive first, then maybe add a light joke.
 - If they share something cool or a win, hype them up.
 
 Hard rules:
-- Do not repeat the user's message word-for-word.
-- Do not start with stiff phrases like "Hello there," "Greetings," or "Good day."
-- Do not talk about "the user", "the prompt", or "as an AI".
+- Do not repeat the person's message word-for-word.
+- Do not start with stiff phrases like "Hello there", "Greetings", or "Good day".
+- Do not talk about "the user", "the prompt", or being an AI.
 - Do not explain what you are doing or list steps.
 - Do not invent fake life stories for yourself (no imaginary trips, jobs, exams, vacations, campaigns, etc.).
 - Stay SFW: no slurs, no NSFW content, no harsh insults.
@@ -130,7 +132,6 @@ class AI(commands.Cog):
         instead of trusting the LLM to not be weird.
         """
         t = text.strip().lower()
-
         # Kill trailing punctuation
         t = re.sub(r"[!?.,]+$", "", t)
 
@@ -146,6 +147,28 @@ class AI(commands.Cog):
         greetings = {"hi", "hey", "hello", "yo", "hiya", "heya", "sup"}
         return t in greetings
 
+    def _fallback_smalltalk(self, text: str) -> str:
+        """Fallback for stuff like 'hey, how are you' when the LLM is being cringe."""
+        t = text.lower()
+        if re.search(r"how\s+are\s+(you|u)", t) or "hru" in t or "how's it going" in t:
+            options = [
+                "pretty good, just vibing. you?",
+                "tired but alive lmao, hbu?",
+                "not bad at all, how about you?",
+                "chillin as always, you good?",
+            ]
+            return random.choice(options)
+
+        # Generic short answer if the model output was unusable
+        options = [
+            "lmao fair enough",
+            "yeah I feel that 😅",
+            "trueee",
+            "valid tbh",
+            "sounds about right 😂",
+        ]
+        return random.choice(options)
+
     def _random_greeting_reply(self) -> str:
         replies = [
             "hey 😄",
@@ -159,13 +182,20 @@ class AI(commands.Cog):
 
     async def generate_reply(self, user_text: str) -> str:
         """
-        Decide if we handle this as a simple greeting or send it to the LLM.
+        Decide if we handle this as a simple greeting or send it to the LLM,
+        and patch over obviously bad model habits.
         """
         if self._is_simple_greeting(user_text):
             return self._random_greeting_reply()
 
         prompt = f"{BASE_PROMPT}\n\nLast message: {user_text}\nTLG AI:"
-        return await self.ask_ollama(prompt)
+        reply = await self.ask_ollama(prompt)
+
+        # If it still talks to "TLG AI" like a third person, just use a fallback.
+        if "tlg ai" in reply.lower():
+            return self._fallback_smalltalk(user_text)
+
+        return reply
 
     def _cleanup_reply(self, text: str) -> str:
         """
@@ -173,9 +203,20 @@ class AI(commands.Cog):
         - strip super formal greetings
         - remove/replace assistant-y phrases
         - strip narrator-style junk or echoed prompt text
+        - strip wrapping quotes
         """
         original = text
         t = text.strip()
+        lower = t.lower()
+
+        # Remove wrapping quotes like " ... " or ‘…’
+        quote_pairs = [('\"', '\"'), ("'", "'"), ("“", "”"), ("‘", "’")]
+        for ql, qr in quote_pairs:
+            if t.startswith(ql) and t.endswith(qr) and len(t) > 2:
+                t = t[1:-1].strip()
+        # Also nuke stray leading quotes
+        t = t.lstrip("\"'“”‘’").rstrip()
+
         lower = t.lower()
 
         # If the model echoed the prompt, cut off anything after these markers
@@ -236,7 +277,7 @@ class AI(commands.Cog):
                 lower = t.lower()
                 break
 
-        # Replace some obvious assistant phrases
+        # Replace some obvious assistant phrases / polite filler
         replacements = {
             "I'm here to help with the fun stuff": "I'm just here hanging out with everyone",
             "I'm here to help with the fun stuff!": "I'm just here hanging out with everyone!",
@@ -247,6 +288,7 @@ class AI(commands.Cog):
             "AI assistant": "gremlin in this server",
             "assistant for the games and challenges": "goblin that won't stop talking about games",
             "Hope all is well with you and your campaign.": "",
+            "Hope all is well with you and your": "",
             "Hope all is well with you.": "",
             "Hope all is well.": "",
         }
@@ -574,7 +616,8 @@ class AI(commands.Cog):
     async def on_message(self, message: discord.Message):
         """
         - Runs basic automod (invites + spam) if enabled.
-        - If someone starts a message by pinging the bot, TLG AI replies directly.
+        - If someone mentions the bot in a message (anywhere) and it's not a command,
+          TLG AI replies directly.
         - Otherwise, it may occasionally auto-reply in configured channels.
         """
         if message.author.bot:
@@ -594,50 +637,34 @@ class AI(commands.Cog):
         content = message.content or ""
         content_stripped = content.lstrip()
 
-        # --- Direct @mention detection: ONLY if mention is at the start ---
+        # Figure out prefixes once so we can avoid answering inside commands
+        try:
+            prefixes = await self.bot.get_valid_prefixes(guild)
+        except TypeError:
+            prefixes = await self.bot.get_valid_prefixes()
+        is_command_like = any(content.startswith(p) for p in prefixes)
+
+        # --- Direct mention detection: reply if bot is mentioned anywhere ---
         bot_user = self.bot.user
-        if bot_user:
-            is_direct_mention = False
-            user_text = ""
+        if bot_user and (bot_user in message.mentions) and not is_command_like:
+            # Remove the first occurrence of the bot mention from the text
+            mention_pattern = rf"<@!?{bot_user.id}>"
+            user_text = re.sub(mention_pattern, "", content, count=1).strip()
+            if not user_text:
+                user_text = "hi"  # pure ping → treat as greeting
 
-            # Use both the mention object and raw strings to be safe
-            possible_mentions = {
-                bot_user.mention,
-                f"<@{bot_user.id}>",
-                f"<@!{bot_user.id}>",
-            }
+            try:
+                await message.channel.trigger_typing()
+            except discord.HTTPException:
+                pass
 
-            for m_str in list(possible_mentions):
-                if content_stripped.startswith(m_str):
-                    user_text = content_stripped[len(m_str):].strip()
-                    is_direct_mention = True
-                    break
+            reply = await self.generate_reply(user_text)
+            try:
+                await message.reply(reply)
+            except discord.HTTPException:
+                pass
 
-            # Extra check using message.mentions
-            if not is_direct_mention and message.mentions:
-                first_mention = message.mentions[0]
-                if first_mention.id == bot_user.id:
-                    m_str = first_mention.mention
-                    if content_stripped.startswith(m_str):
-                        user_text = content_stripped[len(m_str):].strip()
-                        is_direct_mention = True
-
-            if is_direct_mention:
-                if not user_text:
-                    user_text = "hi"
-
-                try:
-                    await message.channel.trigger_typing()
-                except discord.HTTPException:
-                    pass
-
-                reply = await self.generate_reply(user_text)
-                try:
-                    await message.reply(reply)
-                except discord.HTTPException:
-                    pass
-
-                return  # don't auto-chat on the same message
+            return  # don't auto-chat on the same message
 
         # --- Auto-chat behavior ---
         if not guild_conf.get("enabled", True):
@@ -647,13 +674,8 @@ class AI(commands.Cog):
         if not chan_ids or message.channel.id not in chan_ids:
             return
 
-        # Ignore command messages (rough filter using valid prefixes)
-        try:
-            prefixes = await self.bot.get_valid_prefixes(guild)
-        except TypeError:
-            prefixes = await self.bot.get_valid_prefixes()
-
-        if any(content.startswith(p) for p in prefixes):
+        # Ignore command messages in auto-chat mode
+        if is_command_like:
             return
 
         # Guild-level cooldown
