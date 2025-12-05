@@ -70,7 +70,7 @@ def verify_tag(tag: str) -> bool:
 
 
 class TagStore:
-    """Per-user Brawl Stars tag storage backed by bstools_config."""
+    """Per-user Brawl Stars tag storage backed by Red's config."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -125,6 +125,7 @@ class TagStore:
             account2 < 1 or account2 > n
         ):
             raise InvalidArgument
+
         accounts[account1 - 1], accounts[account2 - 1] = (
             accounts[account2 - 1],
             accounts[account1 - 1],
@@ -136,288 +137,272 @@ class TagStore:
         new_accounts = await self._get_accounts(new_user_id)
         if new_accounts:
             raise MainAlreadySaved
+
         await self._set_accounts(new_user_id, old_accounts)
         await self._set_accounts(old_user_id, [])
+# ============================================================
+#                 BRAWL STARS API HANDLING
+# ============================================================
 
-    async def get_users_with_tag(self, tag: str):
-        tag = format_tag(tag)
-        if not verify_tag(tag):
-            raise InvalidTag
-
-        results = []
-        all_users = await self.config.all_users()
-        for uid_str, data in all_users.items():
-            uid = int(uid_str)
-            accounts = data.get("brawlstars_accounts", [])
-            for idx, t in enumerate(accounts, start=1):
-                if format_tag(t) == tag:
-                    results.append((uid, idx))
-        return results
-
-
-# ----------------- Cog: BrawlStarsTools -----------------
-
-
-class BrawlStarsTools(commands.Cog):
-    """Brawl Stars tools: player tags, player/club views, and club admin utilities."""
-
-    __author__ = "Pat+ChatGPT"
-    __version__ = "2.1.0"
+class BrawlStarsAPI:
+    """
+    Handles all requests to the Brawl Stars API using the shared Red API token.
+    """
 
     def __init__(self, bot: Red):
         self.bot = bot
-        self.config = bstools_config
-        self.tags = TagStore(self.config)
-
         self.session: Optional[aiohttp.ClientSession] = None
+        self.token: Optional[str] = None
 
-    async def cog_load(self) -> None:
-        self.session = aiohttp.ClientSession()
-
-    async def cog_unload(self) -> None:
-        if self.session and not self.session.closed:
-            await self.session.close()
-
-    # --------- API helpers ---------
-
-    async def _get_token(self) -> str:
-        tokens = await self.bot.get_shared_api_tokens("brawlstars")
-        token = tokens.get("token")
-        if not token:
-            raise RuntimeError(
-                "No Brawl Stars API token found! "
-                "Set one with:\n"
-                "`[p]set api brawlstars token YOUR_API_TOKEN`"
-            )
-        return token
-
-    async def _api_request(self, path: str, params=None):
-        token = await self._get_token()
-
-        if not self.session or self.session.closed:
+    async def start(self):
+        """Initialize HTTP session + load API token."""
+        if self.session is None:
             self.session = aiohttp.ClientSession()
 
-        headers = {"Authorization": f"Bearer {token}"}
-        url = BASE_URL + path
+        tokens = await self.bot.get_shared_api_tokens("brawlstars")
+        self.token = tokens.get("token")
 
-        async with self.session.get(url, headers=headers, params=params) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            if resp.status == 404:
-                return None
-            text = await resp.text()
-            raise RuntimeError(f"API error {resp.status}: {text[:300]}...")
+        if not self.token:
+            raise RuntimeError(
+                "No Brawl Stars API token set.\n"
+                "Use: `[p]set api brawlstars token,YOUR_TOKEN_HERE`"
+            )
 
-    async def _get_player(self, tag: str):
-        tag = format_tag(tag)
-        return await self._api_request(f"/players/%23{tag}")
+    async def close(self):
+        """Close HTTP session."""
+        if self.session:
+            await self.session.close()
+            self.session = None
 
-    async def _get_club(self, tag: str):
-        tag = format_tag(tag).lstrip("#")
-        return await self._api_request(f"/clubs/%23{tag}")
-
-    async def _get_main_tag_for_user(self, user_id: int) -> Optional[str]:
-        tags = await self.tags.get_all_tags(user_id)
-        return tags[0] if tags else None
-
-    async def _resolve_player_tag(
-        self,
-        ctx: commands.Context,
-        target: Optional[Union[discord.Member, discord.User, str]],
-    ) -> Optional[str]:
-        """Resolve a player tag from #TAG / @user / author."""
-        player_tag: Optional[str] = None
-        source_user: Optional[discord.abc.User] = None
-
-        if isinstance(target, (discord.Member, discord.User)):
-            source_user = target
-        elif target is None:
-            source_user = ctx.author
-        else:
-            player_tag = target
-
-        if source_user is not None:
-            player_tag = await self._get_main_tag_for_user(source_user.id)
-            if not player_tag:
-                await ctx.send(
-                    f"{source_user.mention} has no Brawl Stars accounts saved. "
-                    "Use `[p]bs save <tag>` first."
-                )
-                return None
-
-        if not player_tag:
-            await ctx.send("No valid player tag found.")
-            return None
-
-        return player_tag
-
-    # --------- Command group ---------
-
-    @commands.group(name="bs", invoke_without_command=True)
-    async def bs_group(self, ctx: commands.Context):
-        """Brawl Stars tools."""
-        await ctx.send_help(ctx.command)
-
-    # ========================================================
-    # USER COMMANDS
-    # ========================================================
-
-    @bs_group.command(name="save")
-    async def bs_save(self, ctx: commands.Context, tag: str, user: Optional[discord.User] = None):
-        """Save a Brawl Stars player tag.
-
-        [p]bs save #TAG
-        [p]bs save #TAG @user   (mods only)
+    async def request(self, endpoint: str) -> Dict:
         """
-        if user is not None and user != ctx.author:
-            if not await self.bot.is_mod(ctx.author):
-                await ctx.send("You need mod permission to save tags for others.")
-                return
-        if user is None:
-            user = ctx.author
+        Sends a GET request.
+        Example endpoint: '/players/%23TAG'
+        """
+        if self.session is None:
+            await self.start()
+
+        url = BASE_URL + endpoint
+        headers = {"Authorization": f"Bearer {self.token}"}
 
         try:
-            player = await self._get_player(tag)
+            async with self.session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+
+                if resp.status == 404:
+                    return None  # Not found
+
+                text = await resp.text()
+                raise RuntimeError(f"API error {resp.status}: {text}")
+
+        except aiohttp.ClientError as e:
+            raise RuntimeError(f"Network error contacting Brawl Stars API: {e}")
+
+    async def get_player(self, tag: str) -> Optional[Dict]:
+        tag = format_tag(tag)
+        return await self.request(f"/players/%23{tag}")
+
+    async def get_club(self, tag: str) -> Optional[Dict]:
+        tag = format_tag(tag)
+        return await self.request(f"/clubs/%23{tag}")
+
+# ============================================================
+#                          MAIN COG
+# ============================================================
+
+class BrawlStarsTools(commands.Cog):
+    """
+    Unified Brawl Stars tools for players, brawlers, clubs, and admin management.
+    """
+
+    def __init__(self, bot: Red):
+        self.bot = bot
+        self.api = BrawlStarsAPI(bot)
+        self.tags = TagStore(bstools_config)
+        self._ready = False
+
+    async def cog_load(self):
+        """Ensure the API client is ready."""
+        await self.api.start()
+        self._ready = True
+
+    async def cog_unload(self):
+        """Cleanup HTTP session."""
+        await self.api.close()
+
+    # -------------------------
+    #     API wrappers
+    # -------------------------
+
+    async def _get_player(self, tag: str):
+        try:
+            return await self.api.get_player(tag)
+        except RuntimeError as e:
+            raise e
+
+    async def _get_club(self, tag: str):
+        try:
+            return await self.api.get_club(tag)
+        except RuntimeError as e:
+            raise e
+
+    # ========================================================
+    #            BASE COMMAND GROUPS (bs + bs admin)
+    # ========================================================
+
+    @commands.group(name="bs")
+    async def bs_group(self, ctx: commands.Context):
+        """Brawl Stars tools and player commands."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @bs_group.group(name="admin")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def bs_admin_group(self, ctx: commands.Context):
+        """Admin commands for managing clubs + data."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    # ========================================================
+    #                   USER COMMANDS
+    # ========================================================
+
+    # --------------------------------------------------------
+    #  bs save
+    # --------------------------------------------------------
+    @bs_group.command(name="save")
+    async def bs_save(self, ctx: commands.Context, tag: str):
+        """
+        Save your Brawl Stars player tag.
+        Usage:
+          [p]bs save #TAG
+        """
+        clean = format_tag(tag)
+        if not verify_tag(clean):
+            await ctx.send("Invalid tag.")
+            return
+
+        # Validate tag by hitting API
+        try:
+            player = await self._get_player(clean)
         except RuntimeError as e:
             await ctx.send(str(e))
             return
 
         if not player:
-            await ctx.send("Invalid tag or player not found.")
+            await ctx.send("Player not found. Double-check the tag.")
             return
 
-        name = player.get("name", "Unknown")
+        name = player.get("name", "Unknown Player")
 
         try:
-            idx = await self.tags.save_tag(user.id, tag)
-            embed = discord.Embed(
-                color=discord.Color.green(),
-                description="Use `[p]bs accounts` to see all accounts.",
-            )
-            embed.set_author(
-                name=f"{name} (#{format_tag(tag)}) has been saved as account {idx}.",
-                icon_url=user.display_avatar.url,
-            )
-            await ctx.send(embed=embed)
-        except InvalidTag:
-            await ctx.send("Invalid tag format.")
+            idx = await self.tags.save_tag(ctx.author.id, clean)
         except TagAlreadySaved:
-            await ctx.send("That tag is already saved for this user.")
+            await ctx.send("You already saved this tag.")
+            return
         except TagAlreadyExists as e:
-            other = self.bot.get_user(e.user_id)
-            mention = other.mention if other else f"`{e.user_id}`"
-            embed = discord.Embed(
-                title="Error",
-                description=f"Tag is saved under another user: {mention}",
-                color=discord.Color.red(),
-            )
-            await ctx.send(
-                embed=embed,
-                allowed_mentions=discord.AllowedMentions(users=True, roles=False),
-            )
-
-    @bs_group.command(name="accounts")
-    async def bs_accounts(self, ctx: commands.Context, user: Optional[discord.Member] = None):
-        """List all saved Brawl Stars accounts."""
-        if user is None:
-            user = ctx.author
-
-        tags = await self.tags.get_all_tags(user.id)
-        embed = discord.Embed(
-            title=f"{user.display_name}'s Brawl Stars Accounts",
-            color=discord.Color.green(),
-        )
-
-        if not tags:
-            embed.add_field(
-                name="Accounts",
-                value="No Brawl Stars accounts saved.\nUse `[p]bs save <tag>` to save one.",
-            )
-            await ctx.send(embed=embed)
+            other = ctx.guild.get_member(e.user_id) or f"User ID {e.user_id}"
+            await ctx.send(f"This tag is already saved by **{other}**.")
+            return
+        except InvalidTag:
+            await ctx.send("Invalid tag.")
             return
 
-        lines = []
-        for i, tag in enumerate(tags, start=1):
-            try:
-                data = await self._get_player(tag)
-                name = data.get("name", "Unknown") if data else "Unknown"
-            except RuntimeError:
-                name = "Unknown (API error)"
-            lines.append(f"{i}: {name} (#{format_tag(tag)})")
-
-        embed.add_field(name="Accounts", value="\n".join(lines), inline=False)
+        # Embed handled in Part 6
+        embed = self._build_save_embed(ctx.author, name, clean, idx)
         await ctx.send(embed=embed)
 
+    # --------------------------------------------------------
+    #  bs accounts
+    # --------------------------------------------------------
+    @bs_group.command(name="accounts")
+    async def bs_accounts(self, ctx: commands.Context, user: Optional[discord.Member] = None):
+        """
+        List saved Brawl Stars accounts.
+        """
+        user = user or ctx.author
+        tags = await self.tags.get_all_tags(user.id)
+
+        # Embed handled in Part 6
+        embed = await self._build_accounts_embed(user, tags)
+        await ctx.send(embed=embed)
+
+    # --------------------------------------------------------
+    #  bs switch
+    # --------------------------------------------------------
     @bs_group.command(name="switch")
-    async def bs_switch(
+    async def bs_switch(self, ctx: commands.Context, account1: int, account2: int):
+        """
+        Swap the order of two saved accounts.
+        """
+        try:
+            await self.tags.switch_place(ctx.author.id, account1, account2)
+        except InvalidArgument:
+            await ctx.send("Invalid account positions.")
+            return
+
+        await ctx.send("Accounts reordered.")
+        tags = await self.tags.get_all_tags(ctx.author.id)
+        embed = await self._build_accounts_embed(ctx.author, tags)
+        await ctx.send(embed=embed)
+
+    # --------------------------------------------------------
+    #  bs unsave
+    # --------------------------------------------------------
+    @bs_group.command(name="unsave")
+    async def bs_unsave(self, ctx: commands.Context, account: int):
+        """
+        Remove a saved account by its index.
+        """
+        try:
+            await self.tags.unlink_tag(ctx.author.id, account)
+        except InvalidArgument:
+            await ctx.send("Invalid account number.")
+            return
+
+        await ctx.send("Account removed.")
+        tags = await self.tags.get_all_tags(ctx.author.id)
+        embed = await self._build_accounts_embed(ctx.author, tags)
+        await ctx.send(embed=embed)
+
+    # ========================================================
+    #        PLAYER / CLUB / BRAWLERS DATA COMMANDS
+    # ========================================================
+
+    # Utility: resolve @user / #tag / none
+    async def _resolve_player_tag(
         self,
         ctx: commands.Context,
-        account_a: int,
-        account_b: int,
-        user: Optional[discord.Member] = None,
-    ):
-        """Swap positions of two saved accounts."""
-        if user is not None and user != ctx.author:
-            if not await self.bot.is_mod(ctx.author):
-                await ctx.send("You need mod permissions to switch accounts for others.")
-                return
-        if user is None:
-            user = ctx.author
+        target: Optional[Union[discord.Member, discord.User, str]],
+    ) -> Optional[str]:
 
-        try:
-            await self.tags.switch_place(user.id, account_a, account_b)
-            await ctx.send("Done! Your accounts have been swapped.")
-            await self.bs_accounts(ctx, user=user)
-        except InvalidArgument:
-            await ctx.send(
-                "Invalid account numbers. Use `[p]bs accounts` to see valid indices."
-            )
+        # Case 1: raw tag
+        if isinstance(target, str):
+            clean = format_tag(target)
+            if verify_tag(clean):
+                return clean
+            await ctx.send("Invalid tag.")
+            return None
 
-    @bs_group.command(name="unsave")
-    async def bs_unsave(self, ctx: commands.Context, account: int, user: Optional[discord.User] = None):
-        """Unsave a Brawl Stars account by index."""
-        if user is not None and user != ctx.author:
-            if not await self.bot.is_mod(ctx.author):
-                await ctx.send("You need mod permissions to unsave accounts for others.")
-                return
-        if user is None:
-            user = ctx.author
+        # Case 2: @user
+        if isinstance(target, (discord.Member, discord.User)):
+            tags = await self.tags.get_all_tags(target.id)
+            if not tags:
+                await ctx.send("That user has no saved accounts.")
+                return None
+            return tags[0]  # main
 
-        try:
-            await self.tags.unlink_tag(user.id, account)
-            await ctx.send("Account unsaved.")
-            await self.bs_accounts(ctx, user=user)
-        except InvalidArgument:
-            await ctx.send(
-                "Invalid account index. Use `[p]bs accounts` to see valid indices."
-            )
+        # Case 3: author
+        tags = await self.tags.get_all_tags(ctx.author.id)
+        if not tags:
+            await ctx.send("You have no saved accounts. Use `[p]bs save #TAG`.")
+            return None
+        return tags[0]
 
-    @bs_group.command(name="accountowners")
-    async def bs_account_owners(self, ctx: commands.Context, tag: str):
-        """Show which users have this tag saved."""
-        try:
-            owners = await self.tags.get_users_with_tag(tag)
-        except InvalidTag:
-            await ctx.send("Invalid tag format.")
-            return
-
-        if not owners:
-            await ctx.send("No one has this account saved.")
-            return
-
-        lines = []
-        for uid, idx in owners:
-            user = self.bot.get_user(uid)
-            mention = user.mention if user else f"`{uid}`"
-            lines.append(f"{mention} | account #{idx}")
-
-        await ctx.send(
-            "Users with this account:\n" + "\n".join(lines),
-            allowed_mentions=discord.AllowedMentions(users=True, roles=False),
-        )
-
-    # ---------- PLAYER VIEW COMMAND ----------
-
+    # --------------------------------------------------------
+    #  bs player
+    # --------------------------------------------------------
     @bs_group.command(name="player")
     async def bs_player(
         self,
@@ -425,11 +410,12 @@ class BrawlStarsTools(commands.Cog):
         target: Optional[Union[discord.Member, discord.User, str]] = None,
     ):
         """
-        Show a player's profile.
+        Show detailed stats for a Brawl Stars player.
 
-        - [p]bs player            → your main saved account
-        - [p]bs player @user      → that user's main saved account
-        - [p]bs player #PLAYERTAG → raw tag
+        Accepts:
+        - [p]bs player
+        - [p]bs player @user
+        - [p]bs player #TAG
         """
         tag = await self._resolve_player_tag(ctx, target)
         if not tag:
@@ -442,14 +428,15 @@ class BrawlStarsTools(commands.Cog):
             return
 
         if not player:
-            await ctx.send("Could not find that player. Double-check the tag.")
+            await ctx.send("Player not found.")
             return
 
         embed = self._build_player_embed(player)
         await ctx.send(embed=embed)
 
-    # ---------- CLUB VIEW COMMAND (USER) ----------
-
+    # --------------------------------------------------------
+    #  bs club  (user command)
+    # --------------------------------------------------------
     @bs_group.command(name="club")
     async def bs_club(
         self,
@@ -457,67 +444,10 @@ class BrawlStarsTools(commands.Cog):
         target: Optional[Union[discord.Member, discord.User, str]] = None,
     ):
         """
-        Show the club of a Brawl Stars player.
-
-        - [p]bs club            → your main saved account
-        - [p]bs club @user      → that user's main saved account
-        - [p]bs club #PLAYERTAG → raw tag
-        """
-        tag = await self._resolve_player_tag(ctx, target)
-        if not tag:
-            return
-
-        try:
-            player_data = await self._get_player(tag)
-        except RuntimeError as e:
-            await ctx.send(str(e))
-            return
-
-        if not player_data:
-            await ctx.send("Could not find that player. Double-check the tag.")
-            return
-
-        club_info = player_data.get("club")
-        if not club_info:
-            await ctx.send("That player is not in a club.")
-            return
-
-        club_tag = club_info.get("tag")
-        if not club_tag or not verify_tag(format_tag(club_tag)):
-            await ctx.send("Could not determine the player's club tag.")
-            return
-
-        try:
-            club_data = await self._get_club(club_tag)
-        except RuntimeError as e:
-            await ctx.send(str(e))
-            return
-
-        if not club_data:
-            await ctx.send("Could not fetch details for that club.")
-            return
-
-        embed = self._build_club_embed(club_data)
-        player_name = player_data.get("name", "Unknown")
-        embed.set_footer(
-            text=f"Club of {player_name} (#{format_tag(tag)}) | Data from Brawl Stars API"
-        )
-        await ctx.send(embed=embed)
-
-    # ---------- BRAWLERS VIEW COMMAND ----------
-
-    @bs_group.command(name="brawlers")
-    async def bs_brawlers(
-        self,
-        ctx: commands.Context,
-        target: Optional[Union[discord.Member, discord.User, str]] = None,
-    ):
-        """
-        Show a summary of a player's brawlers.
-
-        - [p]bs brawlers            → your main saved account
-        - [p]bs brawlers @user      → that user's main saved account
-        - [p]bs brawlers #PLAYERTAG → raw tag
+        Show the club of a player by:
+        - Saved main account
+        - @user's main account
+        - #TAG
         """
         tag = await self._resolve_player_tag(ctx, target)
         if not tag:
@@ -530,62 +460,76 @@ class BrawlStarsTools(commands.Cog):
             return
 
         if not player:
-            await ctx.send("Could not find that player. Double-check the tag.")
+            await ctx.send("Player not found.")
             return
 
-        brawlers = player.get("brawlers", [])
-        if not brawlers:
-            await ctx.send("No brawlers data available for this player.")
+        club = player.get("club")
+        if not club:
+            await ctx.send("This player is not in a club.")
             return
 
-        # Sort by trophies descending and take top 10
-        brawlers_sorted = sorted(brawlers, key=lambda b: b.get("trophies", 0), reverse=True)
-        top = brawlers_sorted[:10]
+        club_tag = club.get("tag")
 
-        lines = []
-        for b in top:
-            name = b.get("name", "Unknown")
-            trophies = b.get("trophies", 0)
-            highest = b.get("highestTrophies", 0)
-            power = b.get("power", 0)
-            rank = b.get("rank", 0)
-            lines.append(
-                f"**{name}** – 🏆 {trophies} (PB {highest}) | ⭐ Power {power} | 🎖 Rank {rank}"
-            )
+        try:
+            data = await self._get_club(club_tag)
+        except RuntimeError as e:
+            await ctx.send(str(e))
+            return
 
-        desc = "\n".join(lines)
-        total = len(brawlers)
+        if not data:
+            await ctx.send("Club not found.")
+            return
 
-        embed = discord.Embed(
-            title=f"{player.get('name', 'Unknown')}'s Top Brawlers",
-            description=desc or "No brawler data.",
-            color=discord.Color.orange(),
-        )
-        embed.set_footer(text=f"Showing top 10 of {total} brawler(s) | #{format_tag(tag)}")
+        embed = self._build_club_embed(data)
+        await ctx.send(embed=embed)
+
+    # --------------------------------------------------------
+    #  bs brawlers
+    # --------------------------------------------------------
+    @bs_group.command(name="brawlers")
+    async def bs_brawlers(
+        self,
+        ctx: commands.Context,
+        target: Optional[Union[discord.Member, discord.User, str]] = None,
+    ):
+        """
+        Show a player's top brawlers.
+        """
+        tag = await self._resolve_player_tag(ctx, target)
+        if not tag:
+            return
+
+        try:
+            player = await self._get_player(tag)
+        except RuntimeError as e:
+            await ctx.send(str(e))
+            return
+
+        if not player:
+            await ctx.send("Player not found.")
+            return
+
+        embed = self._build_brawlers_embed(player)
         await ctx.send(embed=embed)
 
     # ========================================================
-    # ADMIN SUBGROUP: !bs admin ...
+    #                   ADMIN COMMANDS
     # ========================================================
-
-    @bs_group.group(name="admin")
-    @checks.admin_or_permissions(manage_guild=True)
-    async def bs_admin_group(self, ctx: commands.Context):
-        """Admin-only Brawl Stars tools."""
-        if ctx.invoked_subcommand is None:
-            await ctx.send_help(ctx.command)
 
     @bs_admin_group.command(name="addclub")
     async def bs_add_club(self, ctx: commands.Context, tag: str):
-        """Add a club to this server's tracked list (admin).
+        """
+        Add a club to this server's tracked list (by tag only).
 
         Usage:
           [p]bs admin addclub #TAG
         """
-        club_tag = "#" + format_tag(tag)
-        if not verify_tag(format_tag(tag)):
-            await ctx.send("Invalid club tag format.")
+        clean = format_tag(tag)
+        if not verify_tag(clean):
+            await ctx.send("Invalid club tag.")
             return
+
+        club_tag = f"#{clean}"
 
         # Fetch club from API to get the real name
         try:
@@ -600,59 +544,52 @@ class BrawlStarsTools(commands.Cog):
 
         club_name = data.get("name", "Unknown Club")
 
-        async with self.config.guild(ctx.guild).clubs() as clubs:
+        async with bstools_config.guild(ctx.guild).clubs() as clubs:
             clubs[club_tag] = {
                 "tag": club_tag,
                 "name": club_name,
             }
 
-        await ctx.send(f"Added **{club_name}** (`{club_tag}`) to tracked clubs.")
+        embed = self._build_addclub_embed(club_name, club_tag)
+        await ctx.send(embed=embed)
 
     @bs_admin_group.command(name="delclub")
     async def bs_del_club(self, ctx: commands.Context, tag: str):
-        """Remove a club from this server's tracked list (admin) by tag.
+        """
+        Remove a tracked club by tag.
 
         Usage:
           [p]bs admin delclub #TAG
         """
-        club_tag = "#" + format_tag(tag)
-        async with self.config.guild(ctx.guild).clubs() as clubs:
+        clean = format_tag(tag)
+        club_tag = f"#{clean}"
+
+        async with bstools_config.guild(ctx.guild).clubs() as clubs:
             if club_tag not in clubs:
-                await ctx.send("That club tag is not tracked.")
+                await ctx.send("That club tag is not currently tracked.")
                 return
             removed = clubs.pop(club_tag)
-        await ctx.send(f"Removed **{removed.get('name', 'Unknown Club')}** (`{club_tag}`).")
+
+        name = removed.get("name", "Unknown Club")
+        embed = self._build_delclub_embed(name, club_tag)
+        await ctx.send(embed=embed)
 
     @bs_admin_group.command(name="listclubs")
     async def bs_list_clubs(self, ctx: commands.Context):
-        """List all tracked clubs for this server (admin)."""
-        clubs = await self.config.guild(ctx.guild).clubs()
-        if not clubs:
-            await ctx.send("No clubs tracked yet. Use `[p]bs admin addclub #TAG` to add some.")
-            return
-
-        lines = []
-        for club in clubs.values():
-            # club is {"tag": "#XXXX", "name": "Club Name"}
-            tag = club.get("tag", "#??????")
-            name = club.get("name", "Unknown Club")
-            lines.append(f"**{name}** → `{tag}`")
-
-        embed = discord.Embed(
-            title="Tracked Brawl Stars Clubs",
-            description="\n".join(lines),
-            color=discord.Color.gold(),
-        )
+        """
+        List all tracked clubs for this server.
+        """
+        clubs = await bstools_config.guild(ctx.guild).clubs()
+        embed = self._build_listclubs_embed(clubs)
         await ctx.send(embed=embed)
 
     @bs_admin_group.command(name="refreshclubs")
     async def bs_refresh_clubs(self, ctx: commands.Context):
         """
-        Refresh saved club names from the Brawl Stars API.
-
-        Only updates stored `name` for each saved club; tags are left as-is.
+        Refresh saved club names from the API.
+        Tags remain the same; only names are updated.
         """
-        clubs = await self.config.guild(ctx.guild).clubs()
+        clubs = await bstools_config.guild(ctx.guild).clubs()
         if not clubs:
             await ctx.send("No clubs tracked yet. Use `[p]bs admin addclub #TAG` first.")
             return
@@ -660,9 +597,9 @@ class BrawlStarsTools(commands.Cog):
         updated = 0
         failed = 0
 
-        async with self.config.guild(ctx.guild).clubs() as clubs_conf:
-            for key, club in list(clubs_conf.items()):
-                tag = club.get("tag") or key
+        async with bstools_config.guild(ctx.guild).clubs() as clubs_conf:
+            for club_tag, club_data in list(clubs_conf.items()):
+                tag = club_data.get("tag") or club_tag
                 if not tag:
                     failed += 1
                     continue
@@ -677,41 +614,20 @@ class BrawlStarsTools(commands.Cog):
                     failed += 1
                     continue
 
-                new_name = data.get("name") or club.get("name", "Unknown Club")
-                if new_name != club.get("name"):
-                    clubs_conf[key]["name"] = new_name
+                new_name = data.get("name") or club_data.get("name", "Unknown Club")
+                if new_name != club_data.get("name"):
+                    clubs_conf[club_tag]["name"] = new_name
                     updated += 1
 
-        await ctx.send(f"Refreshed club names. Updated **{updated}** club(s), **{failed}** failed.")
-
-    @bs_admin_group.command(name="account_transfer")
-    async def bs_account_transfer(
-        self,
-        ctx: commands.Context,
-        old: discord.User,
-        new: discord.User,
-    ):
-        """Transfer all BS accounts from one user to another (admin)."""
-        try:
-            await self.tags.move_user_id(old.id, new.id)
-        except MainAlreadySaved:
-            await ctx.send(
-                f"{new.mention} already has accounts. "
-                "They must unsave them first with `[p]bs unsave`."
-            )
-            return
-
-        await ctx.send("Transfer complete.")
-        await self.bs_accounts(ctx, user=new)
+        embed = self._build_refreshclubs_embed(updated, failed)
+        await ctx.send(embed=embed)
 
     @bs_admin_group.command(name="clubs")
     async def bs_admin_clubs(self, ctx: commands.Context):
         """
-        Overview of all tracked clubs (admin).
-
-        Uses clubs from: [p]bs admin addclub #TAG
+        Overview of all tracked clubs using live API data.
         """
-        clubs = await self.config.guild(ctx.guild).clubs()
+        clubs = await bstools_config.guild(ctx.guild).clubs()
         if not clubs:
             await ctx.send("No clubs tracked yet. Use `[p]bs admin addclub #TAG` first.")
             return
@@ -728,7 +644,7 @@ class BrawlStarsTools(commands.Cog):
             tasks.append(asyncio.create_task(self._get_club(tag)))
 
         if not tasks:
-            await ctx.send("No valid club entries found in config.")
+            await ctx.send("No valid club entries found.")
             return
 
         try:
@@ -748,53 +664,120 @@ class BrawlStarsTools(commands.Cog):
             return
 
         overview_embed = self._build_overview_embed(collected)
+        detail_embed = self._build_clubs_stats_embed(collected)
+
         await ctx.send(embed=overview_embed)
+        await ctx.send(embed=detail_embed)
 
-        stats_embed = self._build_clubs_stats_embed(collected)
-        await ctx.send(embed=stats_embed)
+    # ========================================================
+    #                   EMBED BUILDERS
+    # ========================================================
 
-    # ----------------- Embed builders -----------------
+    # -----------------------------
+    # Save tag embed
+    # -----------------------------
+    def _build_save_embed(self, user: discord.User, name: str, tag: str, idx: int):
+        embed = discord.Embed(
+            title="✨ Brawl Stars Account Linked",
+            description=f"Saved as **Account #{idx}**\n\n**{name}** (`#{format_tag(tag)}`)",
+            color=discord.Color.from_rgb(0, 200, 140)
+        )
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.set_footer(text="Use bs accounts to view your saved accounts.")
+        return embed
 
-    def _build_player_embed(self, player: Dict) -> discord.Embed:
+    # -----------------------------
+    # Accounts list embed
+    # -----------------------------
+    async def _build_accounts_embed(self, user: discord.Member, tags: List[str]):
+        embed = discord.Embed(
+            title=f"{user.display_name}'s Brawl Stars Accounts",
+            color=discord.Color.from_rgb(0, 170, 255),
+        )
+
+        if not tags:
+            embed.description = (
+                "❌ **No accounts saved.**\n"
+                "Use `bs save #TAG` to link your account."
+            )
+            return embed
+
+        lines = []
+        for i, tag in enumerate(tags, start=1):
+            try:
+                data = await self._get_player(tag)
+                name = data.get("name", "Unknown")
+            except RuntimeError:
+                name = "Unknown (API error)"
+
+            is_main = " **(Main)**" if i == 1 else ""
+            lines.append(f"**{i}. {name}{is_main}**\n`#{format_tag(tag)}`")
+
+        embed.description = "\n\n".join(lines)
+        embed.set_footer(text="Main account is always slot #1.")
+        return embed
+
+    # -----------------------------
+    # Player profile embed
+    # -----------------------------
+    def _build_player_embed(self, player: Dict):
         name = player.get("name", "Unknown")
         tag = player.get("tag", "#??????")
         trophies = player.get("trophies", 0)
         highest = player.get("highestTrophies", 0)
         exp_level = player.get("expLevel", 0)
-        solo_victories = player.get("soloVictories", 0)
-        duo_victories = player.get("duoVictories", 0)
-        trio_victories = player.get("3vs3Victories", 0)
+
+        solo = player.get("soloVictories", 0)
+        duo = player.get("duoVictories", 0)
+        trio = player.get("3vs3Victories", 0)
+
         club = player.get("club") or {}
-        club_name = club.get("name", "No Club")
-        club_tag = club.get("tag", "")
+        club_line = "Not in a club"
+        if club:
+            c_name = club.get("name", "Unknown Club")
+            c_tag = club.get("tag", "")
+            club_line = f"**{c_name}** (`{c_tag}`)"
 
         embed = discord.Embed(
-            title=f"{name} ({tag})",
-            color=discord.Color.blurple(),
+            title=f"{name}",
+            description=f"`{tag}`",
+            color=discord.Color.from_rgb(240, 200, 50),
         )
-        embed.add_field(name="Trophies", value=f"{trophies:,}", inline=True)
-        embed.add_field(name="Highest Trophies", value=f"{highest:,}", inline=True)
-        embed.add_field(name="EXP Level", value=str(exp_level), inline=True)
 
-        embed.add_field(name="3v3 Wins", value=str(trio_victories), inline=True)
-        embed.add_field(name="Solo Wins", value=str(solo_victories), inline=True)
-        embed.add_field(name="Duo Wins", value=str(duo_victories), inline=True)
+        embed.add_field(
+            name="🏆 Trophies",
+            value=f"**{trophies:,}**\n(PB: {highest:,})",
+            inline=True,
+        )
+        embed.add_field(
+            name="⭐ Level",
+            value=f"**{exp_level}**",
+            inline=True,
+        )
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
 
-        club_line = club_name if not club_tag else f"{club_name} ({club_tag})"
-        embed.add_field(name="Club", value=club_line, inline=False)
+        victories = (
+            f"👥 **3v3 Wins:** {trio:,}\n"
+            f"🧍 **Solo Wins:** {solo:,}\n"
+            f"👫 **Duo Wins:** {duo:,}"
+        )
+        embed.add_field(name="📊 Victories", value=victories, inline=False)
+        embed.add_field(name="🏰 Club", value=club_line, inline=False)
 
-        embed.set_footer(text="Data from Supercell Brawl Stars API")
+        embed.set_footer(text="Player stats from the Brawl Stars API")
         return embed
 
-    def _build_club_embed(self, data: Dict) -> discord.Embed:
+    # -----------------------------
+    # Club embed (user command)
+    # -----------------------------
+    def _build_club_embed(self, data: Dict):
         name = data.get("name", "Unknown Club")
         tag = data.get("tag", "#??????")
         trophies = data.get("trophies", 0)
         required = data.get("requiredTrophies", 0)
-        description = data.get("description") or "No description set."
+        desc = data.get("description") or "*No description provided.*"
 
         members = data.get("members", [])
-        total_members = len(members)
         max_members = data.get("maxMembers", 30)
 
         president = next((m for m in members if m.get("role") == "president"), None)
@@ -802,95 +785,164 @@ class BrawlStarsTools(commands.Cog):
         seniors = [m for m in members if m.get("role") == "senior"]
 
         embed = discord.Embed(
-            title=f"{name} ({tag})",
-            description=description,
-            color=discord.Color.blurple(),
+            title=name,
+            description=f"`{tag}`\n\n{desc}",
+            color=discord.Color.from_rgb(0, 200, 255),
         )
 
-        embed.add_field(name="Trophies", value=f"{trophies:,}", inline=True)
+        embed.add_field(name="🏆 Trophies", value=f"**{trophies:,}**", inline=True)
+        embed.add_field(name="🔓 Required", value=f"**{required:,}**", inline=True)
         embed.add_field(
-            name="Required Trophies", value=f"{required:,}", inline=True
-        )
-        embed.add_field(
-            name="Members", value=f"{total_members}/{max_members}", inline=True
-        )
-
-        embed.add_field(
-            name="President",
-            value=president.get("name") if president else "Unknown",
+            name="👥 Members",
+            value=f"**{len(members)}/{max_members}**",
             inline=True,
         )
-        embed.add_field(
-            name="Vice Presidents", value=str(len(vps)), inline=True
-        )
-        embed.add_field(
-            name="Seniors", value=str(len(seniors)), inline=True
-        )
 
-        embed.set_footer(text="Data from Supercell Brawl Stars API")
+        pres_display = "Unknown"
+        if president:
+            pres_display = f"{president.get('name')} (`{president.get('tag')}`)"
+
+        leadership = (
+            f"👑 **President:** {pres_display}\n"
+            f"🛡 **Vice Presidents:** {len(vps)}\n"
+            f"🎖 **Seniors:** {len(seniors)}"
+        )
+        embed.add_field(name="🧭 Leadership", value=leadership, inline=False)
+
+        embed.set_footer(text="Club information from Brawl Stars API")
         return embed
 
-    def _build_overview_embed(
-        self, club_data: List[Tuple[str, str, Dict]]
-    ) -> discord.Embed:
-        total_clubs = len(club_data)
-        total_trophies = 0
-        total_members = 0
-        total_required = 0
-        total_vps = 0
-        total_seniors = 0
+    # -----------------------------
+    # Brawlers embed
+    # -----------------------------
+    def _build_brawlers_embed(self, player: Dict):
+        name = player.get("name", "Unknown")
+        tag = player.get("tag", "#??????")
 
-        for _, _, data in club_data:
-            total_trophies += data.get("trophies", 0)
-            members = data.get("members", [])
-            total_members += len(members)
-            total_required += data.get("requiredTrophies", 0)
-            total_vps += sum(1 for m in members if m.get("role") == "vicePresident")
-            total_seniors += sum(1 for m in members if m.get("role") == "senior")
+        brawlers = player.get("brawlers", [])
+        if not brawlers:
+            return discord.Embed(
+                title=f"{name}'s Brawlers",
+                description="No brawlers found.",
+                color=discord.Color.red(),
+            )
 
-        def avg(x):
-            return x / total_clubs if total_clubs else 0
+        brawlers = sorted(brawlers, key=lambda b: b.get("trophies", 0), reverse=True)
+        top = brawlers[:10]
+
+        lines = []
+        for b in top:
+            lines.append(
+                f"**{b.get('name')}**\n"
+                f"🏆 {b.get('trophies')} (PB {b.get('highestTrophies')}) • "
+                f"⭐ Power {b.get('power')} • 🎖 Rank {b.get('rank')}"
+            )
 
         embed = discord.Embed(
-            title="Overview | Brawl Stars Clubs",
-            color=discord.Color.gold(),
+            title=f"{name}'s Top Brawlers",
+            description="\n\n".join(lines),
+            color=discord.Color.from_rgb(255, 120, 50),
         )
-
-        embed.add_field(name="Total Clubs", value=str(total_clubs), inline=True)
-        embed.add_field(
-            name="Total Trophies", value=f"{total_trophies:,}", inline=True
-        )
-        embed.add_field(
-            name="Total Members", value=str(total_members), inline=True
-        )
-
-        embed.add_field(
-            name="Average Trophies", value=f"{avg(total_trophies):,.0f}", inline=True
-        )
-        embed.add_field(
-            name="Average Required",
-            value=f"{avg(total_required):,.0f}", inline=True,
-        )
-        embed.add_field(
-            name="Average Members", value=f"{avg(total_members):,.1f}", inline=True,
-        )
-
-        embed.add_field(
-            name="Average Vice Presidents", value=f"{avg(total_vps):,.1f}", inline=True
-        )
-        embed.add_field(
-            name="Average Seniors", value=f"{avg(total_seniors):,.1f}", inline=True
-        )
-
-        embed.set_footer(text="Data from Supercell Brawl Stars API")
+        embed.set_footer(text=f"#{format_tag(tag)} • Showing top 10")
         return embed
 
-    def _build_clubs_stats_embed(
-        self, club_data: List[Tuple[str, str, Dict]]
-    ) -> discord.Embed:
+    # -----------------------------
+    # Add club embed
+    # -----------------------------
+    def _build_addclub_embed(self, name: str, tag: str):
         embed = discord.Embed(
-            title="Clubs Overview | Stats",
-            color=discord.Color.blurple(),
+            title="🏰 Club Added",
+            description=f"Tracking **{name}** (`{tag}`)",
+            color=discord.Color.green(),
+        )
+        return embed
+
+    # -----------------------------
+    # Delete club embed
+    # -----------------------------
+    def _build_delclub_embed(self, name: str, tag: str):
+        embed = discord.Embed(
+            title="🗑 Club Removed",
+            description=f"Stopped tracking **{name}** (`{tag}`)",
+            color=discord.Color.red(),
+        )
+        return embed
+
+    # -----------------------------
+    # List clubs embed
+    # -----------------------------
+    def _build_listclubs_embed(self, clubs: Dict[str, Dict]):
+        embed = discord.Embed(
+            title="📜 Tracked Brawl Stars Clubs",
+            color=discord.Color.from_rgb(60, 60, 60),
+        )
+
+        if not clubs:
+            embed.description = (
+                "No clubs saved.\n"
+                "Use `bs admin addclub #TAG` to start tracking clubs."
+            )
+            return embed
+
+        lines = []
+        for data in clubs.values():
+            name = data.get("name", "Unknown")
+            tag = data.get("tag", "#??????")
+            lines.append(f"**{name}**\n`{tag}`")
+
+        embed.description = "\n\n".join(lines)
+        return embed
+
+    # -----------------------------
+    # Refresh clubs embed
+    # -----------------------------
+    def _build_refreshclubs_embed(self, updated: int, failed: int):
+        color = discord.Color.green() if failed == 0 else discord.Color.orange()
+        embed = discord.Embed(
+            title="🔄 Clubs Updated",
+            description=(
+                f"Updated: **{updated}** club(s)\n"
+                f"Failed: **{failed}** club(s)"
+            ),
+            color=color,
+        )
+        return embed
+
+    # -----------------------------
+    # Overview embed (admin)
+    # -----------------------------
+    def _build_overview_embed(self, club_data: List[Tuple[str, str, Dict]]):
+        total = len(club_data)
+        total_trophies = sum(d.get("trophies", 0) for _, _, d in club_data)
+        total_members = sum(len(d.get("members", [])) for _, _, d in club_data)
+        total_required = sum(d.get("requiredTrophies", 0) for _, _, d in club_data)
+
+        def avg(x): return x / total if total else 0
+
+        embed = discord.Embed(
+            title="📊 Clubs Overview",
+            description=f"Tracking **{total}** clubs",
+            color=discord.Color.purple(),
+        )
+
+        embed.add_field(name="🏆 Total Trophies", value=f"{total_trophies:,}", inline=True)
+        embed.add_field(name="👥 Total Members", value=f"{total_members}", inline=True)
+        embed.add_field(name="🔓 Total Required", value=f"{total_required:,}", inline=True)
+
+        embed.add_field(name="📈 Avg Trophies", value=f"{avg(total_trophies):,.0f}", inline=True)
+        embed.add_field(name="📈 Avg Members", value=f"{avg(total_members):,.1f}", inline=True)
+        embed.add_field(name="📈 Avg Required", value=f"{avg(total_required):,.0f}", inline=True)
+
+        embed.set_footer(text="Overall club performance summary")
+        return embed
+
+    # -----------------------------
+    # Clubs stats embed
+    # -----------------------------
+    def _build_clubs_stats_embed(self, club_data: List[Tuple[str, str, Dict]]):
+        embed = discord.Embed(
+            title="📋 Clubs Detail Breakdown",
+            color=discord.Color.from_rgb(30, 30, 30),
         )
 
         lines = []
@@ -899,16 +951,14 @@ class BrawlStarsTools(commands.Cog):
             required = data.get("requiredTrophies", 0)
             members = data.get("members", [])
             max_members = data.get("maxMembers", 30)
-
             vps = sum(1 for m in members if m.get("role") == "vicePresident")
             seniors = sum(1 for m in members if m.get("role") == "senior")
 
-            line = (
-                f"**{name}** ({tag})\n"
-                f"🏆 {trophies:,}  |  Req: {required:,}\n"
-                f"👥 {len(members)}/{max_members}  |  VP: {vps}  |  Sr: {seniors}"
+            lines.append(
+                f"**{name}** (`{tag}`)\n"
+                f"🏆 {trophies:,} • 🔓 Req {required:,}\n"
+                f"👥 {len(members)}/{max_members} • 🛡 VP {vps} • 🎖 Sr {seniors}"
             )
-            lines.append(line)
 
-        embed.description = "\n\n".join(lines)
+        embed.description = "\n\n".join(lines) if lines else "No club data."
         return embed
