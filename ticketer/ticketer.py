@@ -13,6 +13,11 @@ from redbot.core.bot import Red
 log = logging.getLogger("red.tlg_tickets")
 
 
+# ========================================================================== #
+#  PANEL VIEW (main "Open Ticket" button)
+# ========================================================================== #
+
+
 class TicketPanelView(discord.ui.View):
     """Persistent view for the 'Open Ticket' button."""
 
@@ -47,6 +52,11 @@ class TicketPanelView(discord.ui.View):
                 "Something broke trying to make your ticket, ping staff about it.",
                 ephemeral=True,
             )
+
+
+# ========================================================================== #
+#  PER-TICKET CONTROLS VIEW (Close / Lock / Transcript)
+# ========================================================================== #
 
 
 class TicketControlsView(discord.ui.View):
@@ -90,7 +100,8 @@ class TicketControlsView(discord.ui.View):
 
         if not (is_owner or is_staff):
             await interaction.followup.send(
-                "Only the ticket opener or staff can close this ticket.", ephemeral=True
+                "Only the ticket opener or staff can close this ticket.",
+                ephemeral=True,
             )
             return
 
@@ -226,7 +237,8 @@ class TicketControlsView(discord.ui.View):
         )
 
         try:
-            await owner.send(embed=embed, file=file_for_dm)
+            await owner.send(embed=embed)
+            await owner.send(file=file_for_dm)
         except discord.HTTPException:
             await interaction.followup.send(
                 "I couldn't DM the ticket owner (they might have DMs off).",
@@ -239,11 +251,16 @@ class TicketControlsView(discord.ui.View):
         )
 
 
+# ========================================================================== #
+#  MAIN COG
+# ========================================================================== #
+
+
 class Tickets(commands.Cog):
     """TLG Tickets - button-based ticket system for Threat Level Gaming."""
 
     __author__ = "you + a chatgpt goblin"
-    __version__ = "1.1.0"
+    __version__ = "1.2.0"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -260,8 +277,6 @@ class Tickets(commands.Cog):
             "tickets": {},
         }
         self.config.register_guild(**default_guild)
-
-        self._spam_lock = False
 
         self._panel_view: Optional[TicketPanelView] = None
         self._controls_view: Optional[TicketControlsView] = None
@@ -349,22 +364,12 @@ class Tickets(commands.Cog):
         support_role_ids = set(settings.get("support_role_ids") or [])
 
         for target, overwrites in channel.overwrites.items():
-            if isinstance(target, discord.Role):
-                # Let staff roles through untouched
-                if target.id in support_role_ids:
-                    continue
-                # Don't mess with @everyone here
-                if target == channel.guild.default_role:
-                    continue
-            elif isinstance(target, discord.Member):
-                # Staff users can always talk
-                if self._is_staff_member(target, settings):
-                    continue
-            else:
+            # Only toggle per-member overwrites (owner + added users)
+            if not isinstance(target, discord.Member):
                 continue
 
-            if not isinstance(target, discord.Member):
-                # We only toggle per-member overwrites (owner + added users)
+            # Staff users can always talk
+            if self._is_staff_member(target, settings):
                 continue
 
             ow = channel.overwrites_for(target)
@@ -387,19 +392,36 @@ class Tickets(commands.Cog):
         channel: discord.TextChannel,
         limit: int = 1000,
     ) -> str:
-        """Build a simple text transcript string from recent channel history."""
-        lines = []
+        """Build a readable text transcript from recent channel history."""
+        lines: list[str] = []
+
+        header_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        lines.append(f"Ticket transcript for {channel.guild.name} / #{channel.name}")
+        lines.append(f"Exported at {header_time}")
+        lines.append("-" * 60)
 
         async for msg in channel.history(limit=limit, oldest_first=True):
-            created = msg.created_at.replace(tzinfo=timezone.utc).isoformat()
-            author = f"{msg.author} ({msg.author.id})"
-            content = msg.content.replace("\n", "\\n")
-            lines.append(f"[{created}] {author}: {content}")
+            timestamp = msg.created_at.astimezone(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            author_name = msg.author.display_name
+            content = msg.clean_content or ""
+            content = content.replace("\r\n", "\n").replace("\r", "\n")
+
+            if content:
+                for line in content.split("\n"):
+                    lines.append(f"[{timestamp} UTC] {author_name}: {line}")
+            else:
+                lines.append(f"[{timestamp} UTC] {author_name}: (no text)")
+
             for attachment in msg.attachments:
-                lines.append(f"[{created}] ATTACHMENT: {attachment.url}")
+                lines.append(
+                    f"[{timestamp} UTC] {author_name}: [attachment] "
+                    f"{attachment.filename} <{attachment.url}>"
+                )
 
         if not lines:
-            lines.append("No messages in ticket.")
+            lines.append("No messages in this ticket.")
 
         return "\n".join(lines)
 
@@ -468,32 +490,41 @@ class Tickets(commands.Cog):
         # DM transcript to ticket owner (if we can)
         if isinstance(owner, discord.Member):
             try:
-                file_for_dm = discord.File(
-                    io.StringIO(transcript_text),
-                    filename=f"ticket-{channel.id}.txt",
-                )
                 dm_embed = discord.Embed(
                     title="Your ticket has been closed",
                     description=(
                         f"Server: **{guild.name}**\n"
                         f"Channel: `{channel.name}`\n"
                         f"Closed by: **{closed_by}**\n\n"
-                        "Here's a copy of the conversation for your records."
+                        "I've attached a text transcript of the conversation "
+                        "for your records."
                     ),
                     color=discord.Color.blurple(),
                     timestamp=datetime.now(timezone.utc),
                 )
-                await owner.send(embed=dm_embed, file=file_for_dm)
+
+                # Send the nice embed first
+                await owner.send(embed=dm_embed)
+
+                # Then send the transcript file as a second DM
+                file_for_dm = discord.File(
+                    io.StringIO(transcript_text),
+                    filename=f"ticket-{channel.id}.txt",
+                )
+                await owner.send(file=file_for_dm)
+
             except discord.HTTPException:
                 log.info(
                     "Couldn't DM transcript to %s (%s) – probably closed DMs.",
                     owner,
-                    owner.id,
+                    getattr(owner, "id", "unknown"),
                 )
 
         # Notify in channel & delete
         try:
-            await channel.send("This ticket is now closed. I'll delete this channel in 5 seconds.")
+            await channel.send(
+                "This ticket is now closed. I'll delete this channel in 5 seconds."
+            )
         except discord.HTTPException:
             pass
 
@@ -525,7 +556,10 @@ class Tickets(commands.Cog):
         max_open = settings.get("max_open_tickets") or 2
         current_open = await self._count_open_tickets_for_user(guild, user)
         if max_open > 0 and current_open >= max_open:
-            return f"You already have {current_open} open ticket(s). Please close one before making another."
+            return (
+                f"You already have {current_open} open ticket(s). "
+                "Please close one before making another."
+            )
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -566,7 +600,7 @@ class Tickets(commands.Cog):
 
         await self._set_guild_ticket_data(guild, channel, user)
 
-        # Intro embed instead of text wall
+        # Intro embed with controls
         embed = discord.Embed(
             title="Ticket opened",
             description=(
@@ -683,7 +717,9 @@ class Tickets(commands.Cog):
         if count == 0:
             await ctx.send("Users can now open unlimited tickets (pray for your mods).")
         else:
-            await ctx.send(f"Users can now have up to **{count}** open tickets at a time.")
+            await ctx.send(
+                f"Users can now have up to **{count}** open tickets at a time."
+            )
 
     @ticketset.command(name="panel")
     async def ticketset_panel(
@@ -764,7 +800,9 @@ class Tickets(commands.Cog):
         if not info:
             return
 
-        reason_text = reason or f"Closed via command by {ctx.author} ({ctx.author.id})"
+        reason_text = (
+            reason or f"Closed via command by {ctx.author} ({ctx.author.id})"
+        )
         await self._close_ticket_channel(
             ctx.channel, closed_by=ctx.author, reason=reason_text
         )
