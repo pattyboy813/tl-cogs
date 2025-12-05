@@ -10,21 +10,19 @@ BASE_URL = "https://api.brawlstars.com/v1"
 # Shared config identifier used by both bstools and bsclubs
 BSTOOLS_CONFIG_ID = 0xB5B5B5B5
 
-# Create a shared Config object (None => not tied to a single cog)
 bstools_config = Config.get_conf(
     None,
     identifier=BSTOOLS_CONFIG_ID,
     force_registration=True,
 )
 
-# Defaults for guild and user data
 default_guild = {
     # {"ShortName": "#TAG"}
     "clubs": {},
 }
 
 default_user = {
-    # ["#TAG1", "#TAG2", ...] for Brawl Stars accounts
+    # ["#TAG1", "#TAG2", ...]
     "brawlstars_accounts": [],
 }
 
@@ -156,8 +154,11 @@ class TagStore:
         return results
 
 
+# ----------------- Cog: BrawlStarsTools -----------------
+
+
 class BrawlStarsTools(commands.Cog):
-    
+
     def __init__(self, bot: Red):
         self.bot = bot
         self.config = bstools_config
@@ -210,8 +211,12 @@ class BrawlStarsTools(commands.Cog):
 
     @commands.group(name="bs", invoke_without_command=True)
     async def bs_group(self, ctx: commands.Context):
-        """Brawl Stars tools (tags + clubs)."""
+        """Brawl Stars tools."""
         await ctx.send_help(ctx.command)
+
+    # ========================================================
+    # USER COMMANDS (directly under !bs)
+    # ========================================================
 
     @bs_group.command(name="save")
     async def bs_save(self, ctx: commands.Context, tag: str, user: Optional[discord.User] = None):
@@ -343,27 +348,6 @@ class BrawlStarsTools(commands.Cog):
                 "Invalid account index. Use `[p]bs accounts` to see valid indices."
             )
 
-    @checks.mod_or_permissions(manage_roles=True)
-    @bs_group.command(name="account_transfer")
-    async def bs_account_transfer(
-        self,
-        ctx: commands.Context,
-        old: discord.User,
-        new: discord.User,
-    ):
-        """Admin: transfer all BS accounts from one user to another."""
-        try:
-            await self.tags.move_user_id(old.id, new.id)
-        except MainAlreadySaved:
-            await ctx.send(
-                f"{new.mention} already has accounts. "
-                "They must unsave them first with `[p]bs unsave`."
-            )
-            return
-
-        await ctx.send("Transfer complete.")
-        await self.bs_accounts(ctx, user=new)
-
     @bs_group.command(name="accountowners")
     async def bs_account_owners(self, ctx: commands.Context, tag: str):
         """Show which users have this tag saved."""
@@ -388,8 +372,18 @@ class BrawlStarsTools(commands.Cog):
             allowed_mentions=discord.AllowedMentions(users=True, roles=False),
         )
 
-    @bs_group.command(name="addclub")
+    # ========================================================
+    # ADMIN SUBGROUP: !bs admin ...
+    # ========================================================
+
+    @bs_group.group(name="admin")
     @checks.admin_or_permissions(manage_guild=True)
+    async def bs_admin_group(self, ctx: commands.Context):
+        """Admin-only Brawl Stars tools."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help(ctx.command)
+
+    @bs_admin_group.command(name="addclub")
     async def bs_add_club(self, ctx: commands.Context, name: str, tag: str):
         """Add a club to this server's tracked list (admin)."""
         tag_norm = "#" + format_tag(tag)
@@ -397,8 +391,7 @@ class BrawlStarsTools(commands.Cog):
             clubs[name] = tag_norm
         await ctx.send(f"Added **{name}** with tag `{tag_norm}`.")
 
-    @bs_group.command(name="delclub")
-    @checks.admin_or_permissions(manage_guild=True)
+    @bs_admin_group.command(name="delclub")
     async def bs_del_club(self, ctx: commands.Context, name: str):
         """Remove a club from this server's tracked list (admin)."""
         async with self.config.guild(ctx.guild).clubs() as clubs:
@@ -408,13 +401,12 @@ class BrawlStarsTools(commands.Cog):
             tag = clubs.pop(name)
         await ctx.send(f"Removed **{name}** (`{tag}`).")
 
-    @bs_group.command(name="listclubs")
-    @checks.admin_or_permissions(manage_guild=True)
+    @bs_admin_group.command(name="listclubs")
     async def bs_list_clubs(self, ctx: commands.Context):
         """List all tracked clubs for this server (admin)."""
         clubs = await self.config.guild(ctx.guild).clubs()
         if not clubs:
-            await ctx.send("No clubs tracked yet. Use `[p]bs addclub` to add some.")
+            await ctx.send("No clubs tracked yet. Use `[p]bs admin addclub` to add some.")
             return
 
         desc = "\n".join(f"**{name}** → `{tag}`" for name, tag in clubs.items())
@@ -424,3 +416,23 @@ class BrawlStarsTools(commands.Cog):
             color=discord.Color.gold(),
         )
         await ctx.send(embed=embed)
+
+    @bs_admin_group.command(name="account_transfer")
+    async def bs_account_transfer(
+        self,
+        ctx: commands.Context,
+        old: discord.User,
+        new: discord.User,
+    ):
+        """Transfer all BS accounts from one user to another (admin)."""
+        try:
+            await self.tags.move_user_id(old.id, new.id)
+        except MainAlreadySaved:
+            await ctx.send(
+                f"{new.mention} already has accounts. "
+                "They must unsave them first with `[p]bs unsave`."
+            )
+            return
+
+        await ctx.send("Transfer complete.")
+        await self.bs_accounts(ctx, user=new)

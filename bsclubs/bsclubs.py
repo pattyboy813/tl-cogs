@@ -8,7 +8,6 @@ from redbot.core.bot import Red
 
 BASE_URL = "https://api.brawlstars.com/v1"
 
-# Must match bstools' identifier and schema
 BSTOOLS_CONFIG_ID = 0xB5B5B5B5
 
 bstools_config = Config.get_conf(
@@ -48,66 +47,68 @@ class BrawlStarsClubs(commands.Cog):
 
         self.session: Optional[aiohttp.ClientSession] = None
 
-        # Command objects we add/remove on the bs group
-        self._club_cmd_obj: Optional[commands.Command] = None
-        self._clubs_cmd_obj: Optional[commands.Command] = None
+        self._admin_club_cmd: Optional[commands.Command] = None
+        self._admin_clubs_cmd: Optional[commands.Command] = None
 
     async def cog_load(self) -> None:
         self.session = aiohttp.ClientSession()
 
-        # Get the existing bs group (from bstools)
+        # Get bs group and bs admin subgroup created by bstools
         bs_group = self.bot.get_command("bs")
         if not isinstance(bs_group, commands.Group):
             print("[bsclubs] Warning: 'bs' group not found. Load bstools first.")
             return
 
-        # --- define callbacks that discord.py will inspect ---
+        admin_group = bs_group.get_command("admin")
+        if not isinstance(admin_group, commands.Group):
+            print("[bsclubs] Warning: 'bs admin' group not found. Check bstools.")
+            return
 
-        async def club_callback(
+        # Define callbacks with correct signatures
+        async def admin_club_callback(
             ctx: commands.Context,
             target: Optional[Union[discord.Member, discord.User, str]] = None,
         ):
-            await self._club_impl(ctx, target)
+            await self._admin_club_impl(ctx, target)
 
-        async def clubs_callback(ctx: commands.Context):
-            await self._clubs_overview_impl(ctx)
+        async def admin_clubs_callback(ctx: commands.Context):
+            await self._admin_clubs_overview_impl(ctx)
 
-        # Build Command objects from these callbacks
-        self._club_cmd_obj = commands.Command(
-            club_callback,
+        # Wrap them in Command objects
+        self._admin_club_cmd = commands.Command(
+            admin_club_callback,
             name="club",
             help=(
                 "Show the club of a Brawl Stars player.\n\n"
-                "[p]bs club            → your main saved account\n"
-                "[p]bs club @user      → that user's main saved account\n"
-                "[p]bs club #PLAYERTAG → use the raw tag"
+                "[p]bs admin club              → your main saved account\n"
+                "[p]bs admin club @user        → that user's main saved account\n"
+                "[p]bs admin club #PLAYERTAG   → use the raw tag"
             ),
         )
 
-        self._clubs_cmd_obj = commands.Command(
-            clubs_callback,
+        self._admin_clubs_cmd = commands.Command(
+            admin_clubs_callback,
             name="clubs",
-            help="Overview of all tracked clubs in this server (admin only).",
+            help="Overview of all tracked clubs in this server.",
         )
 
-        # Correct way to add permission check
-        self._clubs_cmd_obj.add_check(checks.admin_or_permissions(manage_guild=True))
-
-        # Attach to existing `bs` group
-        bs_group.add_command(self._club_cmd_obj)
-        bs_group.add_command(self._clubs_cmd_obj)
+        # Parent group already has admin check,
+        # so we don't need to add more checks here.
+        admin_group.add_command(self._admin_club_cmd)
+        admin_group.add_command(self._admin_clubs_cmd)
 
     async def cog_unload(self) -> None:
         if self.session and not self.session.closed:
             await self.session.close()
 
-        # Remove our subcommands from bs group if present
         bs_group = self.bot.get_command("bs")
         if isinstance(bs_group, commands.Group):
-            if self._club_cmd_obj:
-                bs_group.remove_command(self._club_cmd_obj.name)
-            if self._clubs_cmd_obj:
-                bs_group.remove_command(self._clubs_cmd_obj.name)
+            admin_group = bs_group.get_command("admin")
+            if isinstance(admin_group, commands.Group):
+                if self._admin_club_cmd:
+                    admin_group.remove_command(self._admin_club_cmd.name)
+                if self._admin_clubs_cmd:
+                    admin_group.remove_command(self._admin_clubs_cmd.name)
 
     # ----------------- API helpers -----------------
 
@@ -153,30 +154,27 @@ class BrawlStarsClubs(commands.Cog):
             return None
         return accounts[0]
 
-    # ----------------- Implementations used by callbacks -----------------
+    # ----------------- Implementations -----------------
 
-    async def _club_impl(
+    async def _admin_club_impl(
         self,
         ctx: commands.Context,
         target: Optional[Union[discord.Member, discord.User, str]] = None,
     ):
         """
-        Logic for `bs club`:
+        Logic for `bs admin club`:
 
-        - [p]bs club            → author's main saved account
-        - [p]bs club @user      → that user's main saved account
-        - [p]bs club #PLAYERTAG → raw tag
+        - [p]bs admin club              → author's main saved account
+        - [p]bs admin club @user        → that user's main saved account
+        - [p]bs admin club #PLAYERTAG   → raw tag
         """
         player_tag: Optional[str] = None
         source_user: Optional[discord.abc.User] = None
 
-        # Case 1: @user mentioned
         if isinstance(target, (discord.Member, discord.User)):
             source_user = target
-        # Case 2: nothing given → author's main account
         elif target is None:
             source_user = ctx.author
-        # Case 3: raw tag string
         else:
             player_tag = target
 
@@ -193,7 +191,6 @@ class BrawlStarsClubs(commands.Cog):
             await ctx.send("No valid player tag found.")
             return
 
-        # Fetch player
         try:
             player_data = await self._get_player(player_tag)
         except RuntimeError as e:
@@ -214,7 +211,6 @@ class BrawlStarsClubs(commands.Cog):
             await ctx.send("Could not determine the player's club tag.")
             return
 
-        # Fetch club details
         try:
             club_data = await self._get_club(club_tag)
         except RuntimeError as e:
@@ -232,14 +228,14 @@ class BrawlStarsClubs(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    async def _clubs_overview_impl(self, ctx: commands.Context):
+    async def _admin_clubs_overview_impl(self, ctx: commands.Context):
         """
-        Logic for `bs clubs` (admin-only).
-        Uses clubs saved in bstools' [p]bs addclub.
+        Logic for `bs admin clubs`.
+        Uses clubs saved via bstools' `bs admin addclub`.
         """
         clubs = await self.config.guild(ctx.guild).clubs()
         if not clubs:
-            await ctx.send("No clubs tracked yet. Use `[p]bs addclub` first.")
+            await ctx.send("No clubs tracked yet. Use `[p]bs admin addclub` first.")
             return
 
         tasks: List[asyncio.Task] = []
@@ -353,16 +349,14 @@ class BrawlStarsClubs(commands.Cog):
         )
         embed.add_field(
             name="Average Required",
-            value=f"{avg(total_required):,.0f}",
-            inline=True,
+            value=f"{avg(total_required):,.0f}", inline=True,
         )
         embed.add_field(
-            name="Average Members", value=f"{avg(total_members):,.1f}", inline=True
+            name="Average Members", value=f"{avg(total_members):,.1f}", inline=True,
         )
 
         embed.add_field(
-            name="Average Vice Presidents",
-            value=f"{avg(total_vps):,.1f}", inline=True
+            name="Average Vice Presidents", value=f"{avg(total_vps):,.1f}", inline=True
         )
         embed.add_field(
             name="Average Seniors", value=f"{avg(total_seniors):,.1f}", inline=True
