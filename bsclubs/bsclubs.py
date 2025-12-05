@@ -8,7 +8,7 @@ from redbot.core.bot import Red
 
 BASE_URL = "https://api.brawlstars.com/v1"
 
-# Must be the SAME ID & schema as bstools
+# Must match bstools' identifier and schema
 BSTOOLS_CONFIG_ID = 0xB5B5B5B5
 
 bstools_config = Config.get_conf(
@@ -24,10 +24,8 @@ default_user = {
     "brawlstars_accounts": [],
 }
 
-# Safe to call again with same defaults
 bstools_config.register_guild(**default_guild)
 bstools_config.register_user(**default_user)
-
 
 _VALID_TAG_CHARS = set("PYLQGRJCUV0289")
 
@@ -50,23 +48,33 @@ class BrawlStarsClubs(commands.Cog):
 
         self.session: Optional[aiohttp.ClientSession] = None
 
-        # Command objects we attach to `bs` group
+        # Command objects we add/remove on the bs group
         self._club_cmd_obj: Optional[commands.Command] = None
         self._clubs_cmd_obj: Optional[commands.Command] = None
 
     async def cog_load(self) -> None:
         self.session = aiohttp.ClientSession()
 
-        # Attach our commands to existing `bs` group from bstools
+        # Get the existing bs group (from bstools)
         bs_group = self.bot.get_command("bs")
         if not isinstance(bs_group, commands.Group):
-            # bstools not loaded or bs group missing
             print("[bsclubs] Warning: 'bs' group not found. Load bstools first.")
             return
 
-        # Build command objects from our methods
+        # --- define callbacks that discord.py will inspect ---
+
+        async def club_callback(
+            ctx: commands.Context,
+            target: Optional[Union[discord.Member, discord.User, str]] = None,
+        ):
+            await self._club_impl(ctx, target)
+
+        async def clubs_callback(ctx: commands.Context):
+            await self._clubs_overview_impl(ctx)
+
+        # Build Command objects from these callbacks
         self._club_cmd_obj = commands.Command(
-            self.club_cmd,
+            club_callback,
             name="club",
             help=(
                 "Show the club of a Brawl Stars player.\n\n"
@@ -77,16 +85,16 @@ class BrawlStarsClubs(commands.Cog):
         )
 
         self._clubs_cmd_obj = commands.Command(
-            self.clubs_overview_cmd,
+            clubs_callback,
             name="clubs",
             help="Overview of all tracked clubs in this server (admin only).",
         )
-
-        # Re-apply admin check to clubs overview
+        # admin-only check
         self._clubs_cmd_obj.add_check(
             checks.admin_or_permissions(manage_guild=True).predicate
         )
 
+        # Attach to existing `bs` group
         bs_group.add_command(self._club_cmd_obj)
         bs_group.add_command(self._clubs_cmd_obj)
 
@@ -94,7 +102,7 @@ class BrawlStarsClubs(commands.Cog):
         if self.session and not self.session.closed:
             await self.session.close()
 
-        # Remove our subcommands from bs group
+        # Remove our subcommands from bs group if present
         bs_group = self.bot.get_command("bs")
         if isinstance(bs_group, commands.Group):
             if self._club_cmd_obj:
@@ -146,29 +154,31 @@ class BrawlStarsClubs(commands.Cog):
             return None
         return accounts[0]
 
-    # ----------------- Command callbacks (attached dynamically) -----------------
+    # ----------------- Implementations used by callbacks -----------------
 
-    async def club_cmd(
+    async def _club_impl(
         self,
         ctx: commands.Context,
         target: Optional[Union[discord.Member, discord.User, str]] = None,
     ):
         """
-        Implementation of `bs club`.
+        Logic for `bs club`:
 
-        - [p]bs club            → uses author's main saved account
-        - [p]bs club @user      → uses that user's main saved account
-        - [p]bs club #PLAYERTAG → uses given tag
+        - [p]bs club            → author's main saved account
+        - [p]bs club @user      → that user's main saved account
+        - [p]bs club #PLAYERTAG → raw tag
         """
         player_tag: Optional[str] = None
         source_user: Optional[discord.abc.User] = None
 
+        # Case 1: @user mentioned
         if isinstance(target, (discord.Member, discord.User)):
             source_user = target
+        # Case 2: nothing given → author's main account
         elif target is None:
             source_user = ctx.author
+        # Case 3: raw tag string
         else:
-            # treat as raw tag string
             player_tag = target
 
         if source_user is not None:
@@ -184,6 +194,7 @@ class BrawlStarsClubs(commands.Cog):
             await ctx.send("No valid player tag found.")
             return
 
+        # Fetch player
         try:
             player_data = await self._get_player(player_tag)
         except RuntimeError as e:
@@ -200,10 +211,11 @@ class BrawlStarsClubs(commands.Cog):
             return
 
         club_tag = club_info.get("tag")
-        if not club_tag:
+        if not club_tag or not verify_tag(format_tag(club_tag)):
             await ctx.send("Could not determine the player's club tag.")
             return
 
+        # Fetch club details
         try:
             club_data = await self._get_club(club_tag)
         except RuntimeError as e:
@@ -221,11 +233,10 @@ class BrawlStarsClubs(commands.Cog):
         )
         await ctx.send(embed=embed)
 
-    @checks.admin_or_permissions(manage_guild=True)
-    async def clubs_overview_cmd(self, ctx: commands.Context):
+    async def _clubs_overview_impl(self, ctx: commands.Context):
         """
-        Implementation of `bs clubs` (admin only).
-        Overview of all tracked clubs using saved club tags.
+        Logic for `bs clubs` (admin-only).
+        Uses clubs saved in bstools' [p]bs addclub.
         """
         clubs = await self.config.guild(ctx.guild).clubs()
         if not clubs:
@@ -295,14 +306,10 @@ class BrawlStarsClubs(commands.Cog):
             inline=True,
         )
         embed.add_field(
-            name="Vice Presidents",
-            value=str(len(vps)),
-            inline=True,
+            name="Vice Presidents", value=str(len(vps)), inline=True
         )
         embed.add_field(
-            name="Seniors",
-            value=str(len(seniors)),
-            inline=True,
+            name="Seniors", value=str(len(seniors)), inline=True
         )
 
         embed.set_footer(text="Data from Supercell Brawl Stars API")
@@ -351,8 +358,7 @@ class BrawlStarsClubs(commands.Cog):
             inline=True,
         )
         embed.add_field(
-            name="Average Members",
-            value=f"{avg(total_members):,.1f}", inline=True
+            name="Average Members", value=f"{avg(total_members):,.1f}", inline=True
         )
 
         embed.add_field(
@@ -360,8 +366,7 @@ class BrawlStarsClubs(commands.Cog):
             value=f"{avg(total_vps):,.1f}", inline=True
         )
         embed.add_field(
-            name="Average Seniors",
-            value=f"{avg(total_seniors):,.1f}", inline=True
+            name="Average Seniors", value=f"{avg(total_seniors):,.1f}", inline=True
         )
 
         embed.set_footer(text="Data from Supercell Brawl Stars API")
