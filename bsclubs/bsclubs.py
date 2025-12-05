@@ -89,10 +89,9 @@ class BrawlStarsClubs(commands.Cog):
             name="clubs",
             help="Overview of all tracked clubs in this server (admin only).",
         )
-        # admin-only check
-        self._clubs_cmd_obj.add_check(
-            checks.admin_or_permissions(manage_guild=True).predicate
-        )
+
+        # Correct way to add permission check
+        self._clubs_cmd_obj.add_check(checks.admin_or_permissions(manage_guild=True))
 
         # Attach to existing `bs` group
         bs_group.add_command(self._club_cmd_obj)
