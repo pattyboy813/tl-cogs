@@ -158,6 +158,10 @@ class TagStore:
 
 
 class BrawlStarsTools(commands.Cog):
+    """Brawl Stars tools: player tags + club storage."""
+
+    __author__ = "Pat+ChatGPT"
+    __version__ = "1.1.0"
 
     def __init__(self, bot: Red):
         self.bot = bot

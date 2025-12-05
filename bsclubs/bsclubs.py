@@ -41,6 +41,15 @@ def verify_tag(tag: str) -> bool:
 
 
 class BrawlStarsClubs(commands.Cog):
+    """
+    Brawl Stars club views.
+
+    - bs club          (user command)
+    - bs admin clubs   (admin-only overview)
+    """
+
+    __author__ = "Pat+ChatGPT"
+    __version__ = "1.0.3"
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -98,7 +107,7 @@ class BrawlStarsClubs(commands.Cog):
             help="Overview of all tracked clubs in this server.",
         )
 
-        # parent `bs admin` group is already admin-only, so no extra checks here
+        # parent `bs admin` group is already admin-only
         admin_group.add_command(self._admin_clubs_cmd)
 
     async def cog_unload(self) -> None:
@@ -107,14 +116,12 @@ class BrawlStarsClubs(commands.Cog):
 
         bs_group = self.bot.get_command("bs")
         if isinstance(bs_group, commands.Group):
-            # remove bs club
             if self._club_cmd:
                 try:
                     bs_group.remove_command(self._club_cmd.name)
                 except Exception:
                     pass
 
-            # remove bs admin clubs
             admin_group = bs_group.get_command("admin")
             if isinstance(admin_group, commands.Group) and self._admin_clubs_cmd:
                 try:
@@ -353,7 +360,7 @@ class BrawlStarsClubs(commands.Cog):
             name="Total Trophies", value=f"{total_trophies:,}", inline=True
         )
         embed.add_field(
-            name="Total Members", value=str(total_members), inline=True
+            name="Total Members", value=f"{total_members:,}", inline=True
         )
 
         embed.add_field(
