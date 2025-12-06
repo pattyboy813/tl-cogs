@@ -3,9 +3,7 @@ from typing import List, Optional, Union, Dict, Tuple
 
 import aiohttp
 import discord
-from discord import Colour
-from discord.ext import commands as dpy_commands  # not used but fine if you prefer
-from redbot.core import commands, checks, Config
+from redbot.core import commands, checks, Config, tasks
 from redbot.core.bot import Red
 
 BASE_URL = "https://api.brawlstars.com/v1"
@@ -25,6 +23,9 @@ bstools_config = Config.get_conf(
 default_guild = {
     # clubs: mapping of club_tag -> {"tag": "#TAG", "name": "Club Name"}
     "clubs": {},
+    # auto-updating overview
+    "overview_channel": None,   # int or None
+    "overview_message": None,   # int or None
 }
 
 default_user = {
@@ -227,9 +228,8 @@ class BrawlStarsAPI:
         return await self.request(f"/players/%23{tag}")
 
     async def get_club(self, tag: str) -> Optional[Dict]:
-        tag = format_tag(tag)
-        # Allow tag with or without leading #
-        clean_tag = tag.strip("#")
+        # Tag might be with or without '#'
+        clean_tag = format_tag(tag)
         return await self.request(f"/clubs/%23{clean_tag}")
 
 
@@ -249,14 +249,18 @@ class BrawlStarsTools(commands.Cog):
         self.tags = TagStore(bstools_config)
         self._ready = False
 
+        # Start background loop
+        self.overview_update_loop.start()
+
     async def cog_load(self):
         """Ensure the API client is ready."""
         await self.api.start()
         self._ready = True
 
-    async def cog_unload(self):
-        """Cleanup HTTP session."""
-        await self.api.close()
+    def cog_unload(self):
+        """Cancel tasks and close API session."""
+        self.overview_update_loop.cancel()
+        asyncio.create_task(self.api.close())
 
     # -------------------------
     #     API wrappers
@@ -644,7 +648,7 @@ class BrawlStarsTools(commands.Cog):
             await ctx.send("No clubs tracked yet. Use `bs admin addclub #TAG` first.")
             return
 
-        tasks: List[asyncio.Task] = []
+        tasks_list: List[asyncio.Task] = []
         club_meta: List[Tuple[str, str]] = []  # (name, tag)
 
         for club in clubs.values():
@@ -653,14 +657,14 @@ class BrawlStarsTools(commands.Cog):
             if not tag:
                 continue
             club_meta.append((name, tag))
-            tasks.append(asyncio.create_task(self._get_club(tag)))
+            tasks_list.append(asyncio.create_task(self._get_club(tag)))
 
-        if not tasks:
+        if not tasks_list:
             await ctx.send("No valid club entries found.")
             return
 
         try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks_list, return_exceptions=True)
         except RuntimeError as e:
             await ctx.send(str(e))
             return
@@ -680,6 +684,90 @@ class BrawlStarsTools(commands.Cog):
 
         await ctx.send(embed=overview_embed)
         await ctx.send(embed=detail_embed)
+
+    @bs_admin_group.command(name="setoverviewchannel")
+    async def bs_set_overview_channel(
+        self, ctx: commands.Context, channel: discord.TextChannel
+    ):
+        """
+        Set the channel where the automatic overview message will update every 10 minutes.
+        """
+        await bstools_config.guild(ctx.guild).overview_channel.set(channel.id)
+        await bstools_config.guild(ctx.guild).overview_message.set(None)
+        await ctx.send(f"📡 Overview updates will now be posted in {channel.mention}.")
+
+    # ========================================================
+    #                   BACKGROUND TASK
+    # ========================================================
+
+    @tasks.loop(minutes=10)
+    async def overview_update_loop(self):
+        """
+        Automatically updates the family overview embed in each guild every 10 minutes.
+        """
+        await self.bot.wait_until_red_ready()
+
+        for guild in self.bot.guilds:
+            conf = bstools_config.guild(guild)
+
+            channel_id = await conf.overview_channel()
+            if not channel_id:
+                continue  # no overview channel set
+
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                continue
+
+            clubs = await conf.clubs()
+            if not clubs:
+                continue
+
+            # Collect club meta and tasks
+            club_meta: List[Tuple[str, str]] = []
+            tasks_list: List[asyncio.Task] = []
+            for club in clubs.values():
+                tag = club.get("tag")
+                name = club.get("name", "Unknown Club")
+                if not tag:
+                    continue
+                club_meta.append((name, tag))
+                tasks_list.append(asyncio.create_task(self._get_club(tag)))
+
+            if not tasks_list:
+                continue
+
+            results = await asyncio.gather(*tasks_list, return_exceptions=True)
+
+            collected: List[Tuple[str, str, Dict]] = []
+            for (name, tag), result in zip(club_meta, results):
+                if isinstance(result, Exception) or not result:
+                    continue
+                collected.append((name, tag, result))
+
+            if not collected:
+                continue
+
+            overview_embed = self._build_overview_embed(collected)
+
+            msg_id = await conf.overview_message()
+            message: Optional[discord.Message] = None
+
+            if msg_id:
+                try:
+                    message = await channel.fetch_message(msg_id)
+                except discord.NotFound:
+                    message = None
+
+            if message:
+                await message.edit(embed=overview_embed)
+            else:
+                new_msg = await channel.send(embed=overview_embed)
+                await conf.overview_message.set(new_msg.id)
+
+    @overview_update_loop.error
+    async def overview_update_loop_error(self, error):
+        # basic logging; you can make this fancier (log to channel, etc.)
+        print(f"[BrawlStarsTools] overview_update_loop error: {error}")
 
     # ========================================================
     #                   EMBED BUILDERS
@@ -1036,49 +1124,89 @@ class BrawlStarsTools(commands.Cog):
         return embed
 
     # -----------------------------
-    # Overview embed (admin, ENRICHED)
+    # Overview embed (Threat Level style)
     # -----------------------------
     def _build_overview_embed(self, club_data: List[Tuple[str, str, Dict]]):
-        total = len(club_data)
+        # Basic aggregates
+        total_clubs = len(club_data)
         total_trophies = sum(d.get("trophies", 0) for _, _, d in club_data)
-        total_members = sum(len(d.get("members", [])) for _, _, d in club_data)
 
-        avg_trophies = total_trophies / total if total else 0
-        avg_members = total_members / total if total else 0
+        total_members = 0
+        total_capacity = 0
+        total_required = 0
 
-        best_club = max(club_data, key=lambda x: x[2].get("trophies", 0)) if club_data else None
-        worst_club = min(club_data, key=lambda x: x[2].get("trophies", 0)) if club_data else None
+        total_vp = 0
+        total_senior = 0
+        total_online = 0  # may remain 0 if API has no online info
+
+        for _, _, data in club_data:
+            members = data.get("members", []) or []
+            max_members = data.get("maxMembers", 30)
+            req = data.get("requiredTrophies", 0)
+
+            total_members += len(members)
+            total_capacity += max_members
+            total_required += req
+
+            for m in members:
+                role = m.get("role")
+                if role == "vicePresident":
+                    total_vp += 1
+                elif role == "senior":
+                    total_senior += 1
+
+                if m.get("isOnline"):
+                    total_online += 1
+
+        if total_clubs > 0:
+            avg_trophies = total_trophies / total_clubs
+            avg_required = total_required / total_clubs
+            avg_members = total_members / total_clubs
+            avg_vp = total_vp / total_clubs
+            avg_senior = total_senior / total_clubs
+            avg_online = total_online / total_clubs
+        else:
+            avg_trophies = avg_required = avg_members = avg_vp = avg_senior = avg_online = 0
 
         embed = discord.Embed(
-            title="📊 Family Overview",
-            color=discord.Color.purple(),
+            title="Overview from Threat Level | Overview",
+            color=discord.Color.from_rgb(52, 152, 219),
         )
 
-        embed.add_field(name="Clubs Tracked", value=f"**{total}**", inline=True)
-        embed.add_field(name="Total Members", value=f"**{total_members}**", inline=True)
-        embed.add_field(name="Total Trophies", value=f"**{total_trophies:,}**", inline=True)
+        # First row: totals
+        embed.add_field(name="🏰 Total Clubs", value=f"**{total_clubs}**", inline=True)
+        embed.add_field(
+            name="🏆 Total Trophies", value=f"**{total_trophies:,}**", inline=True
+        )
+        embed.add_field(
+            name="🧑‍🤝‍🧑 Members",
+            value=f"**{total_members}**/{total_capacity}",
+            inline=True,
+        )
 
-        embed.add_field(name="Avg Trophies/Club", value=f"{avg_trophies:,.0f}", inline=True)
-        embed.add_field(name="Avg Members", value=f"{avg_members:.1f}", inline=True)
-        embed.add_field(name="\u200b", value="\u200b", inline=True)
+        # Second row: averages
+        embed.add_field(
+            name="📊 Average Trophies", value=f"{avg_trophies:,.0f}", inline=True
+        )
+        embed.add_field(
+            name="📥 Average Required", value=f"{avg_required:,.0f}", inline=True
+        )
+        embed.add_field(
+            name="🦺 Average Vice-Presidents", value=f"{avg_vp:.1f}", inline=True
+        )
 
-        if best_club:
-            b_name, b_tag, b_data = best_club
-            embed.add_field(
-                name="🥇 Top Club",
-                value=f"**{b_name}** (`{b_tag}`)\n🏆 {b_data.get('trophies', 0):,}",
-                inline=False,
-            )
+        # Third row: more averages
+        embed.add_field(
+            name="🎖️ Average Seniors", value=f"{avg_senior:.1f}", inline=True
+        )
+        embed.add_field(
+            name="🟢 Average Online", value=f"{avg_online:.1f}", inline=True
+        )
+        embed.add_field(
+            name="👥 Average Members", value=f"{avg_members:.1f}", inline=True
+        )
 
-        if worst_club and worst_club != best_club:
-            w_name, w_tag, w_data = worst_club
-            embed.add_field(
-                name="⬇️ Lowest Trophies",
-                value=f"**{w_name}** (`{w_tag}`)\n🏆 {w_data.get('trophies', 0):,}",
-                inline=False,
-            )
-
-        embed.set_footer(text="Live data from Brawl Stars API")
+        embed.set_footer(text="Updating every 10 minutes • Live data from Brawl Stars API")
         return embed
 
     # -----------------------------
@@ -1104,7 +1232,7 @@ class BrawlStarsTools(commands.Cog):
 
             stats = (
                 f"`{tag}`\n"
-                f"🏆 **{trophies:,}** | 🚪 {req:,}\n"
+                f"🏆 **{trophies:,}** | 📥 Req: {req:,}\n"
                 f"👥 **{member_count}/{max_m}** Members\n"
                 f"📊 Avg/Member: **{avg_member_trophies:,.0f}**"
             )
@@ -1115,3 +1243,8 @@ class BrawlStarsTools(commands.Cog):
             embed.description = "No data available."
 
         return embed
+
+
+# Red 3.5+ async setup
+async def setup(bot: Red):
+    await bot.add_cog(BrawlStarsTools(bot))
