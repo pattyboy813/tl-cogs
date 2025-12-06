@@ -1,5 +1,3 @@
-# bsemoji/bsemoji.py
-
 import asyncio
 import io
 import re
@@ -16,7 +14,7 @@ EMOJI_BASE = "https://cdn.brawlify.com/brawlers/emoji"  # {id}.png
 
 class BSEmoji(commands.Cog):
     """
-    Import Brawl Stars brawler emojis from Brawlify's CDN.
+    Import & export Brawl Stars brawler emojis from Brawlify CDN.
     """
 
     def __init__(self, bot: Red):
@@ -32,26 +30,23 @@ class BSEmoji(commands.Cog):
             await self.session.close()
             self.session = None
 
-    # --------------------------
+    # ---------------------------------------------------------
     # Internal helpers
-    # --------------------------
+    # ---------------------------------------------------------
 
     async def _get_brawlers(self) -> List[Dict[str, Any]]:
-        """
-        Fetch the list of brawlers from BrawlAPI.
-        We don't know the exact top-level key, so we handle a few cases.
-        """
+        """Get brawler list from BrawlAPI."""
         if self.session is None:
             self.session = aiohttp.ClientSession()
 
         async with self.session.get(BRAWLERS_API) as resp:
             if resp.status != 200:
-                text = await resp.text()
-                raise RuntimeError(f"BrawlAPI error {resp.status}: {text}")
-
+                raise RuntimeError(
+                    f"Failed to fetch brawlers: HTTP {resp.status}"
+                )
             data = await resp.json()
 
-        # Try common shapes: {"list": [...]}, {"brawlers":[...]}, or just [...]
+        # Handle possible shapes
         if isinstance(data, list):
             return data
 
@@ -59,27 +54,23 @@ class BSEmoji(commands.Cog):
             if key in data and isinstance(data[key], list):
                 return data[key]
 
-        # Fallback to "all values flattened" if necessary
-        if isinstance(data, dict):
-            for v in data.values():
-                if isinstance(v, list) and v and isinstance(v[0], dict):
-                    return v
+        # Last ditch attempt
+        for val in data.values():
+            if isinstance(val, list):
+                return val
 
-        raise RuntimeError("Unexpected brawler JSON structure from BrawlAPI")
+        raise RuntimeError("Unknown BrawlAPI JSON layout.")
 
     @staticmethod
     def _emoji_name_from_brawler(name: str) -> str:
         """
-        Turn 'El Primo' -> 'elprimo', 'Mr. P' -> 'mrp' etc.
-        Discord emoji rules: 2-32 chars, a-z 0-9 underscore.
+        Turn brawler names into valid Discord emoji names:
+        “El Primo” -> “elprimo”
+        “Mr. P” -> “mrp”
         """
-        # lower, remove spaces / hyphens / dots
         raw = name.lower().replace(" ", "").replace("-", "").replace(".", "")
-        # keep only allowed chars
-        allowed = re.sub(r"[^a-z0-9_]", "", raw)
-        if not allowed:
-            allowed = "brawler"
-        return allowed[:32]
+        cleaned = re.sub(r"[^a-z0-9_]", "", raw)
+        return cleaned[:32] or "brawler"
 
     async def _download_image(self, url: str) -> bytes:
         if self.session is None:
@@ -87,24 +78,22 @@ class BSEmoji(commands.Cog):
 
         async with self.session.get(url) as resp:
             if resp.status != 200:
-                raise RuntimeError(f"Emoji fetch failed {resp.status} for {url}")
+                raise RuntimeError(f"Failed to download {url}")
             return await resp.read()
 
-    # --------------------------
+    # ---------------------------------------------------------
     # Command group
-    # --------------------------
+    # ---------------------------------------------------------
 
     @commands.group(name="bsemoji")
     async def bsemoji_group(self, ctx: commands.Context):
-        """
-        Brawl Stars emoji importer.
-        """
+        """Brawl Stars emoji importer."""
         if ctx.invoked_subcommand is None:
             await ctx.send_help()
 
-    # --------------------------
-    # Import command
-    # --------------------------
+    # ---------------------------------------------------------
+    # IMPORT COMMAND
+    # ---------------------------------------------------------
 
     @bsemoji_group.command(name="import")
     @checks.admin_or_permissions(manage_guild=True)
@@ -115,125 +104,150 @@ class BSEmoji(commands.Cog):
         overwrite: bool = False,
     ):
         """
-        Import brawler emojis from Brawlify CDN into this server.
+        Import Brawl Stars emojis into your server.
 
         Usage:
           [p]bsemoji import
           [p]bsemoji import 30
-          [p]bsemoji import 0 true   (0 = no limit, true = overwrite)
-
-        - `limit`  : How many brawlers to import (0 = all).
-        - `overwrite` : If true, replace existing emojis with the same name.
+          [p]bsemoji import 0 true
         """
-        guild: discord.Guild = ctx.guild
+        guild = ctx.guild
+
         if guild is None:
-            await ctx.send("This command can only be used in a server.")
+            await ctx.send("Must be used inside a server.")
             return
 
-        perms = guild.me.guild_permissions
-        if not perms.manage_emojis_and_stickers:
+        if not guild.me.guild_permissions.manage_emojis_and_stickers:
             await ctx.send(
-                "I need the **Manage Emojis and Stickers** permission "
-                "to upload emojis here."
+                "I need **Manage Emojis and Stickers** permission."
             )
             return
 
         try:
             brawlers = await self._get_brawlers()
         except Exception as e:
-            await ctx.send(f"Failed to fetch brawlers: `{e}`")
+            await ctx.send(f"Error fetching brawlers:\n`{e}`")
             return
 
         if limit > 0:
             brawlers = brawlers[:limit]
 
-        # Map existing emoji names for quick lookup
-        existing_by_name = {e.name: e for e in guild.emojis}
-
-        # Quick capacity check
-        max_emojis = guild.emoji_limit  # static emoji cap
-        current_count = len(guild.emojis)
-        available_slots = max_emojis - current_count
-        total_to_process = len(brawlers)
-
-        if available_slots <= 0 and not overwrite:
-            await ctx.send("This server has no emoji slots left.")
-            return
+        existing = {e.name: e for e in guild.emojis}
+        max_emojis = guild.emoji_limit
+        current = len(guild.emojis)
 
         msg = await ctx.send(
-            f"Starting import of **{total_to_process}** brawlers...\n"
-            f"Current emojis: {current_count}/{max_emojis}"
+            f"📥 Importing **{len(brawlers)}** brawlers...\n"
+            f"Emoji slots: {current}/{max_emojis}"
         )
 
-        created = 0
-        replaced = 0
-        skipped = 0
-        failed = 0
+        created = replaced = skipped = failed = 0
 
-        for idx, b in enumerate(brawlers, start=1):
-            # BrawlAPI should have id + name
-            b_id = b.get("id")
-            b_name = b.get("name") or f"id{b_id}"
+        for entry in brawlers:
+            b_id = entry.get("id")
+            b_name = entry.get("name", f"id{b_id}")
 
             if b_id is None:
                 skipped += 1
                 continue
 
             emoji_name = self._emoji_name_from_brawler(b_name)
+            existing_emoji = existing.get(emoji_name)
 
-            # Capacity guard if not overwriting
+            # If full & not overwriting, skip
             if not overwrite and len(guild.emojis) >= max_emojis:
                 skipped += 1
                 continue
 
-            # If emoji already exists
-            existing = existing_by_name.get(emoji_name)
-            if existing and not overwrite:
+            # If exists & not overwriting
+            if existing_emoji and not overwrite:
                 skipped += 1
                 continue
 
+            # Download emoji
             url = f"{EMOJI_BASE}/{b_id}.png"
-
             try:
-                image_bytes = await self._download_image(url)
+                data = await self._download_image(url)
             except Exception:
                 failed += 1
                 continue
 
-            try:
-                if existing and overwrite:
-                    # delete and recreate
-                    try:
-                        await existing.delete(reason="BSEmoji overwrite")
-                    except discord.HTTPException:
-                        pass  # ignore if we can't delete
+            # If overwriting existing emoji
+            if existing_emoji and overwrite:
+                try:
+                    await existing_emoji.delete(reason="Overwritten by bsemoji")
+                except discord.HTTPException:
+                    pass  # ignore failures
 
+                try:
                     new_emoji = await guild.create_custom_emoji(
-                        name=emoji_name, image=image_bytes
+                        name=emoji_name, image=data
                     )
-                    existing_by_name[emoji_name] = new_emoji
+                    existing[emoji_name] = new_emoji
                     replaced += 1
-                else:
-                    new_emoji = await guild.create_custom_emoji(
-                        name=emoji_name, image=image_bytes
-                    )
-                    existing_by_name[emoji_name] = new_emoji
-                    created += 1
-
-            except discord.HTTPException:
-                failed += 1
+                except discord.HTTPException:
+                    failed += 1
+                await asyncio.sleep(0.3)
                 continue
 
-            # Gentle rate limit safety buffer
-            await asyncio.sleep(0.3)
+            # Otherwise create new emoji
+            try:
+                new_emoji = await guild.create_custom_emoji(
+                    name=emoji_name, image=data
+                )
+                existing[emoji_name] = new_emoji
+                created += 1
+            except discord.HTTPException:
+                failed += 1
+
+            await asyncio.sleep(0.3)  # rate limit safety
 
         final = (
-            f"✅ **Import finished.**\n"
+            "✅ **Emoji Import Complete**\n"
             f"Created: **{created}**\n"
             f"Replaced: **{replaced}**\n"
             f"Skipped: **{skipped}**\n"
             f"Failed: **{failed}**\n"
-            f"Now at: **{len(guild.emojis)}/{guild.emoji_limit}** emojis"
+            f"Final Count: **{len(guild.emojis)}/{guild.emoji_limit}**"
         )
 
         await msg.edit(content=final)
+
+    # ---------------------------------------------------------
+    # EXPORT COMMAND
+    # ---------------------------------------------------------
+
+    @bsemoji_group.command(name="export")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def bsemoji_export(self, ctx: commands.Context, prefix: str = ""):
+        """
+        Export emojis in the form <:name:id>.
+        
+        Examples:
+          [p]bsemoji export
+          [p]bsemoji export b_    (filter by prefix)
+        """
+        guild = ctx.guild
+        if guild is None:
+            await ctx.send("Must be used in a server.")
+            return
+
+        emojis = guild.emojis
+        if prefix:
+            emojis = [e for e in emojis if e.name.startswith(prefix)]
+
+        if not emojis:
+            await ctx.send("No emojis matched that filter.")
+            return
+
+        # Build lines like <:darryl:1234567890>
+        lines = [f"<:{e.name}:{e.id}>" for e in emojis]
+        text = "\n".join(lines)
+
+        # Fit message or send as file
+        if len(text) < 1900:
+            await ctx.send(f"**Emoji Export:**\n{text}")
+        else:
+            fp = io.StringIO(text)
+            file = discord.File(fp, filename="emojis.txt")
+            await ctx.send("Emoji list attached:", file=file)
