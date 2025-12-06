@@ -3,7 +3,8 @@ from typing import List, Optional, Union, Dict, Tuple
 
 import aiohttp
 import discord
-from redbot.core import commands, checks, Config, tasks
+from discord.ext import tasks
+from redbot.core import commands, checks, Config
 from redbot.core.bot import Red
 
 BASE_URL = "https://api.brawlstars.com/v1"
