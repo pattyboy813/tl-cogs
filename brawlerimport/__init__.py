@@ -1,5 +1,5 @@
 from redbot.core.bot import Red
-from .bsemoji import BSEmoji
+from .brawlerimport import BSEmoji
 
 
 async def setup(bot: Red):
