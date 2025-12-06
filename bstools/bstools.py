@@ -7,6 +7,9 @@ from redbot.core import commands, checks, Config
 from redbot.core.bot import Red
 
 BASE_URL = "https://api.brawlstars.com/v1"
+# CDN for Icons and Badges (Brawlify mirrors official assets)
+CDN_ICON_URL = "https://cdn.brawlify.com/profile-icons/regular/{}.png"
+CDN_BADGE_URL = "https://cdn.brawlify.com/club-badges/regular/{}.png"
 
 # Shared config identifier
 BSTOOLS_CONFIG_ID = 0xB5B5B5B5
@@ -30,6 +33,21 @@ default_user = {
 bstools_config.register_guild(**default_guild)
 bstools_config.register_user(**default_user)
 
+# ----------------- Custom Emoji Mapping -----------------
+# Add your server's custom emote IDs here.
+# Keys should be lowercase brawler names.
+BRAWLER_EMOJIS = {
+    "cordelius": "<:cordelius:1446711250829705369>",
+    "hank": "<:hank:1446711254269034707>",
+    # Add others here, e.g.:
+    # "shelly": "<:shelly:123456789>",
+    # "colt": "<:colt:123456789>",
+}
+
+def get_brawler_emoji(name: str) -> str:
+    """Returns the custom emoji if found, otherwise returns a generic shield."""
+    clean_name = name.lower().replace(" ", "").replace(".", "")
+    return BRAWLER_EMOJIS.get(clean_name, "🛡️")
 
 # ----------------- Exceptions / helpers -----------------
 
@@ -140,6 +158,7 @@ class TagStore:
 
         await self._set_accounts(new_user_id, old_accounts)
         await self._set_accounts(old_user_id, [])
+
 # ============================================================
 #                 BRAWL STARS API HANDLING
 # ============================================================
@@ -295,6 +314,7 @@ class BrawlStarsTools(commands.Cog):
             return
 
         name = player.get("name", "Unknown Player")
+        icon_id = player.get("icon", {}).get("id")
 
         try:
             idx = await self.tags.save_tag(ctx.author.id, clean)
@@ -309,8 +329,7 @@ class BrawlStarsTools(commands.Cog):
             await ctx.send("Invalid tag.")
             return
 
-        # Embed handled in Part 6
-        embed = self._build_save_embed(ctx.author, name, clean, idx)
+        embed = self._build_save_embed(ctx.author, name, clean, idx, icon_id)
         await ctx.send(embed=embed)
 
     # --------------------------------------------------------
@@ -324,7 +343,6 @@ class BrawlStarsTools(commands.Cog):
         user = user or ctx.author
         tags = await self.tags.get_all_tags(user.id)
 
-        # Embed handled in Part 6
         embed = await self._build_accounts_embed(user, tags)
         await ctx.send(embed=embed)
 
@@ -342,7 +360,7 @@ class BrawlStarsTools(commands.Cog):
             await ctx.send("Invalid account positions.")
             return
 
-        await ctx.send("Accounts reordered.")
+        await ctx.send("✅ **Success:** Accounts reordered.")
         tags = await self.tags.get_all_tags(ctx.author.id)
         embed = await self._build_accounts_embed(ctx.author, tags)
         await ctx.send(embed=embed)
@@ -361,7 +379,7 @@ class BrawlStarsTools(commands.Cog):
             await ctx.send("Invalid account number.")
             return
 
-        await ctx.send("Account removed.")
+        await ctx.send("✅ **Success:** Account removed.")
         tags = await self.tags.get_all_tags(ctx.author.id)
         embed = await self._build_accounts_embed(ctx.author, tags)
         await ctx.send(embed=embed)
@@ -382,21 +400,21 @@ class BrawlStarsTools(commands.Cog):
             clean = format_tag(target)
             if verify_tag(clean):
                 return clean
-            await ctx.send("Invalid tag.")
+            await ctx.send("Invalid tag format.")
             return None
 
         # Case 2: @user
         if isinstance(target, (discord.Member, discord.User)):
             tags = await self.tags.get_all_tags(target.id)
             if not tags:
-                await ctx.send("That user has no saved accounts.")
+                await ctx.send(f"⚠️ {target.display_name} has no saved accounts.")
                 return None
             return tags[0]  # main
 
         # Case 3: author
         tags = await self.tags.get_all_tags(ctx.author.id)
         if not tags:
-            await ctx.send("You have no saved accounts. Use `[p]bs save #TAG`.")
+            await ctx.send(f"⚠️ You have no saved accounts. Use `bs save #TAG`.")
             return None
         return tags[0]
 
@@ -411,11 +429,6 @@ class BrawlStarsTools(commands.Cog):
     ):
         """
         Show detailed stats for a Brawl Stars player.
-
-        Accepts:
-        - [p]bs player
-        - [p]bs player @user
-        - [p]bs player #TAG
         """
         tag = await self._resolve_player_tag(ctx, target)
         if not tag:
@@ -444,10 +457,7 @@ class BrawlStarsTools(commands.Cog):
         target: Optional[Union[discord.Member, discord.User, str]] = None,
     ):
         """
-        Show the club of a player by:
-        - Saved main account
-        - @user's main account
-        - #TAG
+        Show the club of a player.
         """
         tag = await self._resolve_player_tag(ctx, target)
         if not tag:
@@ -465,7 +475,7 @@ class BrawlStarsTools(commands.Cog):
 
         club = player.get("club")
         if not club:
-            await ctx.send("This player is not in a club.")
+            await ctx.send(f"**{player.get('name')}** is not in a club.")
             return
 
         club_tag = club.get("tag")
@@ -477,7 +487,7 @@ class BrawlStarsTools(commands.Cog):
             return
 
         if not data:
-            await ctx.send("Club not found.")
+            await ctx.send("Club data not found.")
             return
 
         embed = self._build_club_embed(data)
@@ -520,9 +530,6 @@ class BrawlStarsTools(commands.Cog):
     async def bs_add_club(self, ctx: commands.Context, tag: str):
         """
         Add a club to this server's tracked list (by tag only).
-
-        Usage:
-          [p]bs admin addclub #TAG
         """
         clean = format_tag(tag)
         if not verify_tag(clean):
@@ -543,6 +550,7 @@ class BrawlStarsTools(commands.Cog):
             return
 
         club_name = data.get("name", "Unknown Club")
+        badge_id = data.get("badgeId")
 
         async with bstools_config.guild(ctx.guild).clubs() as clubs:
             clubs[club_tag] = {
@@ -550,16 +558,13 @@ class BrawlStarsTools(commands.Cog):
                 "name": club_name,
             }
 
-        embed = self._build_addclub_embed(club_name, club_tag)
+        embed = self._build_addclub_embed(club_name, club_tag, badge_id)
         await ctx.send(embed=embed)
 
     @bs_admin_group.command(name="delclub")
     async def bs_del_club(self, ctx: commands.Context, tag: str):
         """
         Remove a tracked club by tag.
-
-        Usage:
-          [p]bs admin delclub #TAG
         """
         clean = format_tag(tag)
         club_tag = f"#{clean}"
@@ -587,11 +592,10 @@ class BrawlStarsTools(commands.Cog):
     async def bs_refresh_clubs(self, ctx: commands.Context):
         """
         Refresh saved club names from the API.
-        Tags remain the same; only names are updated.
         """
         clubs = await bstools_config.guild(ctx.guild).clubs()
         if not clubs:
-            await ctx.send("No clubs tracked yet. Use `[p]bs admin addclub #TAG` first.")
+            await ctx.send("No clubs tracked yet. Use `bs admin addclub #TAG` first.")
             return
 
         updated = 0
@@ -629,7 +633,7 @@ class BrawlStarsTools(commands.Cog):
         """
         clubs = await bstools_config.guild(ctx.guild).clubs()
         if not clubs:
-            await ctx.send("No clubs tracked yet. Use `[p]bs admin addclub #TAG` first.")
+            await ctx.send("No clubs tracked yet. Use `bs admin addclub #TAG` first.")
             return
 
         tasks: List[asyncio.Task] = []
@@ -670,51 +674,64 @@ class BrawlStarsTools(commands.Cog):
         await ctx.send(embed=detail_embed)
 
     # ========================================================
-    #                   EMBED BUILDERS
+    #                   EMBED BUILDERS (UPDATED)
     # ========================================================
 
     # -----------------------------
     # Save tag embed
     # -----------------------------
-    def _build_save_embed(self, user: discord.User, name: str, tag: str, idx: int):
+    def _build_save_embed(self, user: discord.User, name: str, tag: str, idx: int, icon_id: int):
+        # Green / success color
         embed = discord.Embed(
-            title="✨ Brawl Stars Account Linked",
-            description=f"Saved as **Account #{idx}**\n\n**{name}** (`#{format_tag(tag)}`)",
-            color=discord.Color.from_rgb(0, 200, 140)
+            description=f"✅ **Account Saved Successfully!**\n\nLinked **{name}** (`#{format_tag(tag)}`) to your Discord account.",
+            color=discord.Color.from_rgb(0, 209, 102) 
         )
-        embed.set_thumbnail(url=user.display_avatar.url)
-        embed.set_footer(text="Use bs accounts to view your saved accounts.")
+        embed.set_author(name=f"{user.display_name}", icon_url=user.display_avatar.url)
+        embed.set_footer(text=f"Saved to slot #{idx} • Use 'bs accounts' to view")
+        
+        if icon_id:
+            embed.set_thumbnail(url=CDN_ICON_URL.format(icon_id))
+            
         return embed
 
     # -----------------------------
     # Accounts list embed
     # -----------------------------
     async def _build_accounts_embed(self, user: discord.Member, tags: List[str]):
+        # Clean Blue
         embed = discord.Embed(
-            title=f"{user.display_name}'s Brawl Stars Accounts",
-            color=discord.Color.from_rgb(0, 170, 255),
+            title=f"🎮 {user.display_name}'s Linked Accounts",
+            color=discord.Color.from_rgb(44, 130, 201),
         )
+        embed.set_thumbnail(url=user.display_avatar.url)
 
         if not tags:
             embed.description = (
-                "❌ **No accounts saved.**\n"
-                "Use `bs save #TAG` to link your account."
+                "⚠️ **No accounts saved.**\n\n"
+                "Use `bs save #TAG` to link your Brawl Stars profile."
             )
             return embed
 
-        lines = []
+        description_lines = []
         for i, tag in enumerate(tags, start=1):
             try:
                 data = await self._get_player(tag)
                 name = data.get("name", "Unknown")
+                trophies = data.get("trophies", 0)
             except RuntimeError:
-                name = "Unknown (API error)"
+                name = "Unknown (API Error)"
+                trophies = 0
 
-            is_main = " **(Main)**" if i == 1 else ""
-            lines.append(f"**{i}. {name}{is_main}**\n`#{format_tag(tag)}`")
+            is_main = "⭐ **MAIN**" if i == 1 else ""
+            
+            line = (
+                f"**{i}. {name}** | 🏆 {trophies:,}\n"
+                f"   `#{format_tag(tag)}` {is_main}"
+            )
+            description_lines.append(line)
 
-        embed.description = "\n\n".join(lines)
-        embed.set_footer(text="Main account is always slot #1.")
+        embed.description = "\n\n".join(description_lines)
+        embed.set_footer(text="To switch main account: bs switch <num1> <num2>")
         return embed
 
     # -----------------------------
@@ -726,45 +743,41 @@ class BrawlStarsTools(commands.Cog):
         trophies = player.get("trophies", 0)
         highest = player.get("highestTrophies", 0)
         exp_level = player.get("expLevel", 0)
+        icon_id = player.get("icon", {}).get("id")
+        
+        # Color: Brawl Stars Legendary Yellow
+        embed = discord.Embed(color=discord.Color.from_rgb(255, 202, 40))
 
+        if icon_id:
+            embed.set_thumbnail(url=CDN_ICON_URL.format(icon_id))
+
+        # Header Info
+        embed.set_author(name=f"{name} | {tag}", icon_url=CDN_ICON_URL.format(icon_id) if icon_id else None)
+        
+        # Main Stats Grid
+        embed.add_field(name="🏆 Trophies", value=f"**{trophies:,}**", inline=True)
+        embed.add_field(name="📈 Highest", value=f"{highest:,}", inline=True)
+        embed.add_field(name="⭐ Level", value=f"{exp_level}", inline=True)
+
+        # Victories (With Emojis)
         solo = player.get("soloVictories", 0)
         duo = player.get("duoVictories", 0)
         trio = player.get("3vs3Victories", 0)
+        
+        embed.add_field(name="🥊 3vs3 Wins", value=f"{trio:,}", inline=True)
+        embed.add_field(name="👤 Solo Wins", value=f"{solo:,}", inline=True)
+        embed.add_field(name="👥 Duo Wins", value=f"{duo:,}", inline=True)
 
-        club = player.get("club") or {}
-        club_line = "Not in a club"
+        # Club Info
+        club = player.get("club")
         if club:
-            c_name = club.get("name", "Unknown Club")
+            c_name = club.get("name", "Unknown")
             c_tag = club.get("tag", "")
-            club_line = f"**{c_name}** (`{c_tag}`)"
+            embed.add_field(name="🛡️ Club", value=f"**{c_name}**\n`{c_tag}`", inline=False)
+        else:
+            embed.add_field(name="🛡️ Club", value="Not in a club", inline=False)
 
-        embed = discord.Embed(
-            title=f"{name}",
-            description=f"`{tag}`",
-            color=discord.Color.from_rgb(240, 200, 50),
-        )
-
-        embed.add_field(
-            name="🏆 Trophies",
-            value=f"**{trophies:,}**\n(PB: {highest:,})",
-            inline=True,
-        )
-        embed.add_field(
-            name="⭐ Level",
-            value=f"**{exp_level}**",
-            inline=True,
-        )
-        embed.add_field(name="\u200b", value="\u200b", inline=True)
-
-        victories = (
-            f"👥 **3v3 Wins:** {trio:,}\n"
-            f"🧍 **Solo Wins:** {solo:,}\n"
-            f"👫 **Duo Wins:** {duo:,}"
-        )
-        embed.add_field(name="📊 Victories", value=victories, inline=False)
-        embed.add_field(name="🏰 Club", value=club_line, inline=False)
-
-        embed.set_footer(text="Player stats from the Brawl Stars API")
+        embed.set_footer(text="TLG Revamp 2025 • Player Statistics", icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None)
         return embed
 
     # -----------------------------
@@ -775,41 +788,39 @@ class BrawlStarsTools(commands.Cog):
         tag = data.get("tag", "#??????")
         trophies = data.get("trophies", 0)
         required = data.get("requiredTrophies", 0)
-        desc = data.get("description") or "*No description provided.*"
-
+        desc = data.get("description") or "No description."
+        badge_id = data.get("badgeId")
+        
         members = data.get("members", [])
         max_members = data.get("maxMembers", 30)
 
-        president = next((m for m in members if m.get("role") == "president"), None)
-        vps = [m for m in members if m.get("role") == "vicePresident"]
-        seniors = [m for m in members if m.get("role") == "senior"]
+        # Role counting
+        roles = {"president": [], "vicePresident": [], "senior": []}
+        for m in members:
+            r = m.get("role")
+            if r in roles:
+                roles[r].append(m)
 
-        embed = discord.Embed(
-            title=name,
-            description=f"`{tag}`\n\n{desc}",
-            color=discord.Color.from_rgb(0, 200, 255),
-        )
+        # Color: Club Red
+        embed = discord.Embed(color=discord.Color.from_rgb(220, 53, 69))
+        
+        if badge_id:
+            embed.set_thumbnail(url=CDN_BADGE_URL.format(badge_id))
 
-        embed.add_field(name="🏆 Trophies", value=f"**{trophies:,}**", inline=True)
-        embed.add_field(name="🔓 Required", value=f"**{required:,}**", inline=True)
-        embed.add_field(
-            name="👥 Members",
-            value=f"**{len(members)}/{max_members}**",
-            inline=True,
-        )
+        embed.set_author(name=f"{name} ({tag})")
+        embed.description = f"*{desc}*"
 
-        pres_display = "Unknown"
-        if president:
-            pres_display = f"{president.get('name')} (`{president.get('tag')}`)"
+        embed.add_field(name="🏆 Total Trophies", value=f"**{trophies:,}**", inline=True)
+        embed.add_field(name="🚪 Required", value=f"{required:,}", inline=True)
+        embed.add_field(name="👥 Members", value=f"**{len(members)}**/{max_members}", inline=True)
 
-        leadership = (
-            f"👑 **President:** {pres_display}\n"
-            f"🛡 **Vice Presidents:** {len(vps)}\n"
-            f"🎖 **Seniors:** {len(seniors)}"
-        )
-        embed.add_field(name="🧭 Leadership", value=leadership, inline=False)
+        # Leadership Display
+        pres = roles["president"][0] if roles["president"] else None
+        pres_text = f"👑 **{pres['name']}**" if pres else "None"
+        
+        embed.add_field(name="Leadership", value=f"{pres_text}\n🛡️ VPs: **{len(roles['vicePresident'])}**\n🎖️ Seniors: **{len(roles['senior'])}**", inline=False)
 
-        embed.set_footer(text="Club information from Brawl Stars API")
+        embed.set_footer(text="TLG Revamp 2025 • Club Statistics")
         return embed
 
     # -----------------------------
@@ -817,44 +828,58 @@ class BrawlStarsTools(commands.Cog):
     # -----------------------------
     def _build_brawlers_embed(self, player: Dict):
         name = player.get("name", "Unknown")
-        tag = player.get("tag", "#??????")
+        icon_id = player.get("icon", {}).get("id")
 
         brawlers = player.get("brawlers", [])
         if not brawlers:
             return discord.Embed(
-                title=f"{name}'s Brawlers",
-                description="No brawlers found.",
-                color=discord.Color.red(),
+                description="❌ No brawler data available.",
+                color=discord.Color.red()
             )
 
+        # Sort: High Trophies -> Low Trophies
         brawlers = sorted(brawlers, key=lambda b: b.get("trophies", 0), reverse=True)
-        top = brawlers[:10]
-
-        lines = []
-        for b in top:
-            lines.append(
-                f"**{b.get('name')}**\n"
-                f"🏆 {b.get('trophies')} (PB {b.get('highestTrophies')}) • "
-                f"⭐ Power {b.get('power')} • 🎖 Rank {b.get('rank')}"
-            )
+        top_10 = brawlers[:15] # Show top 15 for better density
 
         embed = discord.Embed(
             title=f"{name}'s Top Brawlers",
-            description="\n\n".join(lines),
-            color=discord.Color.from_rgb(255, 120, 50),
+            color=discord.Color.from_rgb(155, 89, 182) # Purple/Mystic
         )
-        embed.set_footer(text=f"#{format_tag(tag)} • Showing top 10")
+        if icon_id:
+            embed.set_thumbnail(url=CDN_ICON_URL.format(icon_id))
+
+        field_value = ""
+        for b in top_10:
+            b_name = b.get("name")
+            b_trophies = b.get("trophies")
+            b_power = b.get("power")
+            b_rank = b.get("rank")
+            
+            # Use custom emoji function
+            emoji = get_brawler_emoji(b_name)
+            
+            # Format: <emoji> **NAME** (Rank XX) - 🏆 XXX ⚡ X
+            line = f"{emoji} **{b_name.title()}** `R{b_rank}`\n└ 🏆 **{b_trophies}** • ⚡ {b_power}\n"
+            field_value += line
+
+        if not field_value:
+            field_value = "No brawlers found."
+
+        embed.description = field_value
+        embed.set_footer(text=f"Showing Top {len(top_10)} Brawlers")
         return embed
 
     # -----------------------------
     # Add club embed
     # -----------------------------
-    def _build_addclub_embed(self, name: str, tag: str):
+    def _build_addclub_embed(self, name: str, tag: str, badge_id: int):
         embed = discord.Embed(
-            title="🏰 Club Added",
-            description=f"Tracking **{name}** (`{tag}`)",
+            title="🏰 Tracking Started",
+            description=f"Successfully added **{name}** (`{tag}`) to server club list.",
             color=discord.Color.green(),
         )
+        if badge_id:
+            embed.set_thumbnail(url=CDN_BADGE_URL.format(badge_id))
         return embed
 
     # -----------------------------
@@ -862,9 +887,9 @@ class BrawlStarsTools(commands.Cog):
     # -----------------------------
     def _build_delclub_embed(self, name: str, tag: str):
         embed = discord.Embed(
-            title="🗑 Club Removed",
-            description=f"Stopped tracking **{name}** (`{tag}`)",
-            color=discord.Color.red(),
+            title="🗑 Tracking Stopped",
+            description=f"Removed **{name}** (`{tag}`) from server club list.",
+            color=discord.Color.dark_grey(),
         )
         return embed
 
@@ -873,38 +898,30 @@ class BrawlStarsTools(commands.Cog):
     # -----------------------------
     def _build_listclubs_embed(self, clubs: Dict[str, Dict]):
         embed = discord.Embed(
-            title="📜 Tracked Brawl Stars Clubs",
-            color=discord.Color.from_rgb(60, 60, 60),
+            title="📜 Tracked Clubs",
+            color=discord.Color.from_rgb(52, 152, 219),
         )
 
         if not clubs:
-            embed.description = (
-                "No clubs saved.\n"
-                "Use `bs admin addclub #TAG` to start tracking clubs."
-            )
+            embed.description = "No clubs are currently being tracked."
             return embed
 
-        lines = []
+        list_text = ""
         for data in clubs.values():
             name = data.get("name", "Unknown")
             tag = data.get("tag", "#??????")
-            lines.append(f"**{name}**\n`{tag}`")
+            list_text += f"**{name}** • `{tag}`\n"
 
-        embed.description = "\n\n".join(lines)
+        embed.description = list_text
         return embed
 
     # -----------------------------
     # Refresh clubs embed
     # -----------------------------
     def _build_refreshclubs_embed(self, updated: int, failed: int):
-        color = discord.Color.green() if failed == 0 else discord.Color.orange()
         embed = discord.Embed(
-            title="🔄 Clubs Updated",
-            description=(
-                f"Updated: **{updated}** club(s)\n"
-                f"Failed: **{failed}** club(s)"
-            ),
-            color=color,
+            description=f"🔄 **Refreshed Club Data**\n\nUpdated: `{updated}`\nFailed: `{failed}`",
+            color=discord.Color.blue(),
         )
         return embed
 
@@ -915,25 +932,25 @@ class BrawlStarsTools(commands.Cog):
         total = len(club_data)
         total_trophies = sum(d.get("trophies", 0) for _, _, d in club_data)
         total_members = sum(len(d.get("members", [])) for _, _, d in club_data)
-        total_required = sum(d.get("requiredTrophies", 0) for _, _, d in club_data)
-
-        def avg(x): return x / total if total else 0
+        
+        # Calculate averages safely
+        avg_trophies = total_trophies / total if total else 0
+        avg_members = total_members / total if total else 0
 
         embed = discord.Embed(
-            title="📊 Clubs Overview",
-            description=f"Tracking **{total}** clubs",
+            title="📊 Family Overview",
             color=discord.Color.purple(),
         )
+        
+        embed.add_field(name="Clubs Tracked", value=f"**{total}**", inline=True)
+        embed.add_field(name="Total Members", value=f"**{total_members}**", inline=True)
+        embed.add_field(name="Total Trophies", value=f"**{total_trophies:,}**", inline=True)
+        
+        embed.add_field(name="Avg Trophies/Club", value=f"{avg_trophies:,.0f}", inline=True)
+        embed.add_field(name="Avg Members", value=f"{avg_members:.1f}", inline=True)
+        embed.add_field(name="\u200b", value="\u200b", inline=True) # spacer
 
-        embed.add_field(name="🏆 Total Trophies", value=f"{total_trophies:,}", inline=True)
-        embed.add_field(name="👥 Total Members", value=f"{total_members}", inline=True)
-        embed.add_field(name="🔓 Total Required", value=f"{total_required:,}", inline=True)
-
-        embed.add_field(name="📈 Avg Trophies", value=f"{avg(total_trophies):,.0f}", inline=True)
-        embed.add_field(name="📈 Avg Members", value=f"{avg(total_members):,.1f}", inline=True)
-        embed.add_field(name="📈 Avg Required", value=f"{avg(total_required):,.0f}", inline=True)
-
-        embed.set_footer(text="Overall club performance summary")
+        embed.set_footer(text="Live data from Brawl Stars API")
         return embed
 
     # -----------------------------
@@ -941,24 +958,26 @@ class BrawlStarsTools(commands.Cog):
     # -----------------------------
     def _build_clubs_stats_embed(self, club_data: List[Tuple[str, str, Dict]]):
         embed = discord.Embed(
-            title="📋 Clubs Detail Breakdown",
-            color=discord.Color.from_rgb(30, 30, 30),
+            title="📋 Detailed Club Statistics",
+            color=discord.Color.dark_theme(),
         )
 
-        lines = []
         for name, tag, data in club_data:
             trophies = data.get("trophies", 0)
-            required = data.get("requiredTrophies", 0)
-            members = data.get("members", [])
-            max_members = data.get("maxMembers", 30)
-            vps = sum(1 for m in members if m.get("role") == "vicePresident")
-            seniors = sum(1 for m in members if m.get("role") == "senior")
-
-            lines.append(
-                f"**{name}** (`{tag}`)\n"
-                f"🏆 {trophies:,} • 🔓 Req {required:,}\n"
-                f"👥 {len(members)}/{max_members} • 🛡 VP {vps} • 🎖 Sr {seniors}"
+            req = data.get("requiredTrophies", 0)
+            members = len(data.get("members", []))
+            max_m = data.get("maxMembers", 30)
+            
+            # Create a mini stats block
+            stats = (
+                f"`{tag}`\n"
+                f"🏆 **{trophies:,}** | 🚪 {req:,}\n"
+                f"👥 **{members}/{max_m}** Members"
             )
+            
+            embed.add_field(name=f"🛡️ {name}", value=stats, inline=True)
 
-        embed.description = "\n\n".join(lines) if lines else "No club data."
+        if not club_data:
+            embed.description = "No data available."
+            
         return embed
