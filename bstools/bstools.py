@@ -868,7 +868,7 @@ class BrawlStarsTools(commands.Cog):
     # -----------------------------
     # Save tag embed
     # -----------------------------
-def build_save_embed(user: discord.User, name: str, tag: str, idx: int, icon_id: Optional[int]) -> discord.Embed:
+def _build_save_embed(user: discord.User, name: str, tag: str, idx: int, icon_id: Optional[int]) -> discord.Embed:
     """Return an embed acknowledging a successfully saved tag.
 
     The embed borrows colours from the original and calls out the slot
@@ -903,7 +903,7 @@ def build_save_embed(user: discord.User, name: str, tag: str, idx: int, icon_id:
     return embed
 
 
-async def build_accounts_embed(
+async def _build_accounts_embed(
     ctx_user: discord.Member,
     tags: List[str],
     fetch_player,
@@ -970,7 +970,7 @@ async def build_accounts_embed(
     return embed
 
 
-def build_player_embed(player: Dict) -> discord.Embed:
+def _build_player_embed(player: Dict) -> discord.Embed:
     """Construct a detailed player profile embed.
 
     The layout is inspired by Brawlstats: a concise header with a link to
@@ -1080,7 +1080,7 @@ def build_player_embed(player: Dict) -> discord.Embed:
     return embed
 
 
-def build_club_embed(data: Dict) -> discord.Embed:
+def _build_club_embed(data: Dict) -> discord.Embed:
     """Create a rich embed representing a club.
 
     This design offers a quick glance at the club’s totals, capacity and
@@ -1173,7 +1173,7 @@ def build_club_embed(data: Dict) -> discord.Embed:
     return embed
 
 
-def build_brawlers_embed(player: Dict) -> discord.Embed:
+def _build_brawlers_embed(player: Dict) -> discord.Embed:
     """Return an embed showcasing the player's top brawlers.
 
     To avoid overly long descriptions, the top 15 brawlers are spread
@@ -1240,7 +1240,7 @@ def build_brawlers_embed(player: Dict) -> discord.Embed:
     return embed
 
 
-def build_addclub_embed(name: str, tag: str, badge_id: Optional[int]) -> discord.Embed:
+def _build_addclub_embed(name: str, tag: str, badge_id: Optional[int]) -> discord.Embed:
     """Embed confirming that a club has been added for tracking."""
     embed = discord.Embed(
         title="🏰 Tracking Started",
@@ -1253,7 +1253,7 @@ def build_addclub_embed(name: str, tag: str, badge_id: Optional[int]) -> discord
     return embed
 
 
-def build_delclub_embed(name: str, tag: str) -> discord.Embed:
+def _build_delclub_embed(name: str, tag: str) -> discord.Embed:
     """Embed confirming that a club has been removed from tracking."""
     embed = discord.Embed(
         title="🗑️ Tracking Stopped",
@@ -1263,7 +1263,7 @@ def build_delclub_embed(name: str, tag: str) -> discord.Embed:
     return embed
 
 
-def build_listclubs_embed(clubs: Dict[str, Dict]) -> discord.Embed:
+def _build_listclubs_embed(clubs: Dict[str, Dict]) -> discord.Embed:
     """Create a list embed showing all tracked clubs."""
     embed = discord.Embed(
         title="📜 Tracked Clubs",
@@ -1283,7 +1283,7 @@ def build_listclubs_embed(clubs: Dict[str, Dict]) -> discord.Embed:
     return embed
 
 
-def build_refreshclubs_embed(updated: int, failed: int) -> discord.Embed:
+def _build_refreshclubs_embed(updated: int, failed: int) -> discord.Embed:
     """Embed summarising the outcome of a clubs refresh."""
     embed = discord.Embed(
         description=(
@@ -1295,7 +1295,7 @@ def build_refreshclubs_embed(updated: int, failed: int) -> discord.Embed:
     return embed
 
 
-def build_overview_embed(club_data: List[Tuple[str, str, Dict]]) -> discord.Embed:
+def _build_overview_embed(club_data: List[Tuple[str, str, Dict]]) -> discord.Embed:
     """Aggregate statistics from multiple clubs into a single overview embed."""
     total_clubs = len(club_data)
     total_trophies = sum(data.get("trophies", 0) for _, _, data in club_data)
@@ -1363,7 +1363,7 @@ def build_overview_embed(club_data: List[Tuple[str, str, Dict]]) -> discord.Embe
     return embed
 
 
-def build_clubs_stats_embed(club_data: List[Tuple[str, str, Dict]]) -> discord.Embed:
+def _build_clubs_stats_embed(club_data: List[Tuple[str, str, Dict]]) -> discord.Embed:
     """Detailed statistics for each club in the overview.
 
     Each club is represented as a field with its tag, total trophies,
