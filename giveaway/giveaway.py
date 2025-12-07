@@ -183,7 +183,7 @@ class Giveaways(commands.Cog):
         )
         preview.set_footer(
             text=f"Hosted by {ctx.author.display_name}",
-            icon_url=getattr(ctx.author.display_avatar, "url", discord.Embed.Empty),
+            icon_url=ctx.author.display_avatar.url,
         )
 
         view = ConfirmView(author=ctx.author)
@@ -212,8 +212,9 @@ class Giveaways(commands.Cog):
         )
         giveaway_embed.set_footer(
             text=f"Hosted by {ctx.author.display_name}",
-            icon_url=getattr(ctx.author.display_avatar, "url", discord.Embed.Empty),
+            icon_url=ctx.author.display_avatar.url,
         )
+
 
         giveaway_message = await target_channel.send(embed=giveaway_embed)
 
