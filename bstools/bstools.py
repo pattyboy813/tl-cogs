@@ -305,7 +305,7 @@ class BrawlStarsAPI:
     def __init__(self, bot: Red):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
-               self.token: Optional[str] = None
+        self.token: Optional[str] = None
 
     async def start(self):
         """Initialize HTTP session + load API token."""
@@ -1705,3 +1705,4 @@ class BrawlStarsTools(commands.Cog):
             embed.description = "No data available."
 
         return embed
+
