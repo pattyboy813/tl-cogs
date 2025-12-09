@@ -391,6 +391,33 @@ class BrawlStarsTools(commands.Cog):
         self.overview_update_loop.cancel()
         asyncio.create_task(self.api.close())
 
+    async def _ensure_in_applications_channel(self, ctx: commands.Context) -> bool:
+        """Return True if this command is being used in the applications channel (or its threads)."""
+        if not ctx.guild:
+            await ctx.send("❌ This command can only be used in a server.")
+            return False
+
+        guild_conf = bstools_config.guild(ctx.guild)
+        applications_channel_id = await guild_conf.applications_channel()
+        if not applications_channel_id:
+            await ctx.send(
+                "⚠️ Applications channel is not configured. An admin must run `bs admin setapplicationschannel`."
+            )
+            return False
+
+        # Handle thread or normal channel
+        if isinstance(ctx.channel, discord.Thread):
+            parent_id = ctx.channel.parent_id
+        else:
+            parent_id = ctx.channel.id
+
+        if parent_id != applications_channel_id:
+            await ctx.send("❌ This command can only be used in the applications channel (or its threads).")
+            return False
+
+        return True
+
+
     # -------------------------
     #     API wrappers
     # -------------------------
@@ -951,7 +978,12 @@ class BrawlStarsTools(commands.Cog):
         - Deletes the command message.
         - Sends a short-lived "Check your DMs!" notice.
         - Runs the DM flow & creates a private thread.
+
+        
         """
+        if not await self._ensure_in_applications_channel(ctx):
+            return
+            
         guild_conf = bstools_config.guild(ctx.guild)
         applications_channel_id = await guild_conf.applications_channel()
         if not applications_channel_id:
