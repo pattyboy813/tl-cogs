@@ -1769,6 +1769,3 @@ class BrawlStarsTools(commands.Cog):
 
         return embed
 
-
-async def setup(bot: Red):
-    await bot.add_cog(BrawlStarsTools(bot))
