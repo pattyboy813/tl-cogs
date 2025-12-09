@@ -1,4 +1,5 @@
 import asyncio
+import io
 from typing import List, Optional, Union, Dict, Tuple
 
 import aiohttp
@@ -27,6 +28,9 @@ default_guild = {
     # auto-updating overview
     "overview_channel": None,   # int or None
     "overview_message": None,   # int or None
+    # leadership role & applications channel
+    "leadership_role": None,        # int or None
+    "applications_channel": None,   # int or None
 }
 
 default_user = {
@@ -143,6 +147,34 @@ def get_brawler_emoji(name: str) -> str:
     """Returns the custom emoji if found, otherwise returns a generic shield."""
     clean_name = name.lower().replace(" ", "").replace(".", "")
     return BRAWLER_EMOJIS.get(clean_name, "🛡️")
+
+
+# -------------------------------------------------
+# Club role configuration (fill with real IDs)
+# -------------------------------------------------
+
+CLUB_ROLE_CONFIG = {
+    "revolt": {
+        "add": [111111111111111111, 222222222222222222],  # roles to add
+        "remove": [333333333333333333, 444444444444444444],  # roles to remove
+        "display_name": "Revolt",
+    },
+    "tempest": {
+        "add": [555555555555555555],
+        "remove": [666666666666666666],
+        "display_name": "Tempest",
+    },
+    "dynamite": {
+        "add": [777777777777777777],
+        "remove": [888888888888888888],
+        "display_name": "Dynamite",
+    },
+    "troopers": {
+        "add": [999999999999999999],
+        "remove": [101010101010101010],
+        "display_name": "Troopers",
+    },
+}
 
 
 # ----------------- Exceptions / helpers -----------------
@@ -331,7 +363,7 @@ class BrawlStarsAPI:
 
 class BrawlStarsTools(commands.Cog):
     """
-    Unified Brawl Stars tools for players, brawlers, clubs, and admin management.
+    Unified Brawl Stars tools for players, brawlers, clubs, admin management & ticketing.
     """
 
     def __init__(self, bot: Red):
@@ -786,6 +818,402 @@ class BrawlStarsTools(commands.Cog):
         await bstools_config.guild(ctx.guild).overview_channel.set(channel.id)
         await bstools_config.guild(ctx.guild).overview_message.set(None)
         await ctx.send(f"📡 Overview updates will now be posted in {channel.mention}.")
+
+    @bs_admin_group.command(name="setleadershiprole")
+    async def bs_set_leadership_role(self, ctx: commands.Context, role: discord.Role):
+        """Set the club leadership role for ticketing & club commands."""
+        await bstools_config.guild(ctx.guild).leadership_role.set(role.id)
+        await ctx.send(f"✅ Leadership role set to {role.mention}.")
+
+    @bs_admin_group.command(name="setapplicationschannel")
+    async def bs_set_applications_channel(self, ctx: commands.Context, channel: discord.TextChannel):
+        """Set the channel where application threads will be created."""
+        await bstools_config.guild(ctx.guild).applications_channel.set(channel.id)
+        await ctx.send(f"✅ Applications will create threads in {channel.mention}.")
+
+    # ========================================================
+    #             LEADERSHIP / CLUB ASSIGN HELPERS
+    # ========================================================
+
+    async def _ensure_leadership(self, ctx: commands.Context) -> Optional[discord.Role]:
+        """Return leadership role if caller has it, otherwise send error & return None."""
+        guild_conf = bstools_config.guild(ctx.guild)
+        role_id = await guild_conf.leadership_role()
+        if not role_id:
+            await ctx.send("⚠️ Leadership role is not configured. Use `bs admin setleadershiprole <role>`.")
+            return None
+
+        role = ctx.guild.get_role(role_id)
+        if not role:
+            await ctx.send("⚠️ The configured leadership role no longer exists. Reconfigure it.")
+            return None
+
+        if role not in ctx.author.roles:
+            await ctx.send("❌ You need the leadership role to use this command.")
+            return None
+
+        return role
+
+    async def _find_club_by_name(self, guild: discord.Guild, name: str) -> Optional[Dict]:
+        """Find a tracked club (from bs admin addclub) by its name (case-insensitive)."""
+        clubs = await bstools_config.guild(guild).clubs()
+        for club_data in clubs.values():
+            if club_data.get("name", "").lower() == name.lower():
+                return club_data
+        return None
+
+    async def _assign_member_to_club(
+        self,
+        ctx: commands.Context,
+        member: discord.Member,
+        club_key: str,
+    ):
+        """
+        Shared logic for revolt/tempest/dynamite/troopers commands.
+        - Ensures caller has leadership role.
+        - Verifies the target's main BS account is in the right club.
+        - Sets nickname to {IGN} | ClubName.
+        - Applies hardcoded roles.
+        """
+        # 1) Leadership check
+        lead_role = await self._ensure_leadership(ctx)
+        if not lead_role:
+            return
+
+        if member.bot:
+            await ctx.send("❌ Bots can't be assigned to clubs.")
+            return
+
+        club_conf = CLUB_ROLE_CONFIG.get(club_key)
+        if not club_conf:
+            await ctx.send("⚠️ This club is not configured in CLUB_ROLE_CONFIG.")
+            return
+
+        display_name: str = club_conf.get("display_name", club_key.title())
+
+        # 2) Find the club in the tracked clubs DB
+        club_data = await self._find_club_by_name(ctx.guild, display_name)
+        if not club_data:
+            await ctx.send(
+                f"❌ I couldn't find a tracked club named **{display_name}**.\n"
+                f"Use `bs admin addclub #TAG` to add it first."
+            )
+            return
+
+        club_tag = club_data.get("tag")
+        if not club_tag:
+            await ctx.send("⚠️ This club entry has no tag saved. Re-add it with `bs admin addclub`.")
+            return
+
+        # 3) Get the member's main BS tag
+        tags = await self.tags.get_all_tags(member.id)
+        if not tags:
+            await ctx.send(f"❌ {member.mention} has no saved Brawl Stars account. They must run `bs save #TAG`.")
+            return
+
+        main_tag = tags[0]
+
+        # 4) Fetch player and verify club
+        try:
+            player = await self._get_player(main_tag)
+        except RuntimeError as e:
+            await ctx.send(f"❌ Error contacting Brawl Stars API: `{e}`")
+            return
+
+        if not player:
+            await ctx.send("❌ I couldn't find that player's account from the API.")
+            return
+
+        player_club = player.get("club")
+        if not player_club:
+            await ctx.send(f"❌ {member.mention} is not in any club in-game.")
+            return
+
+        player_club_tag = player_club.get("tag")
+        if player_club_tag != club_tag:
+            await ctx.send(
+                f"❌ {member.mention} is not in **{display_name}** in-game.\n"
+                f"Their current club appears to be **{player_club.get('name', 'Unknown')}** ({player_club_tag})."
+            )
+            return
+
+        ign = player.get("name", "Unknown")
+
+        # 5) Change nickname
+        new_nick = f"{ign} | {display_name}"
+        try:
+            await member.edit(nick=new_nick, reason=f"Assigned to {display_name} by {ctx.author}")
+        except discord.Forbidden:
+            await ctx.send("⚠️ I don't have permission to change that member's nickname.")
+        except discord.HTTPException:
+            await ctx.send("⚠️ Failed to change nickname for some reason, but continuing with roles.")
+
+        # 6) Assign/remove roles
+        roles_to_add_ids = club_conf.get("add", [])
+        roles_to_remove_ids = club_conf.get("remove", [])
+
+        roles_to_add = [ctx.guild.get_role(rid) for rid in roles_to_add_ids if ctx.guild.get_role(rid)]
+        roles_to_remove = [ctx.guild.get_role(rid) for rid in roles_to_remove_ids if ctx.guild.get_role(rid)]
+
+        try:
+            if roles_to_add:
+                await member.add_roles(*roles_to_add, reason=f"Assigned to {display_name}")
+            if roles_to_remove:
+                await member.remove_roles(*roles_to_remove, reason=f"Assigned to {display_name}")
+        except discord.Forbidden:
+            await ctx.send("⚠️ I don't have permission to modify one or more roles for that member.")
+        except discord.HTTPException:
+            await ctx.send("⚠️ Something went wrong while updating roles.")
+
+        await ctx.send(
+            f"✅ {member.mention} has been assigned to **{display_name}**.\n"
+            f"Nickname set to `{new_nick}` and roles updated."
+        )
+
+    # ========================================================
+    #                   CLUB APPLY / TICKETS
+    # ========================================================
+
+    @commands.command(name="clubapply")
+    @commands.guild_only()
+    async def club_apply(self, ctx: commands.Context):
+        """
+        Start a Brawl Stars club application via DM.
+        - Asks for a screenshot of the profile.
+        - Asks for player tag (text) if not saved.
+        - Pulls IGN + trophies from the Brawl Stars API.
+        - Confirms via buttons.
+        - Asks what they want in a club.
+        - Creates a private thread for leadership + applicant.
+        """
+        guild_conf = bstools_config.guild(ctx.guild)
+        applications_channel_id = await guild_conf.applications_channel()
+        if not applications_channel_id:
+            await ctx.send("⚠️ Applications channel is not configured. An admin must run `bs admin setapplicationschannel`.")
+            return
+
+        applications_channel = ctx.guild.get_channel(applications_channel_id)
+        if not isinstance(applications_channel, discord.TextChannel):
+            await ctx.send("⚠️ The configured applications channel is invalid.")
+            return
+
+        # Try to DM the user
+        try:
+            dm = await ctx.author.create_dm()
+            await dm.send(
+                "👋 Hey! Let's set up your club application.\n\n"
+                "First, send a **clear screenshot** of your Brawl Stars profile (not the club screen)."
+            )
+        except discord.Forbidden:
+            await ctx.send("❌ I can't DM you. Please enable DMs from server members and try again.")
+            return
+
+        def dm_check(m: discord.Message):
+            return m.author.id == ctx.author.id and m.channel == dm
+
+        # 1) Get screenshot
+        try:
+            screenshot_msg = await self.bot.wait_for("message", check=dm_check, timeout=300)
+        except asyncio.TimeoutError:
+            await dm.send("⏰ Timed out waiting for a screenshot. Start again in the server with `clubapply`.")
+            return
+
+        if not screenshot_msg.attachments:
+            await dm.send("❌ I didn't see any attachments. Please restart the process and attach a screenshot.")
+            return
+
+        screenshot = screenshot_msg.attachments[0]
+
+        # 2) Try to use an existing saved tag, otherwise ask for it
+        tags = await self.tags.get_all_tags(ctx.author.id)
+        if tags:
+            tag = tags[0]
+            await dm.send(f"✅ I found your saved main account: `#{tag}`.\nI'll use this for your application.")
+        else:
+            await dm.send(
+                "Now, please send your **player tag** as text (e.g. `#9L0P0ABC`).\n"
+                "I'll use this to pull your IGN and trophies from the official API."
+            )
+            try:
+                tag_msg = await self.bot.wait_for("message", check=dm_check, timeout=300)
+            except asyncio.TimeoutError:
+                await dm.send("⏰ Timed out waiting for your tag. Start again in the server with `clubapply`.")
+                return
+
+            raw_tag = tag_msg.content.strip()
+            tag = format_tag(raw_tag)
+            if not verify_tag(tag):
+                await dm.send("❌ That doesn't look like a valid Brawl Stars tag. Please restart and double-check.")
+                return
+
+        # 3) Fetch player from API
+        try:
+            player = await self._get_player(tag)
+        except RuntimeError as e:
+            await dm.send(f"❌ I couldn't reach the Brawl Stars API:\n`{e}`")
+            return
+
+        if not player:
+            await dm.send("❌ I couldn't find a player with that tag. Double-check your in-game tag and restart.")
+            return
+
+        ign = player.get("name", "Unknown")
+        trophies = player.get("trophies", 0)
+        club_info = player.get("club")
+        club_text = "No club" if not club_info else f"{club_info.get('name', 'Unknown')} ({club_info.get('tag', '???')})"
+
+        # 4) Confirmation via buttons
+        class ConfirmView(discord.ui.View):
+            def __init__(self, author: discord.User, timeout: float = 180):
+                super().__init__(timeout=timeout)
+                self.author = author
+                self.value: Optional[bool] = None
+
+            async def interaction_check(self, interaction: discord.Interaction) -> bool:
+                if interaction.user.id != self.author.id:
+                    await interaction.response.send_message("These buttons aren't for you.", ephemeral=True)
+                    return False
+                return True
+
+            @discord.ui.button(label="Yes", style=discord.ButtonStyle.green)
+            async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+                self.value = True
+                await interaction.response.defer()
+                self.stop()
+
+            @discord.ui.button(label="No", style=discord.ButtonStyle.red)
+            async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+                self.value = False
+                await interaction.response.defer()
+                self.stop()
+
+        confirm_embed = discord.Embed(
+            title="Confirm your Brawl Stars details",
+            color=discord.Color.green(),
+        )
+        confirm_embed.add_field(name="IGN", value=f"**{ign}**", inline=True)
+        confirm_embed.add_field(name="Tag", value=f"`#{format_tag(tag)}`", inline=True)
+        confirm_embed.add_field(name="Trophies", value=f"{trophies:,}", inline=True)
+        confirm_embed.add_field(name="Current Club", value=club_text, inline=False)
+        confirm_embed.set_footer(text="Is this information correct?")
+
+        view = ConfirmView(ctx.author)
+        await dm.send(embed=confirm_embed, view=view)
+        await view.wait()
+
+        if view.value is None:
+            await dm.send("⏰ You didn't press a button in time. Start again with `clubapply`.")
+            return
+        if view.value is False:
+            await dm.send("❌ Application cancelled. You can restart with `clubapply` in the server.")
+            return
+
+        # 5) Save tag to their profile (if not already saved)
+        try:
+            await self.tags.save_tag(ctx.author.id, tag)
+        except TagAlreadySaved:
+            pass
+        except TagAlreadyExists:
+            await dm.send(
+                "⚠️ This tag is already linked to another Discord user in the database. "
+                "A staff member may need to resolve this manually."
+            )
+        except InvalidTag:
+            await dm.send("⚠️ Somehow that tag became invalid. Staff will need to handle this manually.")
+        # (We don't block the application if save_tag fails.)
+
+        # 6) Ask for brief description
+        await dm.send(
+            "✅ Details confirmed!\n\n"
+            "Finally, please give a **brief description** of what you're looking for in a club "
+            "(e.g. casual / competitive, language, active time, etc.)."
+        )
+        try:
+            description_msg = await self.bot.wait_for("message", check=dm_check, timeout=600)
+        except asyncio.TimeoutError:
+            await dm.send("⏰ Timed out waiting for your description. Start again with `clubapply`.")
+            return
+
+        description_text = description_msg.content[:1000]  # safety limit
+
+        # 7) Create private thread in applications channel
+        try:
+            thread = await applications_channel.create_thread(
+                name=f"{ign} | Club Application",
+                type=discord.ChannelType.private_thread,
+            )
+        except discord.Forbidden:
+            await dm.send("❌ I couldn't create a thread in the applications channel. Staff will need to fix my permissions.")
+            return
+
+        # Add applicant
+        try:
+            await thread.add_user(ctx.author)
+        except discord.Forbidden:
+            pass
+
+        # Add leadership members
+        lead_role_id = await guild_conf.leadership_role()
+        lead_role = ctx.guild.get_role(lead_role_id) if lead_role_id else None
+        if lead_role:
+            for member in lead_role.members:
+                try:
+                    await thread.add_user(member)
+                except discord.Forbidden:
+                    continue
+
+        # Re-upload the screenshot into the thread
+        screenshot_bytes = await screenshot.read()
+        file = discord.File(io.BytesIO(screenshot_bytes), filename=screenshot.filename or "profile.png")
+
+        # Build thread message
+        profile_link = f"https://brawlstats.com/profile/{format_tag(tag)}"
+        thread_embed = discord.Embed(
+            title=f"New Club Application: {ign}",
+            color=discord.Color.blurple(),
+        )
+        thread_embed.add_field(name="Applicant", value=f"{ctx.author.mention} ({ctx.author.id})", inline=False)
+        thread_embed.add_field(name="IGN", value=f"**{ign}**", inline=True)
+        thread_embed.add_field(name="Tag", value=f"`#{format_tag(tag)}`", inline=True)
+        thread_embed.add_field(name="Trophies", value=f"{trophies:,}", inline=True)
+        thread_embed.add_field(name="Current Club", value=club_text, inline=False)
+        thread_embed.add_field(name="What they want", value=description_text, inline=False)
+        thread_embed.add_field(name="Brawlstats Link", value=profile_link, inline=False)
+        thread_embed.set_footer(text="Use this thread to handle the application.")
+
+        content = lead_role.mention if lead_role else ""
+        await thread.send(content=content, embed=thread_embed, file=file)
+
+        await dm.send("🎉 Your application has been submitted! Club leadership will review it in their private thread.")
+        await ctx.send(f"✅ {ctx.author.mention}, I’ve DMed you and submitted your club application.")
+
+    # ========================================================
+    #                   CLUB ASSIGN COMMANDS
+    # ========================================================
+
+    @commands.command(name="revolt")
+    @commands.guild_only()
+    async def revolt_command(self, ctx: commands.Context, member: discord.Member):
+        """Assign a member to Revolt (leadership only)."""
+        await self._assign_member_to_club(ctx, member, "revolt")
+
+    @commands.command(name="tempest")
+    @commands.guild_only()
+    async def tempest_command(self, ctx: commands.Context, member: discord.Member):
+        """Assign a member to Tempest (leadership only)."""
+        await self._assign_member_to_club(ctx, member, "tempest")
+
+    @commands.command(name="dynamite")
+    @commands.guild_only()
+    async def dynamite_command(self, ctx: commands.Context, member: discord.Member):
+        """Assign a member to Dynamite (leadership only)."""
+        await self._assign_member_to_club(ctx, member, "dynamite")
+
+    @commands.command(name="troopers")
+    @commands.guild_only()
+    async def troopers_command(self, ctx: commands.Context, member: discord.Member):
+        """Assign a member to Troopers (leadership only)."""
+        await self._assign_member_to_club(ctx, member, "troopers")
 
     # ========================================================
     #                   BACKGROUND TASK
@@ -1340,3 +1768,7 @@ class BrawlStarsTools(commands.Cog):
             embed.description = "No data available."
 
         return embed
+
+
+async def setup(bot: Red):
+    await bot.add_cog(BrawlStarsTools(bot))
