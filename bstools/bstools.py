@@ -152,27 +152,33 @@ def get_brawler_emoji(name: str) -> str:
 # -------------------------------------------------
 # Club role configuration (fill with real IDs)
 # -------------------------------------------------
+# bs_name      = full Brawl Stars name as saved in DB (e.g. "TLG Revolt")
+# display_name = short label for nickname ({IGN} | display_name)
 
 CLUB_ROLE_CONFIG = {
     "revolt": {
-        "add": [111111111111111111, 222222222222222222],  # roles to add
-        "remove": [333333333333333333, 444444444444444444],  # roles to remove
+        "bs_name": "TLG Revolt",
         "display_name": "Revolt",
+        "add": [111111111111111111, 222222222222222222],
+        "remove": [333333333333333333, 444444444444444444],
     },
     "tempest": {
+        "bs_name": "TLG Tempest",
+        "display_name": "Tempest",
         "add": [555555555555555555],
         "remove": [666666666666666666],
-        "display_name": "Tempest",
     },
     "dynamite": {
+        "bs_name": "TLG Dynamite",
+        "display_name": "Dynamite",
         "add": [777777777777777777],
         "remove": [888888888888888888],
-        "display_name": "Dynamite",
     },
     "troopers": {
+        "bs_name": "TLG Troopers",
+        "display_name": "Troopers",
         "add": [999999999999999999],
         "remove": [101010101010101010],
-        "display_name": "Troopers",
     },
 }
 
@@ -299,7 +305,7 @@ class BrawlStarsAPI:
     def __init__(self, bot: Red):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
-        self.token: Optional[str] = None
+               self.token: Optional[str] = None
 
     async def start(self):
         """Initialize HTTP session + load API token."""
@@ -422,9 +428,6 @@ class BrawlStarsTools(commands.Cog):
     #                   USER COMMANDS
     # ========================================================
 
-    # --------------------------------------------------------
-    #  bs save
-    # --------------------------------------------------------
     @bs_group.command(name="save")
     async def bs_save(self, ctx: commands.Context, tag: str):
         """
@@ -437,7 +440,6 @@ class BrawlStarsTools(commands.Cog):
             await ctx.send("Invalid tag.")
             return
 
-        # Validate tag by hitting API
         try:
             player = await self._get_player(clean)
         except RuntimeError as e:
@@ -467,28 +469,18 @@ class BrawlStarsTools(commands.Cog):
         embed = self._build_save_embed(ctx.author, name, clean, idx, icon_id)
         await ctx.send(embed=embed)
 
-    # --------------------------------------------------------
-    #  bs accounts
-    # --------------------------------------------------------
     @bs_group.command(name="accounts")
     async def bs_accounts(self, ctx: commands.Context, user: Optional[discord.Member] = None):
-        """
-        List saved Brawl Stars accounts.
-        """
+        """List saved Brawl Stars accounts."""
         user = user or ctx.author
         tags = await self.tags.get_all_tags(user.id)
 
         embed = await self._build_accounts_embed(user, tags)
         await ctx.send(embed=embed)
 
-    # --------------------------------------------------------
-    #  bs switch
-    # --------------------------------------------------------
     @bs_group.command(name="switch")
     async def bs_switch(self, ctx: commands.Context, account1: int, account2: int):
-        """
-        Swap the order of two saved accounts.
-        """
+        """Swap the order of two saved accounts."""
         try:
             await self.tags.switch_place(ctx.author.id, account1, account2)
         except InvalidArgument:
@@ -500,14 +492,9 @@ class BrawlStarsTools(commands.Cog):
         embed = await self._build_accounts_embed(ctx.author, tags)
         await ctx.send(embed=embed)
 
-    # --------------------------------------------------------
-    #  bs unsave
-    # --------------------------------------------------------
     @bs_group.command(name="unsave")
     async def bs_unsave(self, ctx: commands.Context, account: int):
-        """
-        Remove a saved account by its index.
-        """
+        """Remove a saved account by its index."""
         try:
             await self.tags.unlink_tag(ctx.author.id, account)
         except InvalidArgument:
@@ -523,13 +510,11 @@ class BrawlStarsTools(commands.Cog):
     #        PLAYER / CLUB / BRAWLERS DATA COMMANDS
     # ========================================================
 
-    # Utility: resolve @user / #tag / none
     async def _resolve_player_tag(
         self,
         ctx: commands.Context,
         target: Optional[Union[discord.Member, discord.User, str]],
     ) -> Optional[str]:
-
         # Case 1: raw tag
         if isinstance(target, str):
             clean = format_tag(target)
@@ -544,7 +529,7 @@ class BrawlStarsTools(commands.Cog):
             if not tags:
                 await ctx.send(f"⚠️ {target.display_name} has no saved accounts.")
                 return None
-            return tags[0]  # main
+            return tags[0]
 
         # Case 3: author
         tags = await self.tags.get_all_tags(ctx.author.id)
@@ -553,18 +538,13 @@ class BrawlStarsTools(commands.Cog):
             return None
         return tags[0]
 
-    # --------------------------------------------------------
-    #  bs player
-    # --------------------------------------------------------
     @bs_group.command(name="player")
     async def bs_player(
         self,
         ctx: commands.Context,
         target: Optional[Union[discord.Member, discord.User, str]] = None,
     ):
-        """
-        Show detailed stats for a Brawl Stars player.
-        """
+        """Show detailed stats for a Brawl Stars player."""
         tag = await self._resolve_player_tag(ctx, target)
         if not tag:
             return
@@ -582,18 +562,13 @@ class BrawlStarsTools(commands.Cog):
         embed = self._build_player_embed(player)
         await ctx.send(embed=embed)
 
-    # --------------------------------------------------------
-    #  bs club  (user command)
-    # --------------------------------------------------------
     @bs_group.command(name="club")
     async def bs_club(
         self,
         ctx: commands.Context,
         target: Optional[Union[discord.Member, discord.User, str]] = None,
     ):
-        """
-        Show the club of a player.
-        """
+        """Show the club of a player."""
         tag = await self._resolve_player_tag(ctx, target)
         if not tag:
             return
@@ -628,18 +603,13 @@ class BrawlStarsTools(commands.Cog):
         embed = self._build_club_embed(data)
         await ctx.send(embed=embed)
 
-    # --------------------------------------------------------
-    #  bs brawlers
-    # --------------------------------------------------------
     @bs_group.command(name="brawlers")
     async def bs_brawlers(
         self,
         ctx: commands.Context,
         target: Optional[Union[discord.Member, discord.User, str]] = None,
     ):
-        """
-        Show a player's top brawlers.
-        """
+        """Show a player's top brawlers."""
         tag = await self._resolve_player_tag(ctx, target)
         if not tag:
             return
@@ -663,9 +633,7 @@ class BrawlStarsTools(commands.Cog):
 
     @bs_admin_group.command(name="addclub")
     async def bs_add_club(self, ctx: commands.Context, tag: str):
-        """
-        Add a club to this server's tracked list (by tag only).
-        """
+        """Add a club to this server's tracked list (by tag only)."""
         clean = format_tag(tag)
         if not verify_tag(clean):
             await ctx.send("Invalid club tag.")
@@ -673,7 +641,6 @@ class BrawlStarsTools(commands.Cog):
 
         club_tag = f"#{clean}"
 
-        # Fetch club from API to get the real name
         try:
             data = await self._get_club(club_tag)
         except RuntimeError as e:
@@ -698,9 +665,7 @@ class BrawlStarsTools(commands.Cog):
 
     @bs_admin_group.command(name="delclub")
     async def bs_del_club(self, ctx: commands.Context, tag: str):
-        """
-        Remove a tracked club by tag.
-        """
+        """Remove a tracked club by tag."""
         clean = format_tag(tag)
         club_tag = f"#{clean}"
 
@@ -716,18 +681,14 @@ class BrawlStarsTools(commands.Cog):
 
     @bs_admin_group.command(name="listclubs")
     async def bs_list_clubs(self, ctx: commands.Context):
-        """
-        List all tracked clubs for this server.
-        """
+        """List all tracked clubs for this server."""
         clubs = await bstools_config.guild(ctx.guild).clubs()
         embed = self._build_listclubs_embed(clubs)
         await ctx.send(embed=embed)
 
     @bs_admin_group.command(name="refreshclubs")
     async def bs_refresh_clubs(self, ctx: commands.Context):
-        """
-        Refresh saved club names from the API.
-        """
+        """Refresh saved club names from the API."""
         clubs = await bstools_config.guild(ctx.guild).clubs()
         if not clubs:
             await ctx.send("No clubs tracked yet. Use `bs admin addclub #TAG` first.")
@@ -763,16 +724,14 @@ class BrawlStarsTools(commands.Cog):
 
     @bs_admin_group.command(name="clubs")
     async def bs_admin_clubs(self, ctx: commands.Context):
-        """
-        Overview of all tracked clubs using live API data.
-        """
+        """Overview of all tracked clubs using live API data."""
         clubs = await bstools_config.guild(ctx.guild).clubs()
         if not clubs:
             await ctx.send("No clubs tracked yet. Use `bs admin addclub #TAG` first.")
             return
 
         tasks_list: List[asyncio.Task] = []
-        club_meta: List[Tuple[str, str]] = []  # (name, tag)
+        club_meta: List[Tuple[str, str]] = []
 
         for club in clubs.values():
             tag = club.get("tag")
@@ -812,9 +771,7 @@ class BrawlStarsTools(commands.Cog):
     async def bs_set_overview_channel(
         self, ctx: commands.Context, channel: discord.TextChannel
     ):
-        """
-        Set the channel where the automatic overview message will update every 10 minutes.
-        """
+        """Set the channel where the automatic overview message will update every 10 minutes."""
         await bstools_config.guild(ctx.guild).overview_channel.set(channel.id)
         await bstools_config.guild(ctx.guild).overview_message.set(None)
         await ctx.send(f"📡 Overview updates will now be posted in {channel.mention}.")
@@ -872,10 +829,10 @@ class BrawlStarsTools(commands.Cog):
         Shared logic for revolt/tempest/dynamite/troopers commands.
         - Ensures caller has leadership role.
         - Verifies the target's main BS account is in the right club.
-        - Sets nickname to {IGN} | ClubName.
+        - Sets nickname to {IGN} | <display_name>.
         - Applies hardcoded roles.
+        - If used in a thread, locks/archives that thread on success.
         """
-        # 1) Leadership check
         lead_role = await self._ensure_leadership(ctx)
         if not lead_role:
             return
@@ -890,12 +847,13 @@ class BrawlStarsTools(commands.Cog):
             return
 
         display_name: str = club_conf.get("display_name", club_key.title())
+        bs_name: str = club_conf.get("bs_name", display_name)
 
-        # 2) Find the club in the tracked clubs DB
-        club_data = await self._find_club_by_name(ctx.guild, display_name)
+        # Find the club by full Brawl Stars name (e.g. "TLG Revolt")
+        club_data = await self._find_club_by_name(ctx.guild, bs_name)
         if not club_data:
             await ctx.send(
-                f"❌ I couldn't find a tracked club named **{display_name}**.\n"
+                f"❌ I couldn't find a tracked club named **{bs_name}**.\n"
                 f"Use `bs admin addclub #TAG` to add it first."
             )
             return
@@ -905,7 +863,7 @@ class BrawlStarsTools(commands.Cog):
             await ctx.send("⚠️ This club entry has no tag saved. Re-add it with `bs admin addclub`.")
             return
 
-        # 3) Get the member's main BS tag
+        # Get member's main BS tag
         tags = await self.tags.get_all_tags(member.id)
         if not tags:
             await ctx.send(f"❌ {member.mention} has no saved Brawl Stars account. They must run `bs save #TAG`.")
@@ -913,7 +871,6 @@ class BrawlStarsTools(commands.Cog):
 
         main_tag = tags[0]
 
-        # 4) Fetch player and verify club
         try:
             player = await self._get_player(main_tag)
         except RuntimeError as e:
@@ -932,23 +889,22 @@ class BrawlStarsTools(commands.Cog):
         player_club_tag = player_club.get("tag")
         if player_club_tag != club_tag:
             await ctx.send(
-                f"❌ {member.mention} is not in **{display_name}** in-game.\n"
+                f"❌ {member.mention} is not in **{bs_name}** in-game.\n"
                 f"Their current club appears to be **{player_club.get('name', 'Unknown')}** ({player_club_tag})."
             )
             return
 
         ign = player.get("name", "Unknown")
 
-        # 5) Change nickname
+        # Nick: {IGN} | ShortName
         new_nick = f"{ign} | {display_name}"
         try:
-            await member.edit(nick=new_nick, reason=f"Assigned to {display_name} by {ctx.author}")
+            await member.edit(nick=new_nick, reason=f"Assigned to {bs_name} ({display_name}) by {ctx.author}")
         except discord.Forbidden:
             await ctx.send("⚠️ I don't have permission to change that member's nickname.")
         except discord.HTTPException:
-            await ctx.send("⚠️ Failed to change nickname for some reason, but continuing with roles.")
+            await ctx.send("⚠️ Failed to change nickname, continuing with roles.")
 
-        # 6) Assign/remove roles
         roles_to_add_ids = club_conf.get("add", [])
         roles_to_remove_ids = club_conf.get("remove", [])
 
@@ -957,18 +913,31 @@ class BrawlStarsTools(commands.Cog):
 
         try:
             if roles_to_add:
-                await member.add_roles(*roles_to_add, reason=f"Assigned to {display_name}")
+                await member.add_roles(*roles_to_add, reason=f"Assigned to {bs_name}")
             if roles_to_remove:
-                await member.remove_roles(*roles_to_remove, reason=f"Assigned to {display_name}")
+                await member.remove_roles(*roles_to_remove, reason=f"Assigned to {bs_name}")
         except discord.Forbidden:
             await ctx.send("⚠️ I don't have permission to modify one or more roles for that member.")
         except discord.HTTPException:
             await ctx.send("⚠️ Something went wrong while updating roles.")
 
         await ctx.send(
-            f"✅ {member.mention} has been assigned to **{display_name}**.\n"
+            f"✅ {member.mention} has been assigned to **{bs_name}**.\n"
             f"Nickname set to `{new_nick}` and roles updated."
         )
+
+        # If command was used in a thread, lock/archive that thread
+        if isinstance(ctx.channel, discord.Thread):
+            thread: discord.Thread = ctx.channel
+            try:
+                await thread.edit(
+                    locked=True,
+                    archived=True,
+                    reason=f"Application resolved: assigned to {bs_name}",
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                # No perms / some error – assignment already succeeded, so we ignore this
+                pass
 
     # ========================================================
     #                   CLUB APPLY / TICKETS
@@ -979,16 +948,14 @@ class BrawlStarsTools(commands.Cog):
     async def club_apply(self, ctx: commands.Context):
         """
         Start a Brawl Stars club application via DM.
-        - Asks for a screenshot of the profile.
-        - Asks for player tag (text) if not saved.
-        - Pulls IGN + trophies from the Brawl Stars API.
-        - Confirms via buttons.
-        - Asks what they want in a club.
-        - Creates a private thread for leadership + applicant.
+        - Deletes the command message.
+        - Sends a short-lived "Check your DMs!" notice.
+        - Runs the DM flow & creates a private thread.
         """
         guild_conf = bstools_config.guild(ctx.guild)
         applications_channel_id = await guild_conf.applications_channel()
         if not applications_channel_id:
+            # Here we *don't* delete; user needs to see the error.
             await ctx.send("⚠️ Applications channel is not configured. An admin must run `bs admin setapplicationschannel`.")
             return
 
@@ -997,7 +964,21 @@ class BrawlStarsTools(commands.Cog):
             await ctx.send("⚠️ The configured applications channel is invalid.")
             return
 
-        # Try to DM the user
+        # "Ephemeral-ish": delete the command and send a short-lived notice
+        try:
+            await ctx.message.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        try:
+            notice = await ctx.send(f"{ctx.author.mention} Check your DMs! 📬")
+            await asyncio.sleep(8)
+            await notice.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            # Can't send or delete message – ignore and continue with DM flow
+            pass
+
+        # DM flow starts
         try:
             dm = await ctx.author.create_dm()
             await dm.send(
@@ -1005,13 +986,15 @@ class BrawlStarsTools(commands.Cog):
                 "First, send a **clear screenshot** of your Brawl Stars profile (not the club screen)."
             )
         except discord.Forbidden:
-            await ctx.send("❌ I can't DM you. Please enable DMs from server members and try again.")
+            await ctx.send(
+                f"{ctx.author.mention} ❌ I can't DM you. "
+                "Please enable DMs from server members and try again."
+            )
             return
 
         def dm_check(m: discord.Message):
             return m.author.id == ctx.author.id and m.channel == dm
 
-        # 1) Get screenshot
         try:
             screenshot_msg = await self.bot.wait_for("message", check=dm_check, timeout=300)
         except asyncio.TimeoutError:
@@ -1024,7 +1007,7 @@ class BrawlStarsTools(commands.Cog):
 
         screenshot = screenshot_msg.attachments[0]
 
-        # 2) Try to use an existing saved tag, otherwise ask for it
+        # Use saved tag if available
         tags = await self.tags.get_all_tags(ctx.author.id)
         if tags:
             tag = tags[0]
@@ -1046,7 +1029,6 @@ class BrawlStarsTools(commands.Cog):
                 await dm.send("❌ That doesn't look like a valid Brawl Stars tag. Please restart and double-check.")
                 return
 
-        # 3) Fetch player from API
         try:
             player = await self._get_player(tag)
         except RuntimeError as e:
@@ -1062,7 +1044,6 @@ class BrawlStarsTools(commands.Cog):
         club_info = player.get("club")
         club_text = "No club" if not club_info else f"{club_info.get('name', 'Unknown')} ({club_info.get('tag', '???')})"
 
-        # 4) Confirmation via buttons
         class ConfirmView(discord.ui.View):
             def __init__(self, author: discord.User, timeout: float = 180):
                 super().__init__(timeout=timeout)
@@ -1108,7 +1089,6 @@ class BrawlStarsTools(commands.Cog):
             await dm.send("❌ Application cancelled. You can restart with `clubapply` in the server.")
             return
 
-        # 5) Save tag to their profile (if not already saved)
         try:
             await self.tags.save_tag(ctx.author.id, tag)
         except TagAlreadySaved:
@@ -1120,9 +1100,7 @@ class BrawlStarsTools(commands.Cog):
             )
         except InvalidTag:
             await dm.send("⚠️ Somehow that tag became invalid. Staff will need to handle this manually.")
-        # (We don't block the application if save_tag fails.)
 
-        # 6) Ask for brief description
         await dm.send(
             "✅ Details confirmed!\n\n"
             "Finally, please give a **brief description** of what you're looking for in a club "
@@ -1134,9 +1112,8 @@ class BrawlStarsTools(commands.Cog):
             await dm.send("⏰ Timed out waiting for your description. Start again with `clubapply`.")
             return
 
-        description_text = description_msg.content[:1000]  # safety limit
+        description_text = description_msg.content[:1000]
 
-        # 7) Create private thread in applications channel
         try:
             thread = await applications_channel.create_thread(
                 name=f"{ign} | Club Application",
@@ -1146,13 +1123,11 @@ class BrawlStarsTools(commands.Cog):
             await dm.send("❌ I couldn't create a thread in the applications channel. Staff will need to fix my permissions.")
             return
 
-        # Add applicant
         try:
             await thread.add_user(ctx.author)
         except discord.Forbidden:
             pass
 
-        # Add leadership members
         lead_role_id = await guild_conf.leadership_role()
         lead_role = ctx.guild.get_role(lead_role_id) if lead_role_id else None
         if lead_role:
@@ -1162,11 +1137,9 @@ class BrawlStarsTools(commands.Cog):
                 except discord.Forbidden:
                     continue
 
-        # Re-upload the screenshot into the thread
         screenshot_bytes = await screenshot.read()
         file = discord.File(io.BytesIO(screenshot_bytes), filename=screenshot.filename or "profile.png")
 
-        # Build thread message
         profile_link = f"https://brawlstats.com/profile/{format_tag(tag)}"
         thread_embed = discord.Embed(
             title=f"New Club Application: {ign}",
@@ -1185,7 +1158,8 @@ class BrawlStarsTools(commands.Cog):
         await thread.send(content=content, embed=thread_embed, file=file)
 
         await dm.send("🎉 Your application has been submitted! Club leadership will review it in their private thread.")
-        await ctx.send(f"✅ {ctx.author.mention}, I’ve DMed you and submitted your club application.")
+
+        # No message in the channel here – we already did the temporary “check DMs”.
 
     # ========================================================
     #                   CLUB ASSIGN COMMANDS
@@ -1221,9 +1195,7 @@ class BrawlStarsTools(commands.Cog):
 
     @tasks.loop(minutes=10)
     async def overview_update_loop(self):
-        """
-        Automatically updates the family overview embed in each guild every 10 minutes.
-        """
+        """Automatically updates the family overview embed in each guild every 10 minutes."""
         await self.bot.wait_until_red_ready()
 
         for guild in self.bot.guilds:
@@ -1231,7 +1203,7 @@ class BrawlStarsTools(commands.Cog):
 
             channel_id = await conf.overview_channel()
             if not channel_id:
-                continue  # no overview channel set
+                continue
 
             channel = guild.get_channel(channel_id)
             if not channel:
@@ -1241,7 +1213,6 @@ class BrawlStarsTools(commands.Cog):
             if not clubs:
                 continue
 
-            # Collect club meta and tasks
             club_meta: List[Tuple[str, str]] = []
             tasks_list: List[asyncio.Task] = []
             for club in clubs.values():
@@ -1285,16 +1256,12 @@ class BrawlStarsTools(commands.Cog):
 
     @overview_update_loop.error
     async def overview_update_loop_error(self, error):
-        # basic logging; you can make this fancier (log to channel, etc.)
         print(f"[BrawlStarsTools] overview_update_loop error: {error}")
 
     # ========================================================
     #                   EMBED BUILDERS
     # ========================================================
 
-    # -----------------------------
-    # Save tag embed (improved)
-    # -----------------------------
     def _build_save_embed(self, user: discord.User, name: str, tag: str, idx: int, icon_id: int):
         bs_tag = format_tag(tag)
         embed = discord.Embed(
@@ -1311,9 +1278,6 @@ class BrawlStarsTools(commands.Cog):
         embed.set_footer(text=f"Tag: #{bs_tag}")
         return embed
 
-    # -----------------------------
-    # Accounts list embed (Brawlstats-style)
-    # -----------------------------
     async def _build_accounts_embed(self, user: discord.Member, tags: List[str]):
         embed = discord.Embed(
             title=f"🎮 {user.display_name}'s Linked Accounts",
@@ -1361,9 +1325,6 @@ class BrawlStarsTools(commands.Cog):
         embed.set_footer(text="Use 'bs switch <num1> <num2>' to reorder accounts")
         return embed
 
-    # -----------------------------
-    # Player profile embed (Brawlstats-style)
-    # -----------------------------
     def _build_player_embed(self, player: Dict):
         name: str = player.get("name", "Unknown")
         tag: str = player.get("tag", "#??????")
@@ -1455,9 +1416,6 @@ class BrawlStarsTools(commands.Cog):
         embed.set_footer(text="TLG Revamp 2025 • Player Statistics", icon_url=footer_icon)
         return embed
 
-    # -----------------------------
-    # Club embed (enhanced)
-    # -----------------------------
     def _build_club_embed(self, data: Dict):
         name = data.get("name", "Unknown Club")
         tag = data.get("tag", "#??????")
@@ -1533,9 +1491,6 @@ class BrawlStarsTools(commands.Cog):
         embed.set_footer(text="TLG Revamp 2025 • Club Statistics")
         return embed
 
-    # -----------------------------
-    # Brawlers embed (top 15, 3 columns)
-    # -----------------------------
     def _build_brawlers_embed(self, player: Dict):
         name = player.get("name", "Unknown")
         icon_id: Optional[int] = player.get("icon", {}).get("id")
@@ -1590,9 +1545,6 @@ class BrawlStarsTools(commands.Cog):
         embed.set_footer(text=f"Showing Top {len(top_15)} Brawlers")
         return embed
 
-    # -----------------------------
-    # Add club embed
-    # -----------------------------
     def _build_addclub_embed(self, name: str, tag: str, badge_id: int):
         embed = discord.Embed(
             title="🏰 Tracking Started",
@@ -1604,9 +1556,6 @@ class BrawlStarsTools(commands.Cog):
         embed.set_footer(text="Use 'bs admin clubs' to view all tracked clubs")
         return embed
 
-    # -----------------------------
-    # Delete club embed
-    # -----------------------------
     def _build_delclub_embed(self, name: str, tag: str):
         embed = discord.Embed(
             title="🗑️ Tracking Stopped",
@@ -1615,9 +1564,6 @@ class BrawlStarsTools(commands.Cog):
         )
         return embed
 
-    # -----------------------------
-    # List clubs embed
-    # -----------------------------
     def _build_listclubs_embed(self, clubs: Dict[str, Dict]):
         embed = discord.Embed(
             title="📜 Tracked Clubs",
@@ -1637,9 +1583,6 @@ class BrawlStarsTools(commands.Cog):
         embed.description = list_text
         return embed
 
-    # -----------------------------
-    # Refresh clubs embed
-    # -----------------------------
     def _build_refreshclubs_embed(self, updated: int, failed: int):
         embed = discord.Embed(
             description=(
@@ -1650,9 +1593,6 @@ class BrawlStarsTools(commands.Cog):
         )
         return embed
 
-    # -----------------------------
-    # Overview embed
-    # -----------------------------
     def _build_overview_embed(self, club_data: List[Tuple[str, str, Dict]]):
         total_clubs = len(club_data)
         total_trophies = sum(d.get("trophies", 0) for _, _, d in club_data)
@@ -1663,7 +1603,7 @@ class BrawlStarsTools(commands.Cog):
 
         total_vp = 0
         total_senior = 0
-        total_online = 0  # may remain 0 if API has no online info
+        total_online = 0
 
         for _, _, data in club_data:
             members = data.get("members", []) or []
@@ -1733,9 +1673,6 @@ class BrawlStarsTools(commands.Cog):
         embed.set_footer(text="Updating every 10 minutes • Live data from Brawl Stars API")
         return embed
 
-    # -----------------------------
-    # Clubs stats embed (detailed)
-    # -----------------------------
     def _build_clubs_stats_embed(self, club_data: List[Tuple[str, str, Dict]]):
         embed = discord.Embed(
             title="📋 Detailed Club Statistics",
@@ -1768,4 +1705,3 @@ class BrawlStarsTools(commands.Cog):
             embed.description = "No data available."
 
         return embed
-
