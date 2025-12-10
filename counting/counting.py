@@ -302,9 +302,7 @@ class Counting(commands.Cog):
     @commands.guild_only()
     @commands.group(name="counting", invoke_without_command=True)
     async def _counting(self, ctx: commands.Context):
-        """Base command for the counting game."""
-        # Default behaviour: show status
-        await ctx.invoke(self.counting_status)
+        await return
 
     @_counting.command(name="setchannel")
     @commands.has_guild_permissions(manage_guild=True)
