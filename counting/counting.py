@@ -284,7 +284,7 @@ class Counting(commands.Cog):
             timed_out = False
 
         if reason == "double":
-            base = "No doubles (same user twice in a row)."
+            base = "2 people, 1 number. So confusing 🤪"
         else:
             base = f"Expected **{expected}**, but got **{given}**."
 
@@ -293,7 +293,7 @@ class Counting(commands.Cog):
             text += " You have been timed out for **10 minutes**."
 
         try:
-            await message.reply(text, mention_author=False)
+            await message.reply(text)
         except discord.HTTPException:
             pass
 

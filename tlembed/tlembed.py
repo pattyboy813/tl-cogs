@@ -9,29 +9,38 @@ class TLEmbed(commands.Cog):
     @commands.admin()
     async def embed(self, ctx):
         e1 = discord.Embed(
-            title = "Looking for a club? Join here!",
+            title = "Counting Updated!",
+            description = "Now with 40% more ~~punishments~~ enforcement on keeping the count correct!",
             color = 0x5865F2
         )
-        e1.add_field(
-            name = "What we need from you!",
-            value = "  - Your Player Tag (eg. #LYRG2L2U)\n  - A clear screenshot of your profile (example below)",
-            inline = False
-        )
-        e1.set_image(url='https://cdn.discordapp.com/attachments/1344186242115305495/1447873735074775050/IMG_0789.png?ex=693934fe&is=6937e37e&hm=0402269be0a0fb648ba515336cd41f0db6bd0e525887cb0fe564c3630c010362&')
-
         e2 = discord.Embed(
             color = 0x5865F2
         )
         e2.add_field(
-            name = "How it works",
-            value = "1. Run `!clubapply` below and check your DM's\n2. Provide the bot the screenshot of your profile and player tag when prompted\n  - The bot will then contact the Brawl Stars servers to pull your details\n3. Verify your details are correct and go from there!",
+            name = "Mess up the count? No problem!",
+            value = "We all make mistakes, however we also need to learn from them. So we'll give you 10 minutes to reflect on your mistake for free!\n- Courtesy of Discord Timeout",
             inline = False
         )
         e2.add_field(
-            name = "What happens then?",
-            value = "The bot will open a thread attached to this channel and ping our Brawl Stars Staff to get you into a club. Once in a club, our leadership run 1 command and the rest is done by the bot.",
+            name = "Math without letters just wasn't fun, so we fixed it!",
+            value = "Counting with just numbers is so 2016, so now you can type out your numbers for the ultimate experience! (eg. six million seven hundred and sixty seven thousand six hundred and seven)",
+            inline = False
+        )
+        e2.add_field(
+            name = "Advanced math for our nerdy counters.",
+            value = "Love typing out math? Well we've got you covered. Now you can do 1*1, 1/1, 1+1 and 1-1 and so much more!",
             inline =  False
         )
+        e3 = discord.Embed(
+            color = 0x5865F2
+        )
+        e3.add_field(
+            name = "Got any suggestions for features in the count?",
+            value = "Ping Pat, he'll get around to it somewhere in the near future.",
+            inline = False
+        )
+        e3.set_footer(text = "With love, Threat Level Gaming")
 
         await ctx.send(embed = e1)
         await ctx.send(embed = e2)
+        await ctx.send(embed = e3)
