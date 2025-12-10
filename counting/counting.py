@@ -273,11 +273,11 @@ class Counting(commands.Cog):
         except discord.HTTPException:
             pass
 
-        # Try to timeout the user for 10 minutes
+        # Try to timeout the user for 28 days (BTU's idea)
         timed_out = False
         try:
-            until = datetime.now(timezone.utc) + timedelta(minutes=10)
-            await message.author.edit(timed_out_until=until, reason="Failed the counting game.")
+            until = datetime.now(timezone.utc) + timedelta(days=28)
+            await message.author.edit(timed_out_until=until, reason="Fucked up the count")
             timed_out = True
         except (discord.Forbidden, discord.HTTPException):
             # Bot doesn't have permission or can't modify this member
@@ -290,7 +290,7 @@ class Counting(commands.Cog):
 
         text = f"{base} Count resets to **0**. Start again with `1`."
         if timed_out:
-            text += " You have been timed out for **10 minutes**."
+            text += " On us, we've given you 28 days to reflect on your mistake. See you soon!."
 
         try:
             await message.reply(text)
