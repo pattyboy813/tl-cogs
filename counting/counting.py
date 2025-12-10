@@ -300,9 +300,13 @@ class Counting(commands.Cog):
     # -------------- Commands --------------
 
     @commands.guild_only()
-    @commands.group(name="counting", invoke_without_command=True)
+    @commands.group(name="counting")
     async def _counting(self, ctx: commands.Context):
+<<<<<<< HEAD
+        pass
+=======
         await return
+>>>>>>> 22fa1403363527467a2f04d9b37e00bd5ac20091
 
     @_counting.command(name="setchannel")
     @commands.has_guild_permissions(manage_guild=True)
