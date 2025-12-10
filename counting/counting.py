@@ -1,311 +1,19 @@
 from __future__ import annotations
 import asyncio
 from typing import Optional, Dict, List
+import re
+import ast
+import operator
+from datetime import datetime, timedelta, timezone
+
 import discord
-from discord.ui import View, Select, button, Button
 from redbot.core import commands, Config
 
 CONF_ID = 347209384723923874
 
-helpSections = [
-    "Overview",
-    "Setup",
-    "Gameplay",
-    "Admin",
-]
-
-def helpEmbed(section: str) -> discord.Embed:
-    e = discord.Embed(
-        title = "Counting - Help",
-        colour = 0xFF0000,
-        description = "Some help for keeping the count in line.",
-    )
-    e.set_footer(text = "Tip: Made you look")
-    if section == "Overview":
-        e.add_field(
-            name = "What is this counting business?",
-            value = (
-                "Like it's name, counting is just number after number going up by one.\n"
-                "This tool simply helps keep it that way and get's rid of the pesky cheaters."
-            ),
-            inline = False,
-        )
-        e.add_field(
-            name="Quickstart",
-            value=(
-                f"`!counting setup` — run the interactive setup wizard\n"
-                "Then start at `1` in the selected channel. I’ll ✅ correct counts, ❌ on fails."
-            ),
-            inline=False,
-        )
-    elif section == "Setup":
-        e.add_field(
-            name="Setup options",
-            value=(
-                f"Run `!counting setup` and pick:\n"
-                "• Counting channel\n"
-                "• Allow bots (on/off)\n"
-                "• Starting number\n\n"
-                "You can also tweak things manually:\n"
-                f"• `!counting setchannel #counting`\n"
-                f"• `!counting allowbots true|false`\n"
-                f"• `!counting setstart 0`"
-            ),
-            inline=False,
-        )
-    elif section == "Gameplay":
-        e.add_field(
-            name="Rules",
-            value=(
-                "• Post an integer that is exactly the next number (+1)\n"
-                "• No doubles: same user cannot count twice in a row\n"
-                "• Wrong number or double resets the chain to **0**"
-            ),
-            inline=False,
-        )
-        e.add_field(
-            name="Feedback",
-            value="• ✅ for correct counts • ❌ + a short explanation on fails",
-            inline=False,
-        )
-        e.add_field(
-            name="Leaderboard",
-            value=f"`!counting leaderboard` — shows top best streaks",
-            inline=False,
-        )
-    elif section == "Admin":
-        e.add_field(
-            name="Admin Commands",
-            value=(
-                f"`!counting setup` — interactive setup wizard\n"
-                f"`!counting setchannel <#channel>`\n"
-                f"`!counting status`\n"
-                f"`!counting reset [start_at]`\n"
-                f"`!counting setstart <n>`\n"
-                f"`!counting allowbots <true|false>`\n"
-            ),
-            inline=False,
-        )
-    return e
-
-class HelpSelect(Select):
-    def __init__(self, default_section: str = "Overview"):
-        options = [discord.SelectOption(label=s, value=s, default=(s == default_section)) for s in helpSections]
-        super().__init__(placeholder="Pick a help section…", options=options, min_values=1, max_values=1)
-        
-
-    async def callback(self, interaction: discord.Interaction):
-        section = self.values[0]
-        await interaction.response.edit_message(embed=helpEmbed(section, ), view=self.view)
-
-
-class HelpView(View):
-    def __init__(self, author_id: int):
-        super().__init__(timeout=120)
-        self.add_item(HelpSelect())
-        
-        self.author_id = author_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.author_id:
-            return True
-        perms = interaction.channel.permissions_for(interaction.user) if interaction.channel else None
-        return bool(perms and perms.manage_guild)
-
-    @button(label="⟵ Prev", style=discord.ButtonStyle.secondary)
-    async def prev_btn(self, interaction: discord.Interaction, button: Button):
-        current = self._current_section_from_embed(interaction.message)
-        idx = helpSections.index(current)
-        new_section = helpSections[(idx - 1) % len(helpSections)]
-        await interaction.response.edit_message(embed=helpEmbed(new_section, ), view=self)
-
-    @button(label="Next ⟶", style=discord.ButtonStyle.secondary)
-    async def next_btn(self, interaction: discord.Interaction, button: Button):
-        current = self._current_section_from_embed(interaction.message)
-        idx = helpSections.index(current)
-        new_section = helpSections[(idx + 1) % len(helpSections)]
-        await interaction.response.edit_message(embed=helpEmbed(new_section, ), view=self)
-
-    @button(label="Close", style=discord.ButtonStyle.danger)
-    async def close_btn(self, interaction: discord.Interaction, button: Button):
-        try:
-            await interaction.message.delete()
-        except discord.HTTPException:
-            await interaction.response.edit_message(content="(closed)", embed=None, view=None)
-
-    def _current_section_from_embed(self, message: discord.Message) -> str:
-        emb = message.embeds[0] if message.embeds else None
-        if not emb:
-            return "Overview"
-        names = [f.name for f in emb.fields]
-        if "What it does" in names:
-            return "Overview"
-        for s in helpSections:
-            if any(s in n for n in names):
-                return s
-        return "Overview"
-
-
-class CountingSetupView(View):
-    def __init__(self, cog: "Counting", ctx: commands.Context, current: dict):
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.ctx = ctx
-        self.guild = ctx.guild
-        self.author_id = ctx.author.id
-
-        # working values (not yet saved)
-        self.channel_id: Optional[int] = current.get("channel_id")
-        self.allow_bots: bool = current.get("allow_bots", False)
-        self.start_at: int = current.get("last_number", 0)
-
-        self.message: Optional[discord.Message] = None
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.author_id:
-            return True
-        perms = interaction.channel.permissions_for(interaction.user) if interaction.channel else None
-        return bool(perms and perms.manage_guild)
-
-    def _build_embed(self, final: bool = False) -> discord.Embed:
-        ch = self.guild.get_channel(self.channel_id) if self.channel_id else None
-        e = discord.Embed(
-            title="🧮 Counting — Setup Wizard",
-            colour=discord.Colour.blurple(),
-        )
-        if final:
-            e.description = "Setup complete. You can rerun this anytime with the setup command."
-        else:
-            e.description = (
-                "Use the buttons below to configure the counting game.\n"
-                "When you're happy, press **Save & Close**."
-            )
-
-        e.add_field(
-            name="Counting channel",
-            value=ch.mention if ch else "_not set (required)_",
-            inline=False,
-        )
-        e.add_field(
-            name="Allow bots",
-            value="✅ Yes" if self.allow_bots else "❌ No",
-            inline=True,
-        )
-        e.add_field(
-            name="Starting number",
-            value=f"{self.start_at} (next expected will be **{self.start_at + 1}**)",
-            inline=True,
-        )
-        return e
-
-    async def refresh(self):
-        if self.message:
-            try:
-                await self.message.edit(embed=self._build_embed(), view=self)
-            except discord.HTTPException:
-                pass
-
-    async def on_timeout(self) -> None:
-        for child in self.children:
-            if isinstance(child, Button):
-                child.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(
-                    content="Setup timed out. Run the setup command again if you still want to configure counting.",
-                    view=self,
-                    embed=self._build_embed(final=True),
-                )
-            except discord.HTTPException:
-                pass
-
-    @button(label="Use this channel", style=discord.ButtonStyle.primary, row=0)
-    async def set_here(self, interaction: discord.Interaction, button: Button):
-        self.channel_id = interaction.channel.id
-        await interaction.response.defer()
-        await self.refresh()
-
-    @button(label="Toggle allow bots", style=discord.ButtonStyle.secondary, row=0)
-    async def toggle_bots(self, interaction: discord.Interaction, button: Button):
-        self.allow_bots = not self.allow_bots
-        await interaction.response.defer()
-        await self.refresh()
-
-    @button(label="Set starting number", style=discord.ButtonStyle.secondary, row=1)
-    async def set_start(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.send_message(
-            "Reply with the starting number (>= 0) in this channel within 30 seconds.",
-            ephemeral=True,
-        )
-
-        def check(m: discord.Message) -> bool:
-            return m.author.id == interaction.user.id and m.channel.id == interaction.channel.id
-
-        try:
-            msg = await self.cog.bot.wait_for("message", check=check, timeout=30.0)
-            try:
-                value = int(msg.content.strip())
-                if value < 0:
-                    raise ValueError
-            except ValueError:
-                await msg.reply("That wasn't a valid non-negative integer. Keeping previous value.", mention_author=False)
-            else:
-                self.start_at = value
-                try:
-                    await msg.add_reaction("✅")
-                except discord.HTTPException:
-                    pass
-        except asyncio.TimeoutError:
-            # user didn't respond in time; ignore
-            pass
-
-        await self.refresh()
-
-    @button(label="Save & Close", style=discord.ButtonStyle.success, row=2)
-    async def save_close(self, interaction: discord.Interaction, button: Button):
-        if self.channel_id is None:
-            await interaction.response.send_message(
-                "You need to set a counting channel first (use **Use this channel**).",
-                ephemeral=True,
-            )
-            return
-
-        # Persist config
-        await self.cog.config.guild(self.guild).channel_id.set(self.channel_id)
-        await self.cog.config.guild(self.guild).allow_bots.set(self.allow_bots)
-        await self.cog.config.guild(self.guild).last_number.set(self.start_at)
-        await self.cog.config.guild(self.guild).last_user_id.set(None)
-
-        for child in self.children:
-            if isinstance(child, Button):
-                child.disabled = True
-
-        await interaction.response.send_message("Counting setup saved.", ephemeral=True)
-        if self.message:
-            try:
-                await self.message.edit(embed=self._build_embed(final=True), view=self)
-            except discord.HTTPException:
-                pass
-
-    @button(label="Cancel", style=discord.ButtonStyle.danger, row=2)
-    async def cancel(self, interaction: discord.Interaction, button: Button):
-        for child in self.children:
-            if isinstance(child, Button):
-                child.disabled = True
-        await interaction.response.send_message("Setup cancelled.", ephemeral=True)
-        if self.message:
-            try:
-                await self.message.edit(
-                    content="Setup cancelled.",
-                    embed=self._build_embed(final=True),
-                    view=self,
-                )
-            except discord.HTTPException:
-                pass
-
 
 class Counting(commands.Cog):
-    """+1 counting game with a simple setup wizard and leaderboard."""
+    """+1 counting game with stats and optional bot participation."""
 
     def __init__(self, bot):
         self.bot = bot
@@ -344,10 +52,13 @@ class Counting(commands.Cog):
             return
 
         content = message.content.strip()
-        try:
-            value = int(content)
-        except ValueError:
-            return  # ignore non-numeric messages
+        if not content:
+            return
+
+        value = self._parse_number(content)
+        if value is None:
+            # ignore messages that don't clearly represent a number
+            return
 
         last_number = gconf["last_number"]
         last_user_id = gconf["last_user_id"]
@@ -382,7 +93,161 @@ class Counting(commands.Cog):
         except discord.HTTPException:
             pass
 
-    # -------------- Helpers --------------
+    # -------------- Parsing Helpers --------------
+
+    def _parse_number(self, content: str) -> Optional[int]:
+        """
+        Try to interpret content as:
+        - plain integer: "5"
+        - math expression: "2+3", "(10/2)+1", "7*3"
+        - written number: "three", "twenty one", "one hundred and five"
+        """
+        s = content.strip()
+
+        # 1) direct integer
+        try:
+            return int(s)
+        except ValueError:
+            pass
+
+        # 2) math expression
+        expr_source = s
+        # If user writes "1+2=3", take the part after '=' as the "answer" (3)
+        if "=" in expr_source:
+            expr_source = expr_source.split("=")[-1].strip()
+
+        math_val = self._parse_math(expr_source)
+        if math_val is not None:
+            return math_val
+
+        # 3) number words
+        word_val = self._parse_word_number(s.lower())
+        return word_val
+
+    def _parse_math(self, expr: str) -> Optional[int]:
+        """Safely evaluate a simple arithmetic expression and return an int if possible."""
+        # Hard guard: only allow digits, whitespace, + - * / % ( ) and dots
+        if not re.fullmatch(r"[0-9\s\+\-\*\/\%\(\)\.]+", expr):
+            return None
+
+        try:
+            node = ast.parse(expr, mode="eval")
+        except SyntaxError:
+            return None
+
+        allowed_operators = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.FloorDiv: operator.floordiv,
+            ast.Mod: operator.mod,
+            ast.Pow: operator.pow,
+        }
+
+        def _eval(n):
+            if isinstance(n, ast.Expression):
+                return _eval(n.body)
+            if isinstance(n, ast.Constant):
+                if isinstance(n.value, (int, float)):
+                    return n.value
+                raise ValueError
+            if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub):
+                return -_eval(n.operand)
+            if isinstance(n, ast.BinOp) and type(n.op) in allowed_operators:
+                left = _eval(n.left)
+                right = _eval(n.right)
+                return allowed_operators[type(n.op)](left, right)
+            raise ValueError
+
+        try:
+            result = _eval(node)
+        except Exception:
+            return None
+
+        # Coerce to int if it's "really" an int
+        if isinstance(result, (int, float)):
+            int_result = int(round(result))
+            if abs(result - int_result) < 1e-9:
+                return int_result
+        return None
+
+    def _parse_word_number(self, text: str) -> Optional[int]:
+        """
+        Parse a basic English number phrase like:
+        "zero", "ten", "twenty one", "one hundred and five", "two thousand three"
+        """
+        units = {
+            "zero": 0,
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+            "eleven": 11,
+            "twelve": 12,
+            "thirteen": 13,
+            "fourteen": 14,
+            "fifteen": 15,
+            "sixteen": 16,
+            "seventeen": 17,
+            "eighteen": 18,
+            "nineteen": 19,
+        }
+        tens = {
+            "twenty": 20,
+            "thirty": 30,
+            "forty": 40,
+            "fifty": 50,
+            "sixty": 60,
+            "seventy": 70,
+            "eighty": 80,
+            "ninety": 90,
+        }
+        scales = {
+            "hundred": 100,
+            "thousand": 1000,
+            "million": 1_000_000,
+        }
+
+        tokens = re.split(r"[\s\-]+", text)
+        if not tokens:
+            return None
+
+        current = 0
+        total = 0
+        used_any = False
+
+        for word in tokens:
+            if word == "and":
+                continue
+            if word in units:
+                current += units[word]
+                used_any = True
+            elif word in tens:
+                current += tens[word]
+                used_any = True
+            elif word in scales:
+                if current == 0:
+                    current = 1
+                current *= scales[word]
+                total += current
+                current = 0
+                used_any = True
+            else:
+                # Not a recognizable number word
+                return None
+
+        if not used_any:
+            return None
+        return total + current
+
+    # -------------- Fail Helper --------------
 
     async def _fail(
         self,
@@ -408,12 +273,24 @@ class Counting(commands.Cog):
         except discord.HTTPException:
             pass
 
+        # Try to timeout the user for 10 minutes
+        timed_out = False
+        try:
+            until = datetime.now(timezone.utc) + timedelta(minutes=10)
+            await message.author.edit(timed_out_until=until, reason="Failed the counting game.")
+            timed_out = True
+        except (discord.Forbidden, discord.HTTPException):
+            # Bot doesn't have permission or can't modify this member
+            timed_out = False
+
         if reason == "double":
             base = "No doubles (same user twice in a row)."
         else:
             base = f"Expected **{expected}**, but got **{given}**."
 
         text = f"{base} Count resets to **0**. Start again with `1`."
+        if timed_out:
+            text += " You have been timed out for **10 minutes**."
 
         try:
             await message.reply(text, mention_author=False)
@@ -425,27 +302,9 @@ class Counting(commands.Cog):
     @commands.guild_only()
     @commands.group(name="counting", invoke_without_command=True)
     async def _counting(self, ctx: commands.Context):
-        """Base command shows the interactive help menu."""
-        view = HelpView(ctx.author.id)
-        emb = helpEmbed("Overview", )
-        await ctx.send(embed=emb, view=view)
-
-    @_counting.command(name="help")
-    async def counting_help(self, ctx: commands.Context):
-        """Show the interactive help menu."""
-        view = HelpView(ctx.author.id)
-        emb = helpEmbed("Overview", )
-        await ctx.send(embed=emb, view=view)
-
-    @_counting.command(name="setup")
-    @commands.has_guild_permissions(manage_guild=True)
-    async def counting_setup(self, ctx: commands.Context):
-        """Run an interactive setup wizard with buttons."""
-        current = await self.config.guild(ctx.guild).all()
-        view = CountingSetupView(self, ctx, current)
-        emb = view._build_embed()
-        msg = await ctx.send(embed=emb, view=view)
-        view.message = msg
+        """Base command for the counting game."""
+        # Default behaviour: show status
+        await ctx.invoke(self.counting_status)
 
     @_counting.command(name="setchannel")
     @commands.has_guild_permissions(manage_guild=True)
@@ -511,10 +370,3 @@ class Counting(commands.Cog):
         top = max(1, min(top, 25))
         lines = [f"**{i+1}.** {name} — **{score}**" for i, (name, score) in enumerate(items[:top])]
         await ctx.send("__**Best Streaks**__\n" + "\n".join(lines))
-
-    # help hook
-    async def format_help_for_context(self, ctx: commands.Context) -> str:
-        return (
-            "Counting — a +1 counting game with a simple setup wizard.\n"
-            f"Try `!counting setup` to configure it."
-        )
