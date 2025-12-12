@@ -1,41 +1,33 @@
-"""Constant definitions for the Brawl Stars cog.
+# bstools/constants.py
+from redbot.core import Config
 
-All static values such as API endpoints, emoji mappings or default
-configuration live in this module. Centralising these definitions
-improves readability and makes it trivial to reuse the same values in
-multiple parts of the code without duplication.
-"""
+BASE_URL = "https://api.brawlstars.com/v1"
+CDN_ICON_URL = "https://cdn.brawlify.com/profile-icons/regular/{}.png"
+CDN_BADGE_URL = "https://cdn.brawlify.com/club-badges/regular/{}.png"
 
-# Base URL for the official Brawl Stars API
-BASE_URL: str = "https://api.brawlstars.com/v1"
+BSTOOLS_CONFIG_ID = 0xB5B5B5B5
 
-# CDN for Icons and Badges (Brawlify mirrors official assets)
-CDN_ICON_URL: str = "https://cdn.brawlify.com/profile-icons/regular/{}.png"
-CDN_BADGE_URL: str = "https://cdn.brawlify.com/club-badges/regular/{}.png"
+bstools_config = Config.get_conf(
+    None,
+    identifier=BSTOOLS_CONFIG_ID,
+    force_registration=True,
+)
 
-# Shared config identifier.  A hex makes it easy to avoid collisions
-BSTOOLS_CONFIG_ID: int = 0xB5B5B5B5
-
-# Default configuration for servers and users.  These dicts are used
-# when registering configuration with Red's ``Config`` helper.
 default_guild = {
-    # clubs: mapping of club_tag -> {"tag": "#TAG", "name": "Club Name"}
     "clubs": {},
-    # auto‑updating overview
-    "overview_channel": None,   # Optional[int]
-    "overview_message": None,   # Optional[int]
-    # leadership role & applications channel
-    "leadership_role": None,        # Optional[int]
-    "applications_channel": None,   # Optional[int]
+    "overview_channel": None,
+    "overview_message": None,
+    "leadership_role": None,
+    "applications_channel": None,
 }
 
 default_user = {
-    # list of saved brawl stars tags (strings without '#')
     "brawlstars_accounts": [],
 }
 
-# Hardcoded custom emoji mapping.  If a brawler name isn't found the
-# generic shield emoji will be used instead.
+bstools_config.register_guild(**default_guild)
+bstools_config.register_user(**default_user)
+
 BRAWLER_EMOJIS = {
     "gigi": "<:gigi:1446711155874594816>",
     "ziggy": "<:ziggy:1446711159603593328>",
@@ -137,21 +129,12 @@ BRAWLER_EMOJIS = {
     "shelly": "<:shelly:1446735648081051679>",
 }
 
-def get_brawler_emoji(name: str) -> str:
-    """Look up a brawler's custom emoji.
 
-    The names used by the API may include spaces or punctuation, so we normalise
-    the input by stripping spaces and dots and lower‑casing the result before
-    looking it up in ``BRAWLER_EMOJIS``.  If no matching key is found the
-    generic shield emoji is returned.
-    """
+def get_brawler_emoji(name: str) -> str:
     clean_name = name.lower().replace(" ", "").replace(".", "")
     return BRAWLER_EMOJIS.get(clean_name, "🛡️")
 
 
-# Club role configuration (fill with real IDs).  Each entry describes how a
-# tracked club maps to roles that should be added or removed when a member
-# applies to that club.  The keys correspond to command names used by the cog.
 CLUB_ROLE_CONFIG = {
     "revolt": {
         "bs_name": "TLG Revolt",
@@ -178,7 +161,3 @@ CLUB_ROLE_CONFIG = {
         "remove": [101010101010101010],
     },
 }
-
-# Valid characters for Brawl Stars tags.  Used by ``verify_tag`` in the
-# ``utils`` module.
-_VALID_TAG_CHARS: set = set("PYLQGRJCUV0289")
