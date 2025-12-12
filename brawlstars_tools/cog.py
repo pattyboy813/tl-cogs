@@ -1,24 +1,11 @@
-"""Main cog combining user commands, admin commands and background tasks.
-
-This class wires up the various helper modules into a single cog for
-installation into a Redbot instance.  It exposes groups of commands for
-players and administrators as well as a scheduled task that keeps club
-statistics up to date.  For brevity only a handful of commands are
-included here; see the original monolithic file for a comprehensive
-implementation.  Additional commands can be added by following the
-patterns established below: resolve a tag, call into the API and then
-construct an embed via the builders.
-"""
-
 from __future__ import annotations
 
 from typing import Optional, Union, Dict, List, Tuple
 import asyncio
 
 import discord
-from discord.ext import commands, tasks
-from redbot.core import commands as rcommands
-from redbot.core import checks, Config
+from discord.ext import tasks
+from redbot.core import commands, checks, Config
 from redbot.core.bot import Red
 
 from .api import BrawlStarsAPI
